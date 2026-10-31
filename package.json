@@ -1,0 +1,24 @@
+{
+  "name": "codearts-bridge",
+  "version": "0.1.0",
+  "description": "codearts-bridge：opencode 插件薄壳 + 核心库 + 守护（安装管家/双传输/目标引擎）",
+  "type": "module",
+  "exports": {
+    ".": "./src/server.ts",
+    "./server": "./src/server.ts"
+  },
+  "bin": {
+    "codearts-bridge": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^5.9.3"
+  }
+}
