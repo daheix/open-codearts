@@ -1,0 +1,716 @@
+# Review package: 80240ce43b..c0a855b0cd
+
+## Commits
+c0a855b0cd codearts-bridge(T1-06): 健康采样 — DB/WAL/转储/日志/内核自报 RSS/最近错误 — 只读 collectHealth(cfg,opts)：kernelDataDir 传参(R-h3)+PidProbe 注入(R-h5)；ENOENT 零值如实报告、非 ENOENT 显式抛(R-h4)；lastErrors 采 ERROR 前缀∪关键词 INFO/WARN，规范化去重×N/显式截断/上限20/时间序(R-h1)；rssMB 按扫描序取最后一条换算字节(R-h2)；WAL 命名 opencode.db-wal 经内核二进制 strings+实文件双确证；11 新测试，全量 115 绿+typecheck 零错误；真实环境演练 logs/dumps 字节与 du 逐位一致(实测采样 14.4s 已记头注)
+
+## Files changed
+ plugins/codearts-bridge/src/core/health.ts  | 393 ++++++++++++++++++++++++++++
+ plugins/codearts-bridge/test/health.test.ts | 300 +++++++++++++++++++++
+ 2 files changed, 693 insertions(+)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/health.ts b/plugins/codearts-bridge/src/core/health.ts
+new file mode 100644
+index 0000000000..9a7e0db2a8
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/health.ts
+@@ -0,0 +1,393 @@
++/**
++ * codearts-bridge 健康采样（T1-06）——对 codearts 内核 cli-data 的只读体检。
++ *
++ * 目标（痛点②"内存一直增加"可观测化第一步）：一次 collectHealth 产出快照
++ *   { rssBytes?, dbBytes, walBytes, dumps{files,bytes}, logs{bytes}, lastErrors[], kernelRssFromLog? }
++ *
++ * 字段口径：
++ * - rssBytes：托管内核进程 RSS 字节（注入 PidProbe，R-h5）；本任务无托管进程 →
++ *   undefined（M2 接入后由调用方注入真实探测）。
++ * - dbBytes/walBytes：<kernelDataDir>/opencode.db 与 opencode.db-wal（SQLite WAL
++ *   标准命名，已对真实安装双确证：内核二进制 strings 出现 "opencode.db-wal"，
++ *   且本机存在 ~/.codeartsdoer/codearts-data/opencode.db-wal 实文件）。
++ * - dumps：log 目录下 dump-*.heapsnapshot 的数量与字节（真实环境曾累计 1.3GB+，
++ *   是磁盘增长的主嫌，故从目录总量中单列分解）。
++ * - logs：<kernelDataDir>/log 目录递归总字节（任务书口径"logs=log 目录总字节"；
++ *   dumps 就在该目录下，故 logs.bytes ⊇ dumps.bytes，二者是总量与最劣子集的关系）。
++ * - lastErrors：内核日志（kernel-*.log）中最近错误摘要，采集规则见 R-h1；
++ *   experience-*.log 等异构格式日志不参与解析（格式不符裁定样本），但计入 logs.bytes。
++ * - kernelRssFromLog：`service=om "当前进程内存使用情况" rssMB=<n>` 最近一条换算字节
++ *   （R-h2：按行序取最后匹配，MB×1024×1024 四舍五入）。
++ *
++ * 主控裁定（2026-10-31）落点：
++ * - R-h1（采集口径，以真实日志格式为准）：kernel 日志逐行形如
++ *   `SEV  <ISO时间戳> +<耗时> service=<name> <rest>`（严重度前缀 + 结构化字段）。
++ *   采集 = ERROR 前缀行 或 含错误关键词（HEALTH_ERROR_KEYWORDS）的 INFO/WARN 行；
++ *   产出规范化摘要：剥离易变字段（时间戳/耗时）→ 超长截断（显式"截断"标记，
++ *   禁静默截断）→ 按剥离后文本去重（重复出现记 ×N，保留最后出现时间参与排序）→
++ *   上限 HEALTH_MAX_LAST_ERRORS=20 → 按内嵌时间戳升序输出。
++ * - R-h3：kernelDataDir 为函数参数（默认 ~/.codeartsdoer/cli-data），
++ *   本任务不扩展 BridgeConfig 接口。
++ * - R-h4（容忍探测≠掩盖）：目录/文件缺失（ENOENT）→ 对应字段零值/undefined、
++ *   不抛错——这是"只读状态采集"语义而非掩盖错误：缺失本身就是健康状态的一部分，
++ *   如实报告；IO 非 ENOENT 错误 → 显式抛 BridgeError，绝不静默。
++ * - R-h5（PidProbe 注入）：opts.proc 返回"十进制整数字节"字符串（如 "52577"；
++ *   显式约定仅此一种形态，前后空白容忍，其余形态一律 PID_PROBE_INVALID，
++ *   禁止静默解析）；未注入 → rssBytes=undefined；proc 自身失败 → PID_PROBE_FAILED。
++ *
++ * 性能注记（真实环境实测 2026-10-31）：lastErrors/kernelRssFromLog 需流式扫读全部
++ * kernel-*.log（本机 52 文件/325MB，readline 逐行流式、内存 O(1)），单次采样实测约
++ * 14s。M2 接入托管进程后改增量扫描（按文件 offset 续扫，只读新增字节），本任务取
++ * 全量扫描的最小正确实现——正确性优先，调用方（M2）据实测耗时决定采样频率。
++ */
++import { createReadStream } from "node:fs";
++import type { Dirent } from "node:fs";
++import { readdir } from "node:fs/promises";
++import { homedir } from "node:os";
++import * as path from "node:path";
++import { createInterface } from "node:readline";
++import { BridgeError } from "./errors";
++import { errnoOf } from "./fsx";
++import { statOrEnoent } from "./install";
++import type { BridgeConfig } from "./config";
++
++/* ───── 常量（R-h1/R-h2 口径，测试与未来调参共用） ───── */
++
++/** lastErrors 上限（裁定 R-h1：最多 20 条）。 */
++export const HEALTH_MAX_LAST_ERRORS = 20;
++
++/** 单条错误摘要截断长度（裁定 R-h1：截断到合理长度；截断必须带显式标记）。 */
++export const HEALTH_MAX_ERROR_SUMMARY_CHARS = 500;
++
++/**
++ * 错误关键词表（裁定 R-h1 给定的最小集合；INFO/WARN 行命中任一即采集）。
++ * 大小写敏感、按内核日志实际写法收录；后续发现新错误形态在此增列并补测试。
++ */
++export const HEALTH_ERROR_KEYWORDS: readonly string[] = [
++  "error fetch",
++  "ECONNRESET",
++  "timed out",
++  "TimeoutError",
++];
++
++/** 内核日志文件名（log 目录顶层；真实命名 kernel-<host>-<session>-<ts>-<pid>-<seq>.log）。 */
++const KERNEL_LOG_RE = /^kernel-.+\.log$/;
++
++/** 堆转储文件名（log 目录下任意层）。 */
++const DUMP_RE = /^dump-.*\.heapsnapshot$/;
++
++/**
++ * kernel 自报内存行（R-h2 真实样本）：
++ * `INFO  2026-10-30T20:49:52.104 +1ms service=om "当前进程内存使用情况" rssMB=525.77 …`
++ */
++const RSS_LINE_RE = /service=om\s+"当前进程内存使用情况"\s+rssMB=(\d+(?:\.\d+)?)/;
++
++/**
++ * 内核日志行结构（R-h1）：`SEV  <ISO> +<耗时> <rest>`；不匹配者按原样行处理
++ * （ERROR 前缀仍采集，仅摘要不做字段剥离——异常格式如实上报而非丢弃）。
++ */
++const LOG_LINE_RE = /^(DEBUG|INFO|WARN|ERROR)\s+(\S+)\s+\+\S+\s+(.*)$/;
++
++/* ───── 类型 ───── */
++
++/** 健康快照（只读采样结果；字段语义见文件头注）。 */
++export interface HealthSnapshot {
++  /** 托管进程 RSS 字节（PidProbe 注入）；未注入/无托管进程 → undefined。 */
++  rssBytes?: number;
++  /** opencode.db 字节；缺失 → 0（R-h4）。 */
++  dbBytes: number;
++  /** opencode.db-wal 字节；缺失 → 0（R-h4）。 */
++  walBytes: number;
++  /** dump-*.heapsnapshot 计数与字节；log 目录缺失 → 全零（R-h4）。 */
++  dumps: { files: number; bytes: number };
++  /** log 目录递归总字节（含 dumps）；目录缺失 → 0（R-h4）。 */
++  logs: { bytes: number };
++  /** 最近错误摘要（规范化、去重、≤20 条、时间升序；无日志 → 空数组）。 */
++  lastErrors: string[];
++  /** 内核自报 RSS（最近一条 rssMB 换算字节）；日志缺失/无自报行 → undefined。 */
++  kernelRssFromLog?: number;
++}
++
++/** collectHealth 选项（R-h3/R-h5：kernelDataDir 传参 + PidProbe 注入）。 */
++export interface CollectHealthOptions {
++  /** 内核数据目录；缺省 ~/.codeartsdoer/cli-data（R-h3，不扩展 BridgeConfig）。 */
++  kernelDataDir?: string;
++  /**
++   * PidProbe（R-h5）：返回托管进程 RSS 的"十进制整数字节"字符串（如 "52577"）。
++   * 唯一合法形态（前后空白容忍）；非法输出显式抛 PID_PROBE_INVALID。
++   */
++  proc?: () => Promise<string>;
++}
++
++/* ───── PidProbe（R-h5） ───── */
++
++/** 解析 PidProbe 输出；唯一合法形态 = 十进制整数字节串（禁静默解析，见头注 R-h5）。 */
++async function probeRss(proc: () => Promise<string>): Promise<number> {
++  let raw: string;
++  try {
++    raw = await proc();
++  } catch (e) {
++    throw new BridgeError(
++      "PID_PROBE_FAILED",
++      `进程 RSS 探测失败：${e instanceof Error ? e.message : String(e)}`,
++      { cause: e },
++    );
++  }
++  const text = raw.trim();
++  if (!/^\d+$/.test(text)) {
++    throw new BridgeError(
++      "PID_PROBE_INVALID",
++      `进程 RSS 探测输出须为十进制整数字节串，实际为 ${JSON.stringify(raw.slice(0, 64))}`,
++    );
++  }
++  const bytes = Number(text);
++  if (!Number.isSafeInteger(bytes)) {
++    throw new BridgeError("PID_PROBE_INVALID", `进程 RSS 探测输出超出安全整数范围：${text}`);
++  }
++  return bytes;
++}
++
++/* ───── FS 探测原语（R-h4：ENOENT 容忍 + 非 ENOENT 显式抛） ───── */
++
++/** 单文件字节；缺失 → 0（显式"不存在"状态）；存在但非常规文件 → 显式抛（同 install.ts 纪律）。 */
++async function fileSizeOrZero(p: string, label: string): Promise<number> {
++  const st = await statOrEnoent(p);
++  if (st === undefined) return 0;
++  if (!st.isFile()) {
++    throw new BridgeError("FS_PATH_NOT_FILE", `${label} 路径存在但不是常规文件：path=${p}`);
++  }
++  return st.size;
++}
++
++/** 目录字节聚合器：totalBytes=全部常规文件；dump* 单列分解。 */
++interface DirBytesAgg {
++  totalBytes: number;
++  dumpFiles: number;
++  dumpBytes: number;
++}
++
++/**
++ * 递归统计目录字节（logs.bytes 口径：目录内全部常规文件之和，dumps 单列）。
++ * - ENOENT → 直接返回（上层聚合保持零值，R-h4 状态语义）；
++ * - 其他 readdir 错误 → FS_READ_FAILED 显式抛；
++ * - 只计常规文件、只下探目录，其余类型（符号链接/FIFO 等）不计入——目录总量
++ *   口径固定为"常规文件字节和"，不跟随符号链接（防外逃与环）；文件在 readdir 与
++ *   stat 之间被删除（日志轮转竞态）→ 按不存在计（状态采集语义，非掩盖）。
++ */
++async function walkDirBytes(dir: string, agg: DirBytesAgg): Promise<void> {
++  let entries: Dirent[];
++  try {
++    entries = await readdir(dir, { withFileTypes: true });
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return;
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取目录失败：path=${dir} reason=${reason}`, {
++      cause: e,
++    });
++  }
++  for (const d of entries) {
++    const p = path.join(dir, d.name);
++    if (d.isDirectory()) {
++      await walkDirBytes(p, agg);
++    } else if (d.isFile()) {
++      const st = await statOrEnoent(p);
++      if (st === undefined) continue; // 竞态删除：按不存在计（见函数注释）
++      agg.totalBytes += st.size;
++      if (DUMP_RE.test(d.name)) {
++        agg.dumpFiles += 1;
++        agg.dumpBytes += st.size;
++      }
++    }
++  }
++}
++
++/* ───── 内核日志扫描（R-h1 lastErrors + R-h2 kernelRssFromLog） ───── */
++
++/** 单条错误的规范化中间态（排序键：最后出现的内嵌时间戳，无时间戳退化到扫描序）。 */
++interface ErrorEntry {
++  /** 规范化摘要（已剥离时间戳/耗时、已截断带标记）；去重键。 */
++  summary: string;
++  /** 重复出现次数（×N；首次出现后每次命中累加）。 */
++  count: number;
++  /** 最后一次出现的内嵌时间戳（epoch ms）；该行无合法时间戳 → undefined。 */
++  lastTsMs?: number;
++  /** 最后一次出现的全局扫描序号（时间戳缺失时的确定性排序退化键）。 */
++  lastSeq: number;
++}
++
++/** 排序键：有内嵌时间戳按时间；无时间戳排在一切有时间戳之前（负大数），彼此按扫描序。 */
++function orderKey(e: ErrorEntry): number {
++  return e.lastTsMs ?? e.lastSeq - Number.MAX_SAFE_INTEGER;
++}
++
++/**
++ * 规范化单行（R-h1）：剥离 `SEV  <ts> +<dur> ` 易变字段，保留 `SEV <rest>`；
++ * 超长截断并附显式标记（禁静默截断）。行结构不符裁定时原样保留（异常格式如实上报）。
++ */
++function normalizeErrorLine(line: string): string {
++  const m = LOG_LINE_RE.exec(line);
++  let base = m ? `${m[1]} ${m[3]}` : line;
++  if (base.length > HEALTH_MAX_ERROR_SUMMARY_CHARS) {
++    base = `${base.slice(0, HEALTH_MAX_ERROR_SUMMARY_CHARS)} …[截断,原长=${base.length}字符]`;
++  }
++  return base;
++}
++
++/** 扫描状态（跨文件累计；seq 为全局行命中序号，供无时间戳行的确定性排序）。 */
++interface ScanState {
++  kernelRssBytes?: number;
++  bySummary: Map<string, ErrorEntry>;
++  seq: number;
++}
++
++/** 单行处理：R-h2 rssMB 取扫描序最后一条；R-h1 错误行采集/去重/计数。 */
++function processLine(line: string, state: ScanState): void {
++  const rss = RSS_LINE_RE.exec(line);
++  if (rss !== null && rss[1] !== undefined) {
++    state.kernelRssBytes = Math.round(Number.parseFloat(rss[1]) * 1024 * 1024);
++  }
++
++  const sp = line.indexOf(" ");
++  const severity = sp === -1 ? line : line.slice(0, sp);
++  const isErrorLine = severity === "ERROR";
++  const isKeywordLine =
++    (severity === "INFO" || severity === "WARN") &&
++    HEALTH_ERROR_KEYWORDS.some((k) => line.includes(k));
++  if (!isErrorLine && !isKeywordLine) return;
++
++  const m = LOG_LINE_RE.exec(line);
++  const tsMs = m !== null && m[2] !== undefined ? Date.parse(m[2]) : Number.NaN;
++  const summary = normalizeErrorLine(line);
++  state.seq += 1;
++  const prev = state.bySummary.get(summary);
++  if (prev !== undefined) {
++    prev.count += 1;
++    prev.lastSeq = state.seq;
++    if (!Number.isNaN(tsMs)) prev.lastTsMs = tsMs;
++  } else {
++    state.bySummary.set(summary, {
++      summary,
++      count: 1,
++      lastSeq: state.seq,
++      lastTsMs: Number.isNaN(tsMs) ? undefined : tsMs,
++    });
++  }
++}
++
++/** 流式扫读单文件（readline 逐行，内存 O(1)）；读失败显式抛（禁静默跳过）。 */
++async function scanLogFile(file: string, onLine: (line: string) => void): Promise<void> {
++  const input = createReadStream(file, { encoding: "utf8" });
++  // 显式捕获底层流错误：防运行时把错误折算成"提前 EOF"导致漏报（禁静默）
++  let streamError: unknown;
++  input.on("error", (e: unknown) => {
++    streamError = e;
++  });
++  const rl = createInterface({ input, crlfDelay: Infinity });
++  try {
++    for await (const line of rl) {
++      onLine(line);
++    }
++  } catch (e) {
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("HEALTH_LOG_READ_FAILED", `内核日志扫描失败：path=${file} reason=${reason}`, {
++      cause: e,
++    });
++  } finally {
++    rl.close();
++  }
++  if (streamError !== undefined) {
++    const reason =
++      errnoOf(streamError) ?? (streamError instanceof Error ? streamError.name : "UNKNOWN");
++    throw new BridgeError("HEALTH_LOG_READ_FAILED", `内核日志扫描失败：path=${file} reason=${reason}`, {
++      cause: streamError,
++    });
++  }
++}
++
++/**
++ * 扫描 kernel-*.log（log 目录顶层）：文件按 mtime 升序（同名并列按文件名）、
++ * 文件内按行序 → "按行序"的扫描序语义（R-h2"取最后匹配"依据此序）。
++ * 无日志目录/无内核日志 → lastErrors=[] 且 rss 未定义（R-h4 状态语义）。
++ */
++async function scanKernelLogs(logDir: string): Promise<{
++  lastErrors: string[];
++  kernelRssBytes?: number;
++}> {
++  let entries: Dirent[];
++  try {
++    entries = await readdir(logDir, { withFileTypes: true });
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return { lastErrors: [] };
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取目录失败：path=${logDir} reason=${reason}`, {
++      cause: e,
++    });
++  }
++
++  const files: Array<{ path: string; mtimeMs: number; name: string }> = [];
++  for (const d of entries) {
++    if (!d.isFile() || !KERNEL_LOG_RE.test(d.name)) continue;
++    const p = path.join(logDir, d.name);
++    const st = await statOrEnoent(p);
++    if (st === undefined) continue; // 扫描间隙被轮转删除：跳过（状态采集语义）
++    files.push({ path: p, mtimeMs: st.mtimeMs, name: d.name });
++  }
++  files.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
++
++  const state: ScanState = { bySummary: new Map(), seq: 0 };
++  for (const f of files) {
++    await scanLogFile(f.path, (line) => processLine(line, state));
++  }
++
++  // 时间升序（稳定排序：同键保持扫描序）→ 取最近 20 条 → 输出保持时间顺序
++  const ordered = [...state.bySummary.values()].sort((a, b) => orderKey(a) - orderKey(b));
++  const kept = ordered.slice(-HEALTH_MAX_LAST_ERRORS);
++  return {
++    lastErrors: kept.map((e) => (e.count > 1 ? `${e.summary} ×${e.count}` : e.summary)),
++    kernelRssBytes: state.kernelRssBytes,
++  };
++}
++
++/* ───── collectHealth ───── */
++
++/**
++ * 只读采集内核健康快照（字段口径与错误语义见文件头注）。
++ *
++ * @param cfg  全局配置（本任务只读采样未用到；任务书接口固定携带，
++ *             M2 健康快照落盘 <cfg.stateDir>/health 时启用——预留参数，勿删）
++ * @param opts kernelDataDir 传参（R-h3）与 PidProbe 注入（R-h5）
++ */
++export async function collectHealth(
++  cfg: BridgeConfig,
++  opts: CollectHealthOptions = {},
++): Promise<HealthSnapshot> {
++  const kernelDataDir = opts.kernelDataDir ?? path.join(homedir(), ".codeartsdoer", "cli-data");
++  const logDir = path.join(kernelDataDir, "log");
++
++  // 1) 托管进程 RSS（R-h5）：本任务无托管进程，opts.proc 缺省 → undefined
++  const rssBytes = opts.proc !== undefined ? await probeRss(opts.proc) : undefined;
++
++  // 2) db/wal 字节（R-h4：缺失→0；存在但非常规文件→显式抛）
++  const dbBytes = await fileSizeOrZero(path.join(kernelDataDir, "opencode.db"), "opencode.db");
++  const walBytes = await fileSizeOrZero(
++    path.join(kernelDataDir, "opencode.db-wal"),
++    "opencode.db-wal",
++  );
++
++  // 3) log 目录递归总量 + dumps 子集（R-h4：目录缺失→全零）
++  const agg: DirBytesAgg = { totalBytes: 0, dumpFiles: 0, dumpBytes: 0 };
++  await walkDirBytes(logDir, agg);
++
++  // 4) 内核日志扫描（lastErrors + kernelRssFromLog）
++  const scan = await scanKernelLogs(logDir);
++
++  return {
++    rssBytes,
++    dbBytes,
++    walBytes,
++    dumps: { files: agg.dumpFiles, bytes: agg.dumpBytes },
++    logs: { bytes: agg.totalBytes },
++    lastErrors: scan.lastErrors,
++    kernelRssFromLog: scan.kernelRssBytes,
++  };
++}
+diff --git a/plugins/codearts-bridge/test/health.test.ts b/plugins/codearts-bridge/test/health.test.ts
+new file mode 100644
+index 0000000000..d16ae44916
+--- /dev/null
++++ b/plugins/codearts-bridge/test/health.test.ts
+@@ -0,0 +1,300 @@
++/**
++ * T1-06 健康采样测试（bun:test）。
++ *
++ * 覆盖（任务书 Step1 + 主控裁定 R-h1..R-h5）：
++ * - sizes：db/wal/dumps/logs 字节数与文件数（logs=log 目录递归总字节，dumps 为其中
++ *   dump-*.heapsnapshot 子集，口径见 health.ts 头注）；
++ * - kernelRssFromLog：按扫描序（kernel-*.log 文件 mtime 升序 + 行序）取最后一条 rssMB
++ *   换算字节（R-h2"按行序取最后匹配"）；
++ * - lastErrors：ERROR 前缀行 + 含关键词的 INFO/WARN 行；规范化摘要（剥离时间戳/耗时）、
++ *   去重（×N 计数）、截断（显式标记）、上限 20 条、按时间序（R-h1）；
++ * - 缺目录不抛错、零值如实报告（R-h4"容忍探测≠掩盖"）；IO 非 ENOENT 显式抛 BridgeError；
++ * - PidProbe 注入（R-h5）：输出显式约定为十进制整数字节串；非法输出/探测失败显式报错。
++ *
++ * 隔离纪律（主控裁定）：绝不触碰真实 HOME；FS 落点全在 .tmp/health-test/，afterAll 清理。
++ * kernelRssFromLog 用例特意让 mtime 较新的文件携带较旧的内嵌时间戳，钉死"扫描序而非
++ * 时间戳序"这一裁定语义。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import {
++  HEALTH_MAX_ERROR_SUMMARY_CHARS,
++  HEALTH_MAX_LAST_ERRORS,
++  collectHealth,
++} from "../src/core/health";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "health-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 隔离配置（loadConfig 纯函数；路径全在本测试根内，绝不依赖真实 HOME）。 */
++function cfgOf(): BridgeConfig {
++  return loadConfig(
++    {
++      installDir: path.join(TEST_ROOT, "installers"),
++      stateDir: path.join(TEST_ROOT, "state"),
++    },
++    {},
++  );
++}
++
++/* ───── 真实日志样本（主控裁定 R-h1 提供的内核日志原样格式；新增行同格式仿写） ───── */
++
++// 真实样本 1：error fetch + ECONNRESET（INFO 前缀 + 关键词命中）
++const LINE_ECONNRESET = `INFO  2026-10-30T20:22:11.229 +25744ms service=proxy-fetch "error fetch:" fetchUrl={} error={message:"The socket connection was closed unexpectedly. For more information, pass \`verbose: true\` in the second argument to fetch()", name:"Error", code:"ECONNRESET", path:"https://…tar.gz"}`;
++// 真实样本 2：error fetch + TimeoutError/timed out（INFO 前缀 + 关键词命中）
++const LINE_TIMEOUT = `INFO  2026-10-30T20:35:15.779 +185ms service=proxy-fetch "error fetch:" fetchUrl=https://… error={message:"The operation timed out.", name:"TimeoutError", stack:""}`;
++// 真实样本 3：ERROR 前缀行（custom-model-auth 403）
++const LINE_AUTH_403 = `ERROR  2026-10-30T20:20:17.112 +1080ms service=custom-model-auth "request failed" baseUrl=… error=Request failed with status code 403 status=403`;
++// 403 同型错误的重复出现：剥离时间戳/耗时后与 LINE_AUTH_403 同文本 → 去重 ×2
++const LINE_AUTH_403_DUP = `ERROR  2026-10-30T20:58:00.000 +7ms service=custom-model-auth "request failed" baseUrl=… error=Request failed with status code 403 status=403`;
++// WARN 前缀 + 关键词命中（timed out）
++const LINE_WARN_TIMEOUT = `WARN  2026-10-30T20:27:00.000 +2ms service=provider-proxy "upstream timed out waiting" host=proxy.local`;
++// ERROR 前缀行（upgrade 下载失败）
++const LINE_UPGRADE = `ERROR  2026-10-30T21:00:00.000 +10ms service=upgrade "download failed" url=https://mirror.example.com/x.tar.gz error=ECONNRESET`;
++// 无关键词普通 INFO 行（不得采集）
++const LINE_PLAIN_INFO = `INFO  2026-10-30T20:26:00.000 +1ms service=session "poll ok" count=1`;
++// 超长 ERROR 行（触发截断标记）
++const LINE_LONG = `ERROR  2026-10-30T21:30:00.000 +1ms service=custom-model-loader "failed to decrypt apiKey for provider" providerKey=glm error={message:"${"x".repeat(600)}", name:"Error"}`;
++// rssMB 自报（真实样本格式）；kernel-a 为较早文件（mtime 旧）
++const LINE_RSS_A = `INFO  2026-10-30T20:49:52.104 +1ms service=om "当前进程内存使用情况" rssMB=100.50 heapUsedMB=155.13 heapTotalMB=90.35`;
++// rssMB 自报：mtime 较新的 kernel-b 携带"更旧"的内嵌时间戳——按裁定仍取本条（扫描序）
++const LINE_RSS_B = `INFO  2026-10-30T19:00:00.000 +2ms service=om "当前进程内存使用情况" rssMB=525.64 heapUsedMB=96.20`;
++
++const KERNEL_A_LINES = [
++  LINE_ECONNRESET,
++  LINE_AUTH_403,
++  LINE_RSS_A,
++  LINE_PLAIN_INFO,
++  LINE_WARN_TIMEOUT,
++];
++
++const KERNEL_B_LINES = [
++  LINE_TIMEOUT,
++  LINE_AUTH_403_DUP,
++  LINE_UPGRADE,
++  LINE_LONG,
++  LINE_RSS_B,
++];
++
++/** 写入文本文件并返回其 UTF-8 字节数（期望值与实际写入共用同一计算，避免口径漂移）。 */
++async function writeText(file: string, text: string): Promise<number> {
++  await writeFile(file, text, "utf8");
++  return Buffer.byteLength(text, "utf8");
++}
++
++interface HealthFixture {
++  kernelDataDir: string;
++  dbBytes: number;
++  walBytes: number;
++  dumpFiles: number;
++  dumpBytes: number;
++  logTotalBytes: number;
++}
++
++/**
++ * 构造完整 cli-data 目录树（含 db/wal/内核日志/异构日志/转储/杂项/子目录）。
++ * kernel-a mtime=2026-01-01、kernel-b mtime=2026-06-01 → 扫描序 a→b 与写入顺序无关。
++ */
++async function makeFullFixture(root: string): Promise<HealthFixture> {
++  const kernelDataDir = path.join(root, "cli-data");
++  const logDir = path.join(kernelDataDir, "log");
++  await mkdir(path.join(logDir, "sub"), { recursive: true });
++
++  const dbBytes = await writeText(path.join(kernelDataDir, "opencode.db"), "db".repeat(500));
++  const walBytes = await writeText(path.join(kernelDataDir, "opencode.db-wal"), "wal".repeat(83));
++
++  const bytesA = await writeText(path.join(logDir, "kernel-a.log"), KERNEL_A_LINES.join("\n") + "\n");
++  const bytesB = await writeText(path.join(logDir, "kernel-b.log"), KERNEL_B_LINES.join("\n") + "\n");
++  // 异构格式日志（experience-*.log 是另一套格式，不得参与解析，但计入目录总字节）
++  const bytesE = await writeText(
++    path.join(logDir, "experience-2026-10-30.0.log"),
++    "[2026/10/30 00:00:19.000] [WARN] state-sizes extractionStates=0\n",
++  );
++  const dump1 = await writeText(path.join(logDir, "dump-1GB.heapsnapshot"), "d".repeat(40));
++  const dump2 = await writeText(path.join(logDir, "dump-2GB.heapsnapshot"), "e".repeat(60));
++  const notes = await writeText(path.join(logDir, "notes.txt"), "notes\n");
++  const inner = await writeText(path.join(logDir, "sub", "inner.log"), "in\nok");
++
++  // mtime 固定：kernel-a 最旧、kernel-b 较新（扫描序确定性，不依赖写入先后）
++  await utimes(path.join(logDir, "kernel-a.log"), new Date(0), new Date("2026-01-01T00:00:00Z"));
++  await utimes(path.join(logDir, "kernel-b.log"), new Date(0), new Date("2026-06-01T00:00:00Z"));
++
++  return {
++    kernelDataDir,
++    dbBytes,
++    walBytes,
++    dumpFiles: 2,
++    dumpBytes: dump1 + dump2,
++    logTotalBytes: bytesA + bytesB + bytesE + dump1 + dump2 + notes + inner,
++  };
++}
++
++describe("collectHealth sizes（db/wal/dumps/logs）", () => {
++  it("db/wal 字节数、dumps 文件数与字节、log 目录递归总字节均正确", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "sizes"));
++    const snap = await collectHealth(cfgOf(), { kernelDataDir: fx.kernelDataDir });
++
++    expect(snap.dbBytes).toBe(fx.dbBytes);
++    expect(snap.walBytes).toBe(fx.walBytes);
++    expect(snap.dumps.files).toBe(fx.dumpFiles);
++    expect(snap.dumps.bytes).toBe(fx.dumpBytes);
++    // logs=整个 log 目录递归总字节（含 dumps 子集、异构日志、杂项与子目录）
++    expect(snap.logs.bytes).toBe(fx.logTotalBytes);
++  });
++
++  it("kernelRssFromLog：按扫描序取最后一条 rssMB（mtime 新者胜出，即使内嵌时间戳更旧）", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "rss"));
++    const snap = await collectHealth(cfgOf(), { kernelDataDir: fx.kernelDataDir });
++    expect(snap.kernelRssFromLog).toBe(Math.round(525.64 * 1024 * 1024));
++  });
++});
++
++describe("collectHealth lastErrors（R-h1 采集/去重/截断/上限/时序）", () => {
++  it("采集 ERROR 前缀与关键词 INFO/WARN 行；去重 ×2；普通 INFO 不采集；按时间序", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "errors"));
++    const snap = await collectHealth(cfgOf(), { kernelDataDir: fx.kernelDataDir });
++    const errs = snap.lastErrors;
++
++    // 6 个唯一错误：ECONNRESET fetch / WARN timeout / TimeoutError fetch / 403(×2) / upgrade / 超长截断
++    expect(errs.length).toBe(6);
++
++    // 按内嵌时间戳升序（lastSeen 口径）：20:22 → 20:27 → 20:35 → 20:58(403 重复) → 21:00 → 21:30
++    expect(errs[0]).toStartWith(`INFO service=proxy-fetch "error fetch:"`);
++    expect(errs[0]).toContain("ECONNRESET");
++    expect(errs[1]).toBe(`WARN service=provider-proxy "upstream timed out waiting" host=proxy.local`);
++    expect(errs[2]).toContain("TimeoutError");
++    expect(errs[3]).toStartWith(`ERROR service=custom-model-auth "request failed"`);
++    expect(errs[3]).toEndWith("status=403 ×2");
++    expect(errs[4]).toStartWith(`ERROR service=upgrade "download failed"`);
++    expect(errs[5]).toContain("[截断");
++
++    // 普通无关键词 INFO 行不得混入
++    for (const e of errs) expect(e).not.toContain("poll ok");
++  });
++
++  it("超长行截断：摘要长度受限且带显式截断标记（禁静默截断）", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "truncate"));
++    const snap = await collectHealth(cfgOf(), { kernelDataDir: fx.kernelDataDir });
++    const long = snap.lastErrors.at(-1);
++    expect(long).toBeDefined();
++    expect(long).toContain("[截断");
++    expect(long!.length).toBeLessThanOrEqual(HEALTH_MAX_ERROR_SUMMARY_CHARS + 40);
++    expect(long!.length).toBeGreaterThan(HEALTH_MAX_ERROR_SUMMARY_CHARS);
++  });
++
++  it("上限 20 条：25 条不同错误只保留最近 20 条且保持时间序", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "cap", "cli-data");
++    const logDir = path.join(kernelDataDir, "log");
++    await mkdir(logDir, { recursive: true });
++    const lines: string[] = [];
++    for (let i = 0; i < 25; i++) {
++      const mm = String(i).padStart(2, "0");
++      lines.push(`ERROR  2026-10-30T00:${mm}:00.000 +0ms service=t "boom-${i}"`);
++    }
++    await writeFile(path.join(logDir, "kernel-c.log"), lines.join("\n") + "\n", "utf8");
++
++    const snap = await collectHealth(cfgOf(), { kernelDataDir });
++    expect(snap.lastErrors.length).toBe(HEALTH_MAX_LAST_ERRORS);
++    expect(snap.lastErrors[0]).toContain('"boom-5"');
++    expect(snap.lastErrors.at(-1)).toContain('"boom-24"');
++    for (const e of snap.lastErrors) expect(e).not.toContain('"boom-4"');
++  });
++});
++
++describe("collectHealth 容忍探测与非 ENOENT 错误（R-h4）", () => {
++  it("kernelDataDir 整体缺失：零值快照、不抛错（缺失本身是健康状态的一部分）", async () => {
++    const snap = await collectHealth(cfgOf(), {
++      kernelDataDir: path.join(TEST_ROOT, "missing", "cli-data"),
++    });
++    expect(snap.dbBytes).toBe(0);
++    expect(snap.walBytes).toBe(0);
++    expect(snap.dumps).toEqual({ files: 0, bytes: 0 });
++    expect(snap.logs.bytes).toBe(0);
++    expect(snap.lastErrors).toEqual([]);
++    expect(snap.kernelRssFromLog).toBeUndefined();
++    expect(snap.rssBytes).toBeUndefined();
++  });
++
++  it("opencode.db 路径存在但不是常规文件（目录）→ FS_PATH_NOT_FILE 显式抛出", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "db-is-dir", "cli-data");
++    await mkdir(path.join(kernelDataDir, "opencode.db"), { recursive: true });
++    try {
++      await collectHealth(cfgOf(), { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("FS_PATH_NOT_FILE");
++    }
++  });
++
++  it("log 路径是常规文件（readdir ENOTDIR）→ FS_READ_FAILED 显式抛出", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "log-is-file", "cli-data");
++    await mkdir(kernelDataDir, { recursive: true });
++    await writeFile(path.join(kernelDataDir, "log"), "not a dir\n");
++    try {
++      await collectHealth(cfgOf(), { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("FS_READ_FAILED");
++    }
++  });
++});
++
++describe("collectHealth PidProbe 注入（R-h5）", () => {
++  it("注入合法十进制整数字节串 → rssBytes 为该数值；未注入 → undefined", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "pid-ok"));
++    const withProc = await collectHealth(cfgOf(), {
++      kernelDataDir: fx.kernelDataDir,
++      proc: async () => " 52577 ",
++    });
++    expect(withProc.rssBytes).toBe(52577);
++
++    const noProc = await collectHealth(cfgOf(), { kernelDataDir: fx.kernelDataDir });
++    expect(noProc.rssBytes).toBeUndefined();
++  });
++
++  it("非法输出（非整数/负数/空串）→ PID_PROBE_INVALID 显式抛出，禁止静默解析", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "pid-bad"));
++    for (const bad of ["abc", "-5", "12.5", ""]) {
++      try {
++        await collectHealth(cfgOf(), { kernelDataDir: fx.kernelDataDir, proc: async () => bad });
++        expect.unreachable();
++      } catch (e) {
++        expect(e).toBeInstanceOf(BridgeError);
++        expect((e as BridgeError).code).toBe("PID_PROBE_INVALID");
++      }
++    }
++  });
++
++  it("proc 自身拒绝 → PID_PROBE_FAILED 且 cause 保留（不掩盖探测方错误）", async () => {
++    const fx = await makeFullFixture(path.join(TEST_ROOT, "pid-fail"));
++    const cause = new Error("ps 不可用");
++    try {
++      await collectHealth(cfgOf(), {
++        kernelDataDir: fx.kernelDataDir,
++        proc: async () => {
++          throw cause;
++        },
++      });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("PID_PROBE_FAILED");
++      expect((e as { cause?: unknown }).cause).toBe(cause);
++    }
++  });
++});

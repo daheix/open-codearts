@@ -1,0 +1,2319 @@
+# Review package: ce8a360b..ef26e2394b
+
+## Commits
+ef26e2394b codearts-bridge(T3-05): 守护目标 API — 全流程/控制/日志分页/多目标隔离 — R-dg1~R-dg5 落地：daemon-goals.ts 新增 GoalHost（POST /goals 建 GoalState→saveGoal→以落盘状态构造 GoalRunner→事件驱动 wake + 宿主级 sweep 循环（defaultTickLoop=setInterval 5s 可注入，测试手动驱动）；GET /goals 摘要列表（磁盘真相）/GET /goals/:id 实时优先/POST control pause·resume·stop 即时生效（响应前状态落盘+审计冲刷；blocked 目标 pause 显式 409、resume/stop 经宿主归一 paused 构造落实语义）/GET logs cursor 顺序稳定分页（seq=1 基行号与 auditId 同源，越界空页 nextCursor 原样回传，limit 上限显式 400 禁钳位）；R-dg4 多目标独立 {runner,审计队列} 逐目标串行 sweep 单目标失败留痕继续；R-dg5-① autoNudge 接线 runner（GoalState.autoNudge 逐目标覆盖 ?? cfg.autoNudge 经 RunnerDeps.autoNudge 传入，false=停滞看门狗整体跳过不注入不累计 strikes）；R-dg5-② ReconcileDeps 增可选 clock（M72 墙钟与 runner clock 混流修复，GoalHost 始终传同源时钟，假时间线一致有专测）；R-dg5-③ daemon.pid 单守护前提固化（M69：O_EXCL 独占创建防并发双启、活进程 DAEMON_ALREADY_RUNNING 显式拒绝、陈旧 ESRCH 覆写留痕、内容非法 DAEMON_PIDFILE_INVALID 不代删、stop 仅清自身声明）；守护 HTTP：/goals* 路由+BridgeError→状态码映射（404/409/400/500）+1MB 请求体上限+健康端点增 actives（spec §7.2）+未挂载 GoalHost 显式 501 GOAL_HOST_DISABLED（禁静默假装）；quiescePump 排空窗口修复（T3-05 集成实证缺陷：单轮 feedCount 采样在 async generator 唤醒管线 2~3 轮未走完时误判排空，同块连推多信号迟到决策后——改连续 4 轮稳定窗口，runner 2 新回归测试钉死）；GoalState 增 workdir/maxRounds/autoNudge 可选持久化字段（API 契约字段禁静默丢弃，workdir/maxRounds 无消费者登记待后续）+state.ts 形状校验与 requireValidGoalId/auditFilePath 导出；GoalHost 缺省未接线生产装配归 T3-07（报告登记）；21 新测试（全流程/控制三语义/阻断恢复/分页遍历与越界/隔离/对账重锚不重复注入+时钟注入/autoNudge 双路径/pidfile 四分支/501/输入校验/形态卫生），全量 407 计数（406 pass+1 skip）/0 fail/typecheck 零错误，daemon.ts 625 行、daemon-goals.ts 533 行
+
+## Files changed
+ plugins/codearts-bridge/src/core/goal/runner.ts   |  65 +-
+ plugins/codearts-bridge/src/core/goal/state.ts    |  44 +-
+ plugins/codearts-bridge/src/daemon-goals.ts       | 533 ++++++++++++++++
+ plugins/codearts-bridge/src/daemon.ts             | 429 +++++++++++--
+ plugins/codearts-bridge/test/daemon-goals.test.ts | 713 ++++++++++++++++++++++
+ plugins/codearts-bridge/test/runner.test.ts       |  33 +
+ 6 files changed, 1747 insertions(+), 70 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/goal/runner.ts b/plugins/codearts-bridge/src/core/goal/runner.ts
+index df958d29d0..bbe93bc5b3 100644
+--- a/plugins/codearts-bridge/src/core/goal/runner.ts
++++ b/plugins/codearts-bridge/src/core/goal/runner.ts
+@@ -31,20 +31,25 @@
+  *    正文中的错误词样（含 refusal）沿 C++ 一律重试（防方案描述误判中断）。
+  * 4) 进程死重建立即执行（C++ 等 60s 是等 UI 重建就绪；桥接传输 start 即就绪，
+  *    TUI 就绪门若实测需要属传输宿主层职责——T13 真机发现已留档）。
+  * 5) 错误/进度的计时刻统一取消费时刻（deps.clock）；FakeTransport.at 为调用序
+  *    刻度（types.ts 注），不携带毫秒语义。
+  *
+  * 接口缺口补注（报告登记）：RunnerDeps 增可选 `cfg?: BridgeConfig`——进程死
+  * 重建需 transport.start(cfg, ref)。生产宿主（T3-05）必注入 cfg 或注入闭包
+  * 配置的 transport 适配层；缺省透传 undefined，由具体传输自行显式校验报错
+  * （此处禁止兜底伪造配置——错误在真正的消费点暴露）。
++ *
++ * T3-05 接线落点（progress.md Task 18 派发记录 R-dg5-①）：RunnerDeps 增可选
++ * `autoNudge`——宿主解析生效值（逐目标 GoalState.autoNudge 覆盖 ?? cfg.autoNudge）
++ * 后传入；false = 停滞看门狗（tickLocked 第 6 步）整体跳过，不注入不累计
++ * strikes。缺省 undefined 视为 true（config 裁决默认，与既有测试兼容）。
+  */
+ 
+ import type { BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+ import type { CodeartsTransport, SessionRef, Signal } from "../transport/types";
+ import {
+   CONTINUE_PROMPT,
+   buildContract,
+   buildResumeContract,
+   parseProgress,
+@@ -73,20 +78,33 @@ export interface GoalState {
+   /** 连续无进展恢复次数（nudge/重启累计；步进即复位；仅告警不终止）。 */
+   strikes: number;
+   /** 最近注入文本（回显剥离指纹源；上限 6 条，对齐 C++ noteInjection）。 */
+   injected: string[];
+   /** 上次真实进度时刻（步进/完成标记/注入均刷新；clock 刻度）。 */
+   lastProgressAt: number;
+   /** 当前会话引用（传输层不透明值）。 */
+   session?: SessionRef;
+   /** 审计流标识（由 T3-04 状态层维护；runner 不改写）。 */
+   auditId?: string;
++  /**
++   * 创建请求携带的工作目录（T3-05 API 契约字段；持久化保留、当前版本无消费者
++   * ——禁静默丢弃用户输入，语义消费登记待后续任务）。
++   */
++  workdir?: string;
++  /** 创建请求携带的轮次上限（T3-05 API 契约字段；同 workdir，持久化保留）。 */
++  maxRounds?: number;
++  /**
++   * 逐目标自动续跑覆盖（T3-05 R-dg5-①）：缺省随宿主 cfg.autoNudge（config 裁决
++   * "默认 true；false=显式退出自动续跑的高级选项"）；生效值经 RunnerDeps.autoNudge
++   * 传入 runner。
++   */
++  autoNudge?: boolean;
+ }
+ 
+ /** runner 依赖注入（时钟/传输/审计/日志/阈值/验收执行器）。 */
+ export interface RunnerDeps {
+   /** 外部时钟（R-rn1 纯 tick：时间唯一来源）。 */
+   clock: { now(): number };
+   /** 目标会话传输。 */
+   transport: CodeartsTransport;
+   /** 结构化审计（spec §6.3.3 事件面：start/inject/retry/restart/resume/pause/
+    *  stop/complete/verify/error + warning）。 */
+@@ -95,20 +113,26 @@ export interface RunnerDeps {
+   log(e: object): void;
+   /** 阈值（config T1-02 校验面：stallSeconds/retryCapSeconds/strikes/echoGuardMs）。 */
+   thresholds: BridgeConfig["thresholds"];
+   /** 独立验收执行器（verify 非空时必注入——构造期显式校验）。 */
+   verifyRun?(cmd: string[]): Promise<{ ok: boolean; out: string }>;
+   /**
+    * 传输配置（进程死重建 transport.start 透传；接口缺口补注见头注）。
+    * 生产宿主必传；缺省透传 undefined 由具体传输显式报错。
+    */
+   cfg?: BridgeConfig;
++  /**
++   * 自动续跑开关（T3-05 R-dg5-① 接线）：宿主解析生效值（逐目标覆盖 ?? cfg.autoNudge）
++   * 后传入；缺省/undefined → 视为 true（config 裁决默认：停滞 60s 自动续跑，
++   * "目标永不挂起"承诺）。false = 停滞看门狗不注入（显式退出的高级选项）。
++   */
++  autoNudge?: boolean;
+ }
+ 
+ /* ───── 模型错误分类（源：GoalProtocol::classifyModelError 逐条搬运，R-rn5） ───── */
+ 
+ /** 模型错误类别（与 C++ kPatterns 表一一对应；kind 字符串逐字保留）。 */
+ export type ModelErrorKind = "timeout" | "rate_limit" | "server" | "network" | "empty" | "refusal";
+ 
+ /**
+  * 模式表（写死，FR-9；C++ `\\b` 在 TS 正则字面即 `\b`，语义一致）。
+  * 顺序即 C++ 表序：首匹配优先（ECONNREFUSED 因此命中 network 而非 refusal）。
+@@ -201,20 +225,26 @@ class RetryEngine {
+ 
+ /** 活动密度统计窗口（C++ kActivityWindowMs=3000）。 */
+ const ACTIVITY_WINDOW_MS = 3000;
+ /** 窗口内 ≥N 块 = 转轮动画在跑（C++ kActivityMinChunks=12）。 */
+ const ACTIVITY_MIN_CHUNKS = 12;
+ /** 最近注入保留上限（C++ noteInjection 的 6 条）。 */
+ const RECENT_INJECTION_CAP = 6;
+ /** 审计中验收输出截断长度（完整 out 只进注入文案；审计保证据摘要）。 */
+ const AUDIT_OUT_CHARS = 500;
+ 
++/**
++ * quiesce 排空判据的稳定窗口微任务轮数（quiescePump 注释：async generator 唤醒
++ * 管线深度 2~3 轮 + 余量；T3-05 守护集成同块连推多信号用例实证取值）。
++ */
++const QUIESCE_STABLE_TURNS = 4;
++
+ /** 注入种类（审计 goal.inject.kind）。 */
+ type InjectKind = "contract" | "continue" | "resume" | "verify-fail";
+ 
+ /** 截断审计证据文本（保完整 out 于注入文案，审计留摘要）。 */
+ function truncateForAudit(s: string): string {
+   return s.length > AUDIT_OUT_CHARS ? `${s.slice(0, AUDIT_OUT_CHARS)}…(+${s.length - AUDIT_OUT_CHARS} 字符)` : s;
+ }
+ 
+ /**
+  * 目标监督状态机（spec §6.3.2）。
+@@ -379,24 +409,29 @@ export class GoalRunner {
+         hasProgress
+           ? buildResumeContract({
+               objective: this.st.objective,
+               doneSteps: [...new Set(this.st.steps)].sort((a, b) => a - b),
+             })
+           : buildContract(this.st.objective, this.st.verify),
+         hasProgress ? "resume" : "contract",
+       );
+       return this.snap();
+     }
+-    // 6) 停滞看门狗：无增量且无步骤推进 ≥stallMs（双条件，C++ noProg && chatStopped）
+-    const stallMs = this.deps.thresholds.stallSeconds * 1000;
+-    if (now - this.lastProgressAt >= stallMs && now - this.lastActiveAt >= stallMs) {
+-      await this.nudgeLocked(now);
++    // 6) 停滞看门狗：无增量且无步骤推进 ≥stallMs（双条件，C++ noProg && chatStopped）。
++    //    autoNudge=false（R-dg5-①，宿主经 RunnerDeps.autoNudge 传入生效值）= 显式
++    //    退出自动续跑：本分支整体跳过（不注入、不累计 strikes），停滞可见性由
++    //    lastProgressAt 时间戳承载，恢复驱动只能经 control resume（人工）。
++    if (this.deps.autoNudge !== false) {
++      const stallMs = this.deps.thresholds.stallSeconds * 1000;
++      if (now - this.lastProgressAt >= stallMs && now - this.lastActiveAt >= stallMs) {
++        await this.nudgeLocked(now);
++      }
+     }
+     return this.snap();
+   }
+ 
+   /* ───── 引导 / 重试 / 停滞 / 重建 ───── */
+ 
+   /** 首次驱动：建会话 + 起信号泵 +（未注入过时）下发契约并审计 goal.start。 */
+   private async bootstrapLocked(): Promise<void> {
+     const now = this.now();
+     const ref = await this.deps.transport.start(this.deps.cfg as BridgeConfig);
+@@ -585,27 +620,37 @@ export class GoalRunner {
+   }
+ 
+   /** 等泵排空已送达信号（tick 决策前消费完，防"信号迟到决策后"竞态）。 */
+   private async quiescePump(): Promise<void> {
+     for (;;) {
+       if (!this.pumpLoop) return; // 泵未启动/已退出：无在途消费
+       if (!this.pumpParked) {
+         await Promise.resolve(); // 泵正在消费/尚未首停：让渡等它挂起
+         continue;
+       }
+-      // 挂起态：再让渡一整轮微任务——若期间有新消费（feedCount 变化）说明
+-      // 还有已 resolve 未处理的信号，继续；否则传输队列已空，决策安全。
+-      // （信号 push 的唤醒反应在 tick 之前已入微任务队列，FIFO 保证可达。）
++      // 挂起态：连续 QUIESCE_STABLE_TURNS 个微任务轮 feedCount 无变化且泵始终
++      // 挂起 → 传输队列已空，决策安全。单轮采样不够（T3-05 守护集成实证）：
++      // async generator 的唤醒管线"恢复 → yield → 泵续"跨 2~3 个微任务轮，
++      // 同步块内连推的多信号在管线中依次迟到——单轮 feedCount 稳定会误判
++      // 排空（首个信号已消费、后续信号尚在管线），违反"已到达信号先于决策
++      // 被消费"契约。窗口取 4 轮（覆盖实测管线深度 + 余量）：若仍有在途
++      // 信号，feedCount 必在窗口内变化，外层循环继续等。
+       const before = this.feedCount;
+-      await Promise.resolve();
+-      if (!this.pumpLoop || !this.pumpParked) continue;
+-      if (this.feedCount === before) return;
++      let stable = true;
++      for (let i = 0; i < QUIESCE_STABLE_TURNS; i++) {
++        await Promise.resolve();
++        if (!this.pumpLoop || !this.pumpParked || this.feedCount !== before) {
++          stable = false;
++          break;
++        }
++      }
++      if (stable) return;
+     }
+   }
+ 
+   /** 等泵完全退出（重启前确保 observe 槽位释放，防 OBSERVER_ACTIVE）。 */
+   private async awaitPumpDead(): Promise<void> {
+     while (this.pumpLoop) await Promise.resolve();
+   }
+ 
+   /**
+    * 单信号处理（C++ GoalRunner::feed 移植；feed 顺序契约见 protocol.ts 头注）：
+diff --git a/plugins/codearts-bridge/src/core/goal/state.ts b/plugins/codearts-bridge/src/core/goal/state.ts
+index 5b5b348314..e361be23df 100644
+--- a/plugins/codearts-bridge/src/core/goal/state.ts
++++ b/plugins/codearts-bridge/src/core/goal/state.ts
+@@ -66,22 +66,26 @@ import type { GoalPhase, GoalState } from "./runner";
+ 
+ /* ───── 常量与校验 ───── */
+ 
+ /** goalId 白名单（路径安全 + 语义约束；头注"显式决策"条目）。 */
+ const GOAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+ /** goalId 长度上限（文件名卫生；合法 id 均为生成器产物，远短于此）。 */
+ const GOAL_ID_MAX = 128;
+ /** 损坏内容进审计证据的截断长度（防超大垃圾文件撑爆审计流）。 */
+ const CORRUPT_PREVIEW_CHARS = 200;
+ 
+-/** 校验 goalId（路径安全白名单）；非法抛 GOAL_ID_INVALID。 */
+-function requireValidGoalId(goalId: string): string {
++/**
++ * 校验 goalId（路径安全白名单）；非法抛 GOAL_ID_INVALID。
++ * 导出供 T3-05 守护宿主（daemon-goals）复用同一白名单——logs/control 端点以
++ * goalId 构造审计文件路径，路径穿越拒绝面必须同源。
++ */
++export function requireValidGoalId(goalId: string): string {
+   if (typeof goalId !== "string" || goalId.length === 0 || goalId.length > GOAL_ID_MAX || !GOAL_ID_RE.test(goalId)) {
+     throw new BridgeError(
+       "GOAL_ID_INVALID",
+       `goalId 非法（须匹配 ${GOAL_ID_RE.source} 且 ≤${GOAL_ID_MAX} 字符）：${JSON.stringify(goalId)}`,
+       { remediation: "goalId 由 /goal 创建方生成（<时间戳>-<随机串> 形态）；禁止含路径分隔符等字符。" },
+     );
+   }
+   return goalId;
+ }
+ 
+@@ -136,20 +140,30 @@ function validateGoalState(v: unknown, expectedGoalId: string): GoalState {
+   if (typeof g.lastProgressAt !== "number" || !Number.isFinite(g.lastProgressAt)) {
+     throw invalidState("lastProgressAt 须为有限数字");
+   }
+   if (g.session !== undefined) {
+     if (!isPlainObject(g.session)) throw invalidState("session 须为对象");
+     const s = g.session as Record<string, unknown>;
+     if (s.kind !== "structured" && s.kind !== "pty") throw invalidState(`session.kind 须为 structured/pty：${JSON.stringify(s.kind)}`);
+     if (typeof s.id !== "string" || s.id.length === 0) throw invalidState("session.id 须为非空字符串");
+   }
+   if (g.auditId !== undefined && typeof g.auditId !== "string") throw invalidState("auditId 须为字符串");
++  // T3-05 新增可选字段（API 契约字段持久化；出现即校验形状，错型判损坏）：
++  if (g.workdir !== undefined && (typeof g.workdir !== "string" || g.workdir.length === 0)) {
++    throw invalidState("workdir 须为非空字符串");
++  }
++  if (g.maxRounds !== undefined && (!isNonNegInt(g.maxRounds) || g.maxRounds < 1)) {
++    throw invalidState("maxRounds 须为正整数");
++  }
++  if (g.autoNudge !== undefined && typeof g.autoNudge !== "boolean") {
++    throw invalidState("autoNudge 须为布尔值");
++  }
+   return v as unknown as GoalState;
+ }
+ 
+ /* ───── 路径布局（<stateDir>/goals、<stateDir>/audit） ───── */
+ 
+ function goalsDirOf(stateDir: string): string {
+   return path.join(stateDir, "goals");
+ }
+ 
+ function auditDirOf(stateDir: string): string {
+@@ -157,20 +171,25 @@ function auditDirOf(stateDir: string): string {
+ }
+ 
+ function goalFileOf(stateDir: string, goalId: string): string {
+   return path.join(goalsDirOf(stateDir), `${requireValidGoalId(goalId)}.json`);
+ }
+ 
+ function auditFileOf(stateDir: string, goalId: string): string {
+   return path.join(auditDirOf(stateDir), `${requireValidGoalId(goalId)}.jsonl`);
+ }
+ 
++/** 审计流文件绝对路径（导出供 T3-05 守护宿主 logs 分页读取；内部校验 goalId）。 */
++export function auditFilePath(stateDir: string, goalId: string): string {
++  return auditFileOf(stateDir, goalId);
++}
++
+ /** 确保子目录存在且 mode 0700（mkdir 的 mode 被 umask 掩蔽，故创建后显式 chmod；同 config.ensureStateDirs 纪律）。 */
+ async function ensureDir(dir: string): Promise<void> {
+   await mkdir(dir, { recursive: true, mode: 0o700 });
+   await chmod(dir, 0o700);
+ }
+ 
+ /* ───── saveGoal / loadGoals（R-st1） ───── */
+ 
+ /**
+  * 原子持久化单个目标状态（R-st1）：同构结构校验 → atomicWriteFile（同目录
+@@ -346,26 +365,34 @@ async function appendAuditLocked(file: string, goalId: string, e: Record<string,
+       { cause: err },
+     );
+   } finally {
+     await fh?.close().catch(() => undefined); // 关闭失败不掩盖主错误（仅资源回收）
+   }
+   return auditId;
+ }
+ 
+ /* ───── reconcile（R-st3 幂等 / R-st4 重锚） ───── */
+ 
+-/** reconcile 依赖注入（任务书接口 + 已裁定 cfg 缺口，见头注）。 */
++/** reconcile 依赖注入（任务书接口 + 已裁定 cfg 缺口 + T3-05 时钟注入 M72）。 */
+ export interface ReconcileDeps {
+   /** 目标会话传输。 */
+   transport: CodeartsTransport;
+   /** 传输配置（重建 transport.start 透传；缺省 undefined 由具体传输显式校验）。 */
+   cfg?: BridgeConfig;
++  /**
++   * 时钟源（M72 裁定，T3-05 守护宿主接线）：对账期 lastProgressAt / 审计 at 的
++   * 时刻唯一来源。缺省 = 系统墙钟（独立调用方的生产语义，与 loadConfig 缺省
++   * process.env 同风格）；守护宿主（GoalHost）必须传入与 GoalRunner 同源的
++   * clock——假时钟测试下"对账时刻"与"runner tick 时刻"保持同一条时间线，
++   * 禁止墙钟与注入时钟混流。
++   */
++  clock?: { now(): number };
+ }
+ 
+ /** reconcile 结果（R-st3：供守护/测试断言）。resumed=已恢复可驱动；blocked=等人工。 */
+ export interface ReconcileResult {
+   resumed: string[];
+   blocked: string[];
+ }
+ 
+ /**
+  * 对账互斥锁（per stateDir 绝对路径 → Promise 链尾）：并发/重入 reconcile
+@@ -409,32 +436,33 @@ export function reconcile(stateDir: string, deps: ReconcileDeps): Promise<Reconc
+ 
+ /** 锁内主体：逐目标判定与恢复。 */
+ async function reconcileLocked(stateDir: string, deps: ReconcileDeps): Promise<ReconcileResult> {
+   const { goals, corrupted } = await loadGoals(stateDir);
+   const resumed: string[] = [];
+   const blocked = corrupted.map((c) => c.goalId);
+   for (const g of goals) {
+     if (g.phase !== "active") continue; // 终态/paused/blocked：不触碰（头注分工边界）
+     if (g.session === undefined) continue; // 从未引导：首 tick bootstrap 自举，无需对账
+     const alive = await deps.transport.alive(g.session);
++    const nowOf = (): number => deps.clock?.now() ?? Date.now(); // M72：注入时钟优先，缺省墙钟
+     if (alive) {
+       if (g.injected.length === 0) {
+         // R-st4 重锚分支：会话在场但从未注入 → 重发契约（判据同 runner.tick 第 5 步）
+         const text = progressContractOf(g);
+         await deps.transport.inject(g.session, text);
+         g.injected = [text];
+         g.rounds += 1;
+-        g.lastProgressAt = Date.now(); // 注入刷新进度时刻（runner.injectPrompt 同语义；对账层时刻源=墙钟）
++        g.lastProgressAt = nowOf(); // 注入刷新进度时刻（runner.injectPrompt 同语义；时刻源见 ReconcileDeps.clock）
+         g.auditId = await appendAudit(stateDir, g.goalId, {
+           type: "goal.inject",
+           goalId: g.goalId,
+-          at: Date.now(),
++          at: nowOf(),
+           kind: "reconcile-reanchor",
+           rounds: g.rounds,
+         });
+         await saveGoal(stateDir, g);
+       }
+       // 指纹在场 → 不重发（R-st4 后半；连续两次 reconcile 的第二次走此路径）
+       resumed.push(g.goalId);
+       continue;
+     }
+     // 会话死：重建 + 断点契约（R-st3）。仅"传输阶段失败"按裁定降级 blocked；
+@@ -459,31 +487,31 @@ async function reconcileLocked(stateDir: string, deps: ReconcileDeps): Promise<R
+         reason,
+       });
+       await saveGoal(stateDir, g);
+       blocked.push(g.goalId);
+       continue;
+     }
+     g.session = ref;
+     g.injected = [text]; // 重建全新会话：旧指纹清空，仅留本次契约（runner 重锚期待）
+     g.rounds += 1;
+     g.strikes += 1; // 与 runner.restartLocked 同口径：重启计入循环保护
+-    g.lastProgressAt = Date.now();
++    g.lastProgressAt = nowOf();
+     await appendAudit(stateDir, g.goalId, {
+       type: "goal.restart",
+       goalId: g.goalId,
+-      at: Date.now(),
++      at: nowOf(),
+       reason: "reconcile-session-died",
+     });
+     g.auditId = await appendAudit(stateDir, g.goalId, {
+       type: "goal.inject",
+       goalId: g.goalId,
+-      at: Date.now(),
++      at: nowOf(),
+       kind: "reconcile-rebuild",
+       rounds: g.rounds,
+     });
+     await saveGoal(stateDir, g);
+     resumed.push(g.goalId);
+   }
+   return { resumed, blocked };
+ }
+ 
+ /**
+diff --git a/plugins/codearts-bridge/src/daemon-goals.ts b/plugins/codearts-bridge/src/daemon-goals.ts
+new file mode 100644
+index 0000000000..d12d132841
+--- /dev/null
++++ b/plugins/codearts-bridge/src/daemon-goals.ts
+@@ -0,0 +1,533 @@
++/**
++ * 守护目标域宿主（T3-05）——把 T3-03 GoalRunner（纯 tick）与 T3-04 持久化/对账
++ * 接进守护 HTTP API（spec §7.2 /goals* 端点的领域层）。
++ *
++ * 主控裁定落点（progress.md Task 18 派发记录，2026-10-31，逐条）：
++ * - R-dg1（构造与循环）：POST /goals → 构造 GoalState（goalId 生成：
++ *   `g<clock36>-<8hex>`，匹配 state.ts 白名单）→ saveGoal → 以落盘状态构造
++ *   GoalRunner（同一字节落盘后 roster；对账/自举写入的 injected 指纹使 tick
++ *   重锚不重复注入——R-st4 语义）→ 立即 loop.wake()（事件驱动首驱）。
++ *   周期 sweep 循环为宿主级：生产缺省 setInterval 5s（defaultTickLoop），测试经
++ *   TickLoop 注入手动驱动——runner 保持 R-rn1 纯 tick（零内嵌定时器），本模块是
++ *   唯一的定时器宿主。
++ * - R-dg2（控制语义）：pause=phase 翻转（此后 sweep 不再注入——runner.tick 对
++ *   非 active 相位不驱动）；resume=注入继续指令；stop=终态并移出循环名册。
++ *   即时生效：control 端点 await runner 动作 + 状态落盘 + 审计冲刷后才响应。
++ * - R-dg3（日志分页）：GET /goals/:id/logs 顺序稳定分页——审计文件为追加流，
++ *   seq=1 基行号（与 appendAudit 的 auditId 序号同源同序）；cursor=已读最大 seq
++ *   （含），返回 seq>cursor 的升序事件页；nextCursor=本页最大 seq（空页=原
++ *   cursor）——前进单调、不重复、不遗漏；轮询方以 nextCursor 续读即可。
++ * - R-dg4（多目标隔离）：每目标独立 {runner, 审计队列}；sweep 逐目标串行 tick，
++ *   单目标失败不中断其余目标（stderr + goal.error 审计留痕，可见非静默）。
++ * - R-dg5（携带指针）：
++ *   ① autoNudge 接线 runner：生效值 = GoalState.autoNudge（逐目标覆盖）??
++ *     cfg.autoNudge（宿主默认），经 RunnerDeps.autoNudge 传入；false 时 runner
++ *     停滞看门狗整体跳过。
++ *   ② reconcile 墙钟 vs runner clock 混流（M72）：ReconcileDeps 增可选 clock，
++ *     GoalHost.start 始终传入与 runner 同源的 clock——假时钟下时间线一致。
++ *   ③ 单守护前提以 pidfile 固化（M69）：daemon.pid 在 daemon.ts 实现（HTTP 宿主
++ *     生命周期层），本模块不涉。
++ *
++ * 显式决策登记（非兜底，逐条可审计）：
++ * - 审计队列：RunnerDeps.audit 为同步签名（T3-03 接口），而 appendAudit 为异步
++ *   ——宿主以 per-goal Promise 链排队，端点响应前 await 冲刷（测试确定性）。
++ *   追加失败打 stderr 结构化日志、不掩盖已生效动作（对齐 run.ts R-cr4 "exit
++ *   失败不掩盖结果"先例；状态本体已由 saveGoal 持久化）。
++ * - sweep 逐目标 tick 异常：stderr + goal.error(kind=tick-failed) 审计各一条，
++ *   目标保留待下轮重试（传输瞬断自愈语义，与 runner 进程死重建立即执行同风格）。
++ * - 状态落盘节流：sweep 内 JSON 串比对，未变化不写盘（5s 周期的幂等优化，
++ *   非"失败兜底"——写失败照常显式报错）。
++ * - GET /goals/:id 优先返回在册 runner 的实时状态（比磁盘新）；不在册（终态/
++ *   blocked/外部启动前）读磁盘。GET /goals 列表一律读磁盘（全生命周期视图）。
++ * - blocked 目标的 control：GoalRunner 构造守卫拒绝 blocked 初值（T3-03），
++ *   宿主侧归一为 paused 构造后立即执行动作——resume 的"注入继续并转 active"
++ *   与 stop 的"终态"语义由 runner 原样达成，瞬态 paused 不落盘（动作后统一
++ *   持久化）；pause 对 blocked 显式拒绝 409（已由策略暂停，重复暂停无意义）。
++ * - workdir/maxRounds：任务书 API 契约字段，当前版本无消费者——持久化保留
++ *   （禁静默丢弃用户输入），语义消费登记待后续任务；形状校验就地显式报错。
++ */
++
++import { randomBytes } from "node:crypto";
++import { readFile } from "node:fs/promises";
++import * as path from "node:path";
++import type { BridgeConfig } from "./core/config";
++import { BridgeError } from "./core/errors";
++import { errnoOf } from "./core/fsx";
++import { appendAudit, auditFilePath, loadGoals, reconcile, requireValidGoalId, saveGoal } from "./core/goal/state";
++import type { ReconcileResult } from "./core/goal/state";
++import { GoalRunner } from "./core/goal/runner";
++import type { GoalPhase, GoalState, RunnerDeps } from "./core/goal/runner";
++import type { CodeartsTransport } from "./core/transport/types";
++
++/* ───── tick 循环宿主抽象（R-dg1：定时器唯一宿主） ───── */
++
++/**
++ * 生产 sweep 周期（任务书 R-dg1：宿主级 setInterval 5s）——事件驱动之外的
++ * 周期兜底驱动（停滞看门狗/重试到期/验收核验的决策节拍）。T3-07 守护服务
++ * 装配 defaultTickLoop(GOAL_SWEEP_INTERVAL_MS) 时消费同一常量。
++ */
++export const GOAL_SWEEP_INTERVAL_MS = 5000;
++
++/** 宿主级 sweep 循环：start 装配、wake 事件驱动、stop 摘除。 */
++export interface TickLoop {
++  /** 装配周期 sweep（重复 start 须先摘除旧循环——实现自保证幂等）。 */
++  start(sweep: () => Promise<void>): void;
++  /** 请求立即执行一次 sweep（事件驱动触发；实现可合并并发触发）。 */
++  wake(): void;
++  /** 摘除循环（守护 stop 路径；幂等）。 */
++  stop(): void;
++}
++
++/** 生产缺省循环：setInterval(intervalMs) + wake 立即触发（并发触发合并）。 */
++export function defaultTickLoop(intervalMs: number): TickLoop {
++  let timer: ReturnType<typeof setInterval> | undefined;
++  let sweepFn: (() => Promise<void>) | undefined;
++  let inFlight = false;
++  const fire = (): void => {
++    if (inFlight || sweepFn === undefined) return; // 未装配/上轮未结束：合并到下轮（sweep 自带 per-goal 容错）
++    inFlight = true;
++    void Promise.resolve()
++      .then(sweepFn)
++      .catch((e: unknown) => {
++        // sweep 自身已 per-goal 容错；此处是框架级意外：可见非静默
++        console.error(`[codearts-bridge] 目标 sweep 框架异常：${e instanceof Error ? e.message : String(e)}`);
++      })
++      .finally(() => {
++        inFlight = false;
++      });
++  };
++  return {
++    start(sweep: () => Promise<void>): void {
++      if (timer !== undefined) clearInterval(timer); // 重复 start：先摘旧（幂等）
++      sweepFn = sweep;
++      timer = setInterval(fire, intervalMs);
++      // unref：定时器不独立维持事件循环（守护存活由 HTTP server 承载），
++      // 防 bun test 等嵌入场景因在册定时器悬挂退出。
++      (timer as unknown as { unref?: () => void }).unref?.();
++    },
++    wake(): void {
++      fire();
++    },
++    stop(): void {
++      if (timer !== undefined) clearInterval(timer);
++      timer = undefined;
++      sweepFn = undefined;
++    },
++  };
++}
++
++/* ───── 守护目标域依赖与请求形状 ───── */
++
++/** GoalHost 依赖注入（传输/时钟/循环/验收执行器）。 */
++export interface GoalHostDeps {
++  cfg: BridgeConfig;
++  /** 目标会话传输（生产由守护装配层选型注入；测试注入 FakeTransport）。 */
++  transport: CodeartsTransport;
++  /** 时钟（与 runner 同源；R-rn1 纯 tick + M72 对账同源）。 */
++  clock: { now(): number };
++  /** sweep 循环宿主。 */
++  loop: TickLoop;
++  /** 独立验收执行器（透传 RunnerDeps.verifyRun；目标声明 verify 时必配）。 */
++  verifyRun?(cmd: string[]): Promise<{ ok: boolean; out: string }>;
++}
++
++/** POST /goals 请求体（任务书 API 契约 + autoNudge 逐目标覆盖）。 */
++export interface GoalCreateInput {
++  objective: string;
++  verify: string[];
++  workdir?: string;
++  maxRounds?: number;
++  autoNudge?: boolean;
++}
++
++/** control 动作（R-dg2）。 */
++export type GoalControlAction = "pause" | "resume" | "stop";
++
++/** GET /goals/:id/logs 响应页（R-dg3）。 */
++export interface GoalLogsPage {
++  goalId: string;
++  /** 审计事件（追加序升序；seq=1 基行号与 auditId 序号同源）。 */
++  events: Array<Record<string, unknown>>;
++  /** 续读游标：本页最大 seq（空页=请求 cursor）；轮询方原样回传。 */
++  nextCursor: number;
++}
++
++/* ───── 输入校验（显式报错，禁静默截断/补缺） ───── */
++
++/** GET /goals/:id/logs 的 limit 缺省/上限（分页守卫生；防单响应拖垮守护）。 */
++export const LOGS_DEFAULT_LIMIT = 200;
++export const LOGS_MAX_LIMIT = 1000;
++
++function isPlainObject(v: unknown): v is Record<string, unknown> {
++  return typeof v === "object" && v !== null && !Array.isArray(v);
++}
++
++function inputError(detail: string): BridgeError {
++  return new BridgeError("GOAL_INPUT_INVALID", `POST /goals 请求体非法：${detail}`, {
++    remediation: "形如 { objective: string, verify?: string[], workdir?: 绝对路径, maxRounds?: 正整数, autoNudge?: boolean }。",
++  });
++}
++
++/** blocked 目标的 pause 统一拒绝（在册/非在册同裁决；头注 blocked 条目）。 */
++function blockedPauseError(goalId: string): BridgeError {
++  return new BridgeError(
++    "GOAL_PHASE_INVALID",
++    `目标处于 blocked（等人工），pause 无意义：goalId=${goalId}`,
++    { remediation: "如需恢复驱动请 resume；如需终止请 stop。" },
++  );
++}
++
++/** 解析并校验创建请求体（全字段显式校验；未知字段忽略——前向兼容口径）。 */
++export function parseCreateInput(raw: unknown): GoalCreateInput {
++  if (!isPlainObject(raw)) throw inputError(`须为 JSON 对象（实际 ${raw === null ? "null" : typeof raw}）`);
++  const objective = raw["objective"];
++  if (typeof objective !== "string" || objective.trim().length === 0) {
++    throw inputError(`objective 须为非空字符串（实际 ${JSON.stringify(objective ?? null)}）`);
++  }
++  let verify: string[] = [];
++  if (raw["verify"] !== undefined) {
++    if (!Array.isArray(raw["verify"]) || !(raw["verify"] as unknown[]).every((x) => typeof x === "string")) {
++      throw inputError("verify 须为字符串数组");
++    }
++    verify = (raw["verify"] as string[]).map((v) => v.trim()).filter((v) => v !== "");
++  }
++  let workdir: string | undefined;
++  if (raw["workdir"] !== undefined) {
++    if (typeof raw["workdir"] !== "string" || (raw["workdir"] as string).length === 0) {
++      throw inputError("workdir 须为非空字符串");
++    }
++    workdir = raw["workdir"] as string;
++    if (!path.isAbsolute(workdir)) {
++      throw inputError(`workdir 必须为绝对路径（FS 落点禁止依赖 cwd，与配置层同纪律）：${JSON.stringify(workdir)}`);
++    }
++  }
++  let maxRounds: number | undefined;
++  if (raw["maxRounds"] !== undefined) {
++    const v = raw["maxRounds"];
++    if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
++      throw inputError(`maxRounds 须为正整数（实际 ${JSON.stringify(v ?? null)}）`);
++    }
++    maxRounds = v;
++  }
++  let autoNudge: boolean | undefined;
++  if (raw["autoNudge"] !== undefined) {
++    if (typeof raw["autoNudge"] !== "boolean") throw inputError("autoNudge 须为布尔值");
++    autoNudge = raw["autoNudge"] as boolean;
++  }
++  return { objective: objective.trim(), verify, workdir, maxRounds, autoNudge };
++}
++
++/* ───── 审计队列（RunnerDeps.audit 同步签名 → 异步追加的宿主桥） ───── */
++
++interface AuditSink {
++  push(e: object): void;
++  /** 等待已入队事件全部落盘（端点响应前调用，测试确定性）。 */
++  flush(): Promise<void>;
++}
++
++function makeAuditSink(stateDir: string, goalId: string): AuditSink {
++  let tail: Promise<unknown> = Promise.resolve();
++  return {
++    push(e: object): void {
++      const run = tail.then(() => appendAudit(stateDir, goalId, e));
++      tail = run.then(
++        () => undefined,
++        (err: unknown) => {
++          // 显式可见、不掩盖已生效动作（头注"显式决策"条目）
++          console.error(
++            `[codearts-bridge] 目标审计追加失败（动作已生效，审计留痕缺失）：goalId=${goalId} reason=${err instanceof Error ? err.message : String(err)}`,
++          );
++        },
++      );
++    },
++    flush: () => tail.then(() => undefined, () => undefined),
++  };
++}
++
++/* ───── GoalHost ───── */
++
++/** 循环名册条目：runner + 审计队列 + 上次落盘快照（变化检测）。 */
++interface RosterEntry {
++  runner: GoalRunner;
++  sink: AuditSink;
++  lastSaved: string;
++}
++
++/**
++ * 目标域宿主：GoalRunner 的循环宿主与 /goals* 端点的领域实现（R-dg1~R-dg5）。
++ * 守护（daemon.ts）经 createDaemon 第三参挂载；HTTP 形态与鉴权归守护层。
++ */
++export class GoalHost {
++  private readonly deps: GoalHostDeps;
++  private readonly stateDir: string;
++  private readonly roster = new Map<string, RosterEntry>();
++  private sweeping = false;
++
++  constructor(deps: GoalHostDeps) {
++    this.deps = deps;
++    this.stateDir = deps.cfg.stateDir;
++  }
++
++  /**
++   * 守护启动装配：对账（M72 时钟同源注入）→ 以落盘状态 roster active/paused
++   * 目标（R-dg1"以落盘状态构造 GoalRunner"）→ 启动 sweep 循环。
++   * reconcileOverride：daemon 钩子缝（T3-04 DaemonHooks.reconcileOnStart）透传，
++   * 测试可替换对账实现；缺省用本模块的真实 reconcile。
++   */
++  async start(reconcileOverride?: (stateDir: string) => Promise<ReconcileResult>): Promise<ReconcileResult> {
++    const result =
++      reconcileOverride !== undefined
++        ? await reconcileOverride(this.stateDir)
++        : await reconcile(this.stateDir, {
++            transport: this.deps.transport,
++            cfg: this.deps.cfg,
++            clock: this.deps.clock, // M72：对账与 runner 同一条时间线
++          });
++    const { goals } = await loadGoals(this.stateDir);
++    for (const g of goals) {
++      if (this.roster.has(g.goalId)) continue; // 启动重试路径防双 roster（双 pump 会 OBSERVER_ACTIVE）
++      if (g.phase === "active" || g.phase === "paused") this.rosterGoal(g);
++    }
++    this.deps.loop.start(() => this.sweep());
++    return result;
++  }
++
++  /** 守护停止：摘除循环。会话与目标状态不销毁（重启后 reconcile 重连续跑）。 */
++  stop(): void {
++    this.deps.loop.stop();
++  }
++
++  /** 健康端点 actives：在册且相位 active 的目标数。 */
++  activeCount(): number {
++    let n = 0;
++    for (const entry of this.roster.values()) {
++      if (entry.runner.state().phase === "active") n += 1;
++    }
++    return n;
++  }
++
++  /** 创建目标（R-dg1）：校验 → 落盘 → 以落盘状态 roster → 事件驱动唤醒。 */
++  async createGoal(raw: unknown): Promise<{ goalId: string }> {
++    const input = parseCreateInput(raw);
++    const now = this.deps.clock.now();
++    const goalId = `g${now.toString(36)}-${randomBytes(4).toString("hex")}`;
++    const state: GoalState = {
++      goalId,
++      objective: input.objective,
++      verify: input.verify,
++      phase: "active",
++      rounds: 0,
++      steps: [],
++      strikes: 0,
++      injected: [],
++      lastProgressAt: now,
++      ...(input.workdir !== undefined ? { workdir: input.workdir } : {}),
++      ...(input.maxRounds !== undefined ? { maxRounds: input.maxRounds } : {}),
++      ...(input.autoNudge !== undefined ? { autoNudge: input.autoNudge } : {}),
++    };
++    await saveGoal(this.stateDir, state);
++    this.rosterGoal(state);
++    this.deps.loop.wake(); // 事件驱动首驱（生产缺省循环立即 sweep；测试手动驱动不受影响）
++    return { goalId };
++  }
++
++  /** 全量目标列表（磁盘真相；spec §7.2 摘要形态，objective 截断 ≤120 字）。 */
++  async listGoals(): Promise<Array<{ goalId: string; state: GoalPhase; rounds: number; strikes: number; objective: string }>> {
++    const { goals } = await loadGoals(this.stateDir);
++    return goals.map((g) => ({
++      goalId: g.goalId,
++      state: g.phase,
++      rounds: g.rounds,
++      strikes: g.strikes,
++      objective: g.objective.slice(0, 120),
++    }));
++  }
++
++  /** 单目标完整状态（在册优先实时，否则读磁盘）。 */
++  async getGoal(goalId: string): Promise<GoalState> {
++    requireValidGoalId(goalId);
++    const entry = this.roster.get(goalId);
++    if (entry !== undefined) return entry.runner.state();
++    return this.loadFromDisk(goalId);
++  }
++
++  /** control 端点（R-dg2）：pause/resume/stop 即时生效并持久化。 */
++  async control(goalId: string, action: unknown): Promise<GoalState> {
++    requireValidGoalId(goalId);
++    if (action !== "pause" && action !== "resume" && action !== "stop") {
++      throw new BridgeError("GOAL_ACTION_INVALID", `control action 非法（须为 pause/resume/stop）：${JSON.stringify(action)}`);
++    }
++    const entry = await this.resolveEntry(goalId, action);
++    if (action === "pause" && entry.runner.state().phase === "blocked") {
++      // 在册 blocked 目标的 pause 同样显式拒绝（与 resolveEntry 非在册路径同一裁决）
++      throw blockedPauseError(goalId);
++    }
++    let st: GoalState;
++    if (action === "pause") {
++      entry.runner.pause(); // 同步原子翻转（R-rn2）；终态已在 resolveEntry 拦截
++      st = entry.runner.state();
++    } else if (action === "resume") {
++      st = await entry.runner.resume();
++    } else {
++      st = await entry.runner.stop();
++    }
++    await saveGoal(this.stateDir, st);
++    entry.lastSaved = JSON.stringify(st);
++    await entry.sink.flush(); // R-dg2 即时生效：响应前审计已落盘
++    if (st.phase === "complete" || st.phase === "stopped") this.roster.delete(goalId);
++    return st;
++  }
++
++  /** logs 分页（R-dg3）：磁盘审计流的顺序稳定分页。 */
++  async getLogs(goalId: string, cursor?: number, limit?: number): Promise<GoalLogsPage> {
++    requireValidGoalId(goalId);
++    await this.loadFromDisk(goalId); // 存在性守卫（终态/blocked 目标的审计同样可读）
++    const cur = cursor ?? 0;
++    const limRaw = limit ?? LOGS_DEFAULT_LIMIT;
++    if (limRaw > LOGS_MAX_LIMIT) {
++      // 上限显式拒绝（禁静默钳位——超限是调用方错误，就地上报）
++      throw new BridgeError("GOAL_LIMIT_INVALID", `limit 超过上限 ${LOGS_MAX_LIMIT}：${limRaw}`);
++    }
++    const lim = limRaw;
++    const file = auditFilePath(this.stateDir, goalId);
++    let content: string | undefined;
++    try {
++      content = await readFile(file, "utf8");
++    } catch (e) {
++      if (errnoOf(e) !== "ENOENT") {
++        throw new BridgeError(
++          "AUDIT_READ_FAILED",
++          `读取审计流失败：path=${file} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++          { cause: e },
++        );
++      }
++      // ENOENT：目标尚无审计事件（创建后未驱动）——合法空页，与 loadGoals 首启口径一致
++    }
++    const matched: Array<{ seq: number; event: Record<string, unknown> }> = [];
++    if (content !== undefined) {
++      const lines = content.split("\n");
++      for (let i = 0; i < lines.length; i++) {
++        const line = lines[i] as string;
++        if (line.trim().length === 0) continue; // 尾换行产生的空段
++        const seq = i + 1;
++        if (seq <= cur) continue;
++        let event: unknown;
++        try {
++          event = JSON.parse(line);
++        } catch (cause) {
++          // 审计流损坏（外部改写/撕裂）：显式报错，禁静默跳行（取证凭据不容猜）
++          throw new BridgeError(
++            "AUDIT_LOG_CORRUPT",
++            `审计行解析失败：path=${file} line=${seq}（seq 基于行号，损坏即停止分页）`,
++            { cause },
++          );
++        }
++        matched.push({ seq, event: { ...(event as Record<string, unknown>), seq } });
++      }
++    }
++    const page = matched.slice(0, lim);
++    const nextCursor = page.length > 0 ? (page[page.length - 1] as { seq: number }).seq : cur;
++    return { goalId, events: page.map((p) => p.event), nextCursor };
++  }
++
++  /* ───── 内部：roster / sweep / 解析 ───── */
++
++  /** 以（落盘）状态构造 runner 并入册（R-dg1）。 */
++  private rosterGoal(g: GoalState): RosterEntry {
++    const sink = makeAuditSink(this.stateDir, g.goalId);
++    const deps: RunnerDeps = {
++      clock: this.deps.clock,
++      transport: this.deps.transport,
++      audit: (e: object) => sink.push(e),
++      log: (e: object) => {
++        // 决策日志（非审计流）：stderr 结构化可见（守护暂无文件日志器，与既有
++        // server 启动摘要同通道）
++        console.error(`[codearts-bridge] ${JSON.stringify(e)}`);
++      },
++      thresholds: this.deps.cfg.thresholds,
++      verifyRun: this.deps.verifyRun,
++      cfg: this.deps.cfg,
++      autoNudge: g.autoNudge ?? this.deps.cfg.autoNudge, // R-dg5-① 生效值解析
++    };
++    const runner = new GoalRunner(g, deps);
++    const entry: RosterEntry = { runner, sink, lastSaved: JSON.stringify(g) };
++    this.roster.set(g.goalId, entry);
++    return entry;
++  }
++
++  /**
++   * 一轮 sweep：逐目标 tick → 变化落盘 → 终态出册（R-dg4 隔离：单目标失败
++   * 留痕继续）。并发触发合并（上轮未结束直接跳过，下轮周期追平）。
++   */
++  private async sweep(): Promise<void> {
++    if (this.sweeping) return;
++    this.sweeping = true;
++    try {
++      for (const [goalId, entry] of [...this.roster]) {
++        const before = entry.runner.state().phase;
++        if (before === "complete" || before === "stopped") {
++          this.roster.delete(goalId); // control 路径已落盘；此处仅清名册
++          continue;
++        }
++        try {
++          const after = await entry.runner.tick();
++          const json = JSON.stringify(after);
++          if (json !== entry.lastSaved) {
++            await saveGoal(this.stateDir, after);
++            entry.lastSaved = json;
++          }
++          if (after.phase === "complete" || after.phase === "stopped") this.roster.delete(goalId);
++        } catch (e) {
++          const msg = e instanceof Error ? e.message : String(e);
++          console.error(`[codearts-bridge] 目标 tick 失败（保留待下轮重试）：goalId=${goalId} ${msg}`);
++          entry.sink.push({
++            type: "goal.error",
++            goalId,
++            at: this.deps.clock.now(),
++            kind: "tick-failed",
++            fatal: false,
++            message: msg,
++          });
++          await entry.sink.flush();
++        }
++      }
++    } finally {
++      this.sweeping = false;
++    }
++  }
++
++  /** control 目标解析：在册直取；否则读盘并按需归一入册（头注 blocked 条目）。 */
++  private async resolveEntry(goalId: string, action: GoalControlAction): Promise<RosterEntry> {
++    const existing = this.roster.get(goalId);
++    if (existing !== undefined) return existing;
++    const g = await this.loadFromDisk(goalId);
++    if (g.phase === "complete" || g.phase === "stopped") {
++      throw new BridgeError(
++        "GOAL_TERMINAL_STATE",
++        `目标已终态（${g.phase}），control 不可用：goalId=${goalId}`,
++        { remediation: "终态目标只读；如需重跑请新建目标。" },
++      );
++    }
++    if (g.phase === "blocked" && action === "pause") {
++      throw blockedPauseError(goalId);
++    }
++    if (g.phase === "blocked") {
++      // 宿主归一（头注"显式决策"条目）：paused 构造后由动作语义落实
++      // （resume=注入继续并转 active / stop=终态），瞬态不落盘。
++      g.phase = "paused";
++    }
++    return this.rosterGoal(g);
++  }
++
++  /** 从磁盘载入单个目标；不存在 → GOAL_NOT_FOUND（显式 404）。 */
++  private async loadFromDisk(goalId: string): Promise<GoalState> {
++    const { goals } = await loadGoals(this.stateDir);
++    const g = goals.find((x) => x.goalId === goalId);
++    if (g === undefined) {
++      throw new BridgeError("GOAL_NOT_FOUND", `目标不存在：goalId=${goalId}`, {
++        remediation: "GET /goals 查看全部目标。",
++      });
++    }
++    return g;
++  }
++}
+diff --git a/plugins/codearts-bridge/src/daemon.ts b/plugins/codearts-bridge/src/daemon.ts
+index 0ed7769d5f..4b8c4c1aa5 100644
+--- a/plugins/codearts-bridge/src/daemon.ts
++++ b/plugins/codearts-bridge/src/daemon.ts
+@@ -1,84 +1,106 @@
+ /**
+- * codearts-bridge 守护进程骨架与 HTTP API（T3-01，M3 起点）。
++ * codearts-bridge 守护进程骨架与 HTTP API（T3-01 骨架 + T3-05 目标域接线）。
+  *
+- * 职责（任务书 T3-01 + 主控裁定 R-d1~R-d4）：
++ * 职责（任务书 T3-01/T3-05 + 主控裁定 R-d1~R-d4、R-dg1~R-dg5）：
+  * - 仅绑 127.0.0.1 的 HTTP 宿主——"目标永不挂起"承诺的宿主进程骨架；
+- *   T3-04（状态持久化）/ T3-05（监督循环与 goal 控制端点）后续挂载于此。
++ *   T3-05 起 /goals* 端点经可选挂载的 GoalHost（daemon-goals.ts）提供目标域。
+  * - token 鉴权 + GET /health 健康端点；生命周期 start/stop（幂等）。
++ * - daemon.pid 单守护前提固化（R-dg5-③/M69：状态层锁表为进程内 Map，双守护
++ *   会双对账双注入——pidfile 在启动路径显式断言唯一性）。
+  *
+  * 主控裁定落点（SDD 2026-10-31，逐条；实现处再注）：
+  * - R-d1（网络面）：绑定地址恒为 127.0.0.1（硬编码，不受 daemonUrl 主机名影响——
+  *   守护是本机单用户服务，网络面必须最小化，暴露面裁定的权威来源是裁定而非配置）。
+  *   端口取 cfg.daemonUrl 的端口部分：loadConfig 已对 daemonUrl 做合法性校验并默认
+  *   "http://127.0.0.1:4577"，故"端口默认 4577 可配（loadConfig 覆盖）"经 daemonUrl
+  *   的端口段实现（不新增第二个端口配置真相源）；端口 0 → 内核随机分配，实际端口
+  *   经 start() 返回（任务书接口：start(): Promise<{port}>）。
+  * - R-d2（token）：<stateDir>/daemon-token 首启自动生成（crypto.randomBytes(32)
+  *   .toString("hex")）、mode 0600、重启复用；请求鉴权 Authorization: Bearer <token>；
+  *   缺失/错误 → 401 结构化 JSON。复用路径显式 chmod 0600（幂等收紧，防外部工具
+  *   放宽过权限；0600 本位为 no-op）。比较用 timingSafeEqual（常量时间，防时序侧信道）。
+- * - R-d3（路由语义）：GET /health 免鉴权 → {ok, version, uptime}。设计依据：健康
+- *   探测不得要求凭据——systemd watchdog/监控脚本若须先读 token 才能探活，token
+- *   文件一旦损坏即探活死锁（watchdog 杀守护的判据失灵），探活通道必须零依赖；
+- *   端点只回静态摘要（版本+运行秒数），无凭据外泄面。未知路由 → 404 结构化
+- *   {error:{code:"NOT_FOUND"}}；其余一切请求（含非 GET 打 /health）一律先过鉴权
+- *   再路由——未鉴权者无从探测路由存在性，也拿不到 404 信息面。
++ * - R-d3（路由语义）：GET /health 免鉴权 → {ok, version, uptime, actives}。设计依据：
++ *   健康探测不得要求凭据——systemd watchdog/监控脚本若须先读 token 才能探活，
++ *   token 文件一旦损坏即探活死锁（watchdog 杀守护的判据失灵），探活通道必须零依赖；
++ *   端点只回静态摘要（版本+运行秒数+活跃目标数），无凭据外泄面（T3-05 增 actives，
++ *   spec §7.2 契约字段）。未知路由 → 404 结构化 {error:{code:"NOT_FOUND"}}；其余
++ *   一切请求（含非 GET 打 /health）一律先过鉴权再路由——未鉴权者无从探测路由
++ *   存在性，也拿不到 404 信息面。
+  * - R-d4（生命周期）：start 幂等——进行中/已完成的 start 复用同一次 listen（监督
+  *   循环与 CLI 可能重复触发 start，"拒绝"语义制造竞态脆弱点，"复用"与幂等恢复
+  *   语义一致，此处为显式选择而非兜底）；stop 关闭监听并先斩断全部 keep-alive
+  *   连接（否则活动连接令 close 回调悬挂，bun test 进程不退出）；stop 对未启动态
+  *   幂等空操作，stop 后可再次 start（token 重启复用语义的重启路径）。
+- * - R-d6（T3-04 启动对账缝）：createDaemon 可选注入 reconcileOnStart 钩子，在
+- *   token 就绪后、listen 之前以 cfg.stateDir 调用恰一次——对账失败显式拒绝
+- *   start（状态层坏即不带病服务）；钩子缺省不注入（T3-05 接线真实传输前显式
+- *   无操作——守护自身无传输可构造，伪造默认传输即兜底，禁止）。
++ * - R-d6（T3-04 启动对账缝）：DaemonHooks.reconcileOnStart 为测试缝——挂载
++ *   GoalHost 时透传给它做对账实现替换；未挂载 GoalHost 且钩子在场的旧路径保持
++ *   兼容。GoalHost 在场时由其以真实传输 + 注入时钟执行对账（M72：对账与 runner
++ *   同一时间线），失败显式拒绝 start（状态层坏即不带病服务）。
++ * - R-dg1~R-dg4（T3-05 目标域）：领域逻辑在 daemon-goals.ts（GoalHost），本文件
++ *   只做 HTTP 形态：路由解析、请求体读取（1MB 上限）、BridgeError → HTTP 状态
++ *   映射、统一 JSON 响应。GoalHost 缺省未挂载时 /goals* → 501 GOAL_HOST_DISABLED
++ *   （显式声明功能未接线，禁静默假装存在；生产装配归守护服务任务 T3-07）。
++ * - R-dg5-③（pidfile，M69 单守护前提）：<stateDir>/daemon.pid——start 时
++ *   O_EXCL 独占创建写入自身 pid；已存在且指向活进程 → DAEMON_ALREADY_RUNNING
++ *   显式拒绝（防双守护双对账）；指向死进程（ESRCH）或本进程残留 → 陈旧清除
++ *   覆写（stderr 留痕）；内容非法 → DAEMON_PIDFILE_INVALID 显式报错（不代删
++ *   ——内容损坏可能是外部工具写入，删除属用户决策）。stop 时仅当内容为自身
++ *   pid 才清除；清除失败 stderr 可见、不阻断停止（残留文件按陈旧语义在下次
++ *   启动自愈——显式登记的收尾决策，非静默吞错）。
+  *
+  * 错误纪律（仓库铁律：出错即显式报错，禁静默兜底）：
+  * - FS/listen 失败统一 BridgeError 显式上抛（DAEMON_LISTEN_FAILED /
+  *   DAEMON_TOKEN_INVALID / FS_READ_FAILED），消息含路径与原因码；
+  * - token 文件存在但为空 → DAEMON_TOKEN_INVALID（拒绝空令牌，绝不静默重新生成——
+  *   重新生成会使其他已缓存令牌的客户端静默失联，属掩盖问题的兜底行为）；
+  * - 所有 HTTP 响应（含错误）均为 application/json 结构化，无文本态响应。
+  */
+ import { randomBytes, timingSafeEqual } from "node:crypto";
+-import { chmod, readFile } from "node:fs/promises";
++import { chmod, open as fsOpen, readFile, unlink } from "node:fs/promises";
+ import * as http from "node:http";
+ import * as path from "node:path";
+ import type { BridgeConfig } from "./core/config";
+ import { PLUGIN_VERSION, ensureStateDirs } from "./core/config";
+ import { BridgeError } from "./core/errors";
+ import { atomicWriteFile, errnoOf } from "./core/fsx";
+ import type { ReconcileResult } from "./core/goal/state";
++import type { GoalHost } from "./daemon-goals";
+ 
+ /** token 文件名（位于状态根，与裁定 <stateDir>/daemon-token 一致；mode 0600）。 */
+ const TOKEN_FILE_NAME = "daemon-token";
+ 
++/** pid 文件名（R-dg5-③：单守护前提固化；mode 0600）。 */
++const PID_FILE_NAME = "daemon.pid";
++
+ /** daemonUrl 未写端口段时的默认端口（与 loadConfig 的 DEFAULT_DAEMON_URL 口径一致）。 */
+ const DEFAULT_DAEMON_PORT = 4577;
+ 
++/** 请求体字节上限（goals 写路径防拖垮守护；超出显式 400）。 */
++const MAX_BODY_BYTES = 1_000_000;
++
+ /** 守护句柄（任务书接口：createDaemon(cfg) 返回形态）。 */
+ export interface DaemonHandle {
+   /** 底层 HTTP server（createDaemon 时创建、未监听；测试/上层可断言其形态）。 */
+   server: http.Server;
+   /** 启动监听；幂等复用；返回实际端口（port 0 → 内核分配值）。 */
+   start(): Promise<{ port: number }>;
+   /** 停止监听并斩断全部 keep-alive 连接；未启动时空操作；之后可再次 start。 */
+   stop(): Promise<void>;
+ }
+ 
+-/** 守护可选钩子（T3-04）：启动对账缝（T3-05 注入真实传输接线）。 */
++/** 守护可选钩子（T3-04）：启动对账缝（T3-05 起作为 GoalHost 对账实现的替换缝）。 */
+ export interface DaemonHooks {
+   /**
+    * 启动对账：token 就绪后、listen 之前以 cfg.stateDir 调用恰一次；抛错即
+-   * start 显式失败（R-d6：状态层坏不带病服务）。典型实现：reconcile(stateDir,
+-   * { transport }) —— 传输由 T3-05 按配置选型后闭包注入。
++   * start 显式失败（R-d6：状态层坏不带病服务）。挂载 GoalHost 时本钩子透传给
++   * GoalHost.start 作对账实现替换（测试缝）；未挂载 GoalHost 时保持旧路径
++   * 直接调用并落启动摘要。
+    */
+   reconcileOnStart?(stateDir: string): Promise<ReconcileResult>;
+ }
+ 
+ /* ───── 配置派生（R-d1） ───── */
+ 
+ /**
+  * 从 daemonUrl 提取监听端口：端口段缺省（含协议默认端口被 URL 归一为空串）→ 4577；
+  * "0" 保留（随机端口）；其余须为 0~65535 整数，非法显式抛错。
+  * daemonUrl 的合法性与协议校验由 loadConfig 负责（唯一校验点），此处只做端口派生。
+@@ -133,20 +155,142 @@ async function loadOrCreateToken(cfg: BridgeConfig): Promise<string> {
+       "DAEMON_TOKEN_INVALID",
+       `daemon-token 文件为空（拒绝空令牌）：path=${tokenPath}`,
+       { remediation: "删除该文件后重启守护进程即可重新生成" },
+     );
+   }
+   // 复用路径：显式收紧 0600（幂等；防外部工具放宽过权限后残留）
+   await chmod(tokenPath, 0o600);
+   return token;
+ }
+ 
++/* ───── pidfile（R-dg5-③，M69 单守护前提固化） ───── */
++
++/** pid 文件绝对路径（<stateDir>/daemon.pid）。 */
++export function daemonPidPath(cfg: BridgeConfig): string {
++  return path.join(cfg.stateDir, PID_FILE_NAME);
++}
++
++/**
++ * 启动时断言本 stateDir 仅有一个守护进程（头注 R-dg5-③，逐分支）：
++ * - pidfile 不存在 → O_EXCL（"wx"）独占创建写自身 pid——与并发启动竞态安全，
++ *   双守护中至多一个能创建成功；
++ * - 已存在：读内容解析 pid——活进程（kill(pid,0) 不抛 / EPERM=存在但非本用户）
++ *   → DAEMON_ALREADY_RUNNING 显式拒绝；死进程（ESRCH）→ 陈旧清除覆写（stderr
++ *   留痕）；本进程残留（同 pid 重启路径）→ 直接覆写；内容非法 →
++ *   DAEMON_PIDFILE_INVALID 显式报错（不代删，头注决策）。
++ */
++async function acquirePidfile(cfg: BridgeConfig): Promise<void> {
++  const pidPath = daemonPidPath(cfg);
++  try {
++    const fh = await fsOpen(pidPath, "wx", 0o600);
++    try {
++      await fh.writeFile(`${process.pid}\n`, "utf8");
++      await fh.sync();
++    } finally {
++      await fh.close().catch(() => undefined);
++    }
++    return;
++  } catch (e) {
++    if (errnoOf(e) !== "EEXIST") {
++      throw new BridgeError(
++        "FS_WRITE_FAILED",
++        `创建 daemon.pid 失败：path=${pidPath} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++        { cause: e },
++      );
++    }
++  }
++  let raw: string;
++  try {
++    raw = await readFile(pidPath, "utf8");
++  } catch (e) {
++    throw new BridgeError(
++      "FS_READ_FAILED",
++      `读取 daemon.pid 失败：path=${pidPath} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++      { cause: e },
++    );
++  }
++  const pid = Number(raw.trim());
++  if (raw.trim().length === 0 || !Number.isInteger(pid) || pid <= 0) {
++    throw new BridgeError(
++      "DAEMON_PIDFILE_INVALID",
++      `daemon.pid 内容非法（须为正整数 pid）：path=${pidPath} content=${JSON.stringify(raw.slice(0, 64))}`,
++      { remediation: "确认无守护进程在跑后手工删除该文件再启动。" },
++    );
++  }
++  if (pid === process.pid) {
++    // 本进程残留（start 失败重试路径）：直接覆写为当前持有声明
++    await atomicWriteFile(pidPath, `${process.pid}\n`, 0o600);
++    return;
++  }
++  let alive = true;
++  try {
++    process.kill(pid, 0); // 信号 0 = 仅存在性探测
++  } catch (e) {
++    const code = errnoOf(e);
++    if (code === "ESRCH") {
++      alive = false; // 陈旧 pid：清除
++    } else if (code === "EPERM") {
++      alive = true; // 存在但非本用户：按在跑处理（保守拒绝，禁双守护）
++    } else {
++      throw new BridgeError(
++        "DAEMON_PIDFILE_INVALID",
++        `探测 daemon.pid 进程存在性失败：pid=${pid} reason=${code ?? "UNKNOWN"}`,
++        { cause: e },
++      );
++    }
++  }
++  if (alive) {
++    throw new BridgeError(
++      "DAEMON_ALREADY_RUNNING",
++      `已有守护进程在跑（pid=${pid}），禁止双守护：path=${pidPath}`,
++      {
++        remediation: `先停止该守护进程（kill ${pid}）并确认退出；若确认其已死亡，删除 daemon.pid 后重试。`,
++      },
++    );
++  }
++  console.error(`[codearts-bridge] 清除陈旧 daemon.pid（pid=${pid} 已不存在）：path=${pidPath}`);
++  await atomicWriteFile(pidPath, `${process.pid}\n`, 0o600);
++}
++
++/**
++ * 停止时清除 pidfile：仅当内容为自身 pid 才删（防误删接管者的声明）；不存在
++ * 幂等返回；其他失败 stderr 可见、不阻断停止（残留按陈旧语义下次启动自愈——
++ * 头注 R-dg5-③ 显式登记的收尾决策，非静默吞错）。
++ */
++async function releasePidfile(cfg: BridgeConfig): Promise<void> {
++  const pidPath = daemonPidPath(cfg);
++  let raw: string;
++  try {
++    raw = await readFile(pidPath, "utf8");
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return;
++    console.error(
++      `[codearts-bridge] 读取 daemon.pid 失败（保留现场）：path=${pidPath} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++    );
++    return;
++  }
++  if (raw.trim() !== String(process.pid)) {
++    console.error(
++      `[codearts-bridge] daemon.pid 非本进程声明（content=${JSON.stringify(raw.slice(0, 64))}），不清除：path=${pidPath}`,
++    );
++    return;
++  }
++  try {
++    await unlink(pidPath);
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return;
++    console.error(
++      `[codearts-bridge] 删除 daemon.pid 失败（残留将由下次启动按陈旧清除）：path=${pidPath} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++    );
++  }
++}
++
+ /** 提取请求的 Bearer 令牌；头缺失或方案非 "Bearer"（精确匹配，本插件客户端约定）→ undefined。 */
+ function bearerTokenOf(req: http.IncomingMessage): string | undefined {
+   const header = req.headers.authorization;
+   if (typeof header !== "string") return undefined;
+   const m = /^Bearer (.+)$/.exec(header);
+   const token = m?.[1];
+   return token === undefined ? undefined : token;
+ }
+ 
+ /** 常量时间令牌比较（长度不等先短路——长度本身不属机密）；空串永不相等。 */
+@@ -163,73 +307,244 @@ function tokenMatches(presented: string, expected: string): boolean {
+ /** 统一 JSON 响应出口：所有响应（含错误）application/json 结构化。 */
+ function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+   const body = JSON.stringify(payload);
+   res.writeHead(status, {
+     "Content-Type": "application/json; charset=utf-8",
+     "Content-Length": Buffer.byteLength(body),
+   });
+   res.end(body);
+ }
+ 
+-/* ───── createDaemon（R-d1~R-d4） ───── */
++/** BridgeError code → HTTP 状态映射（T3-05：目标域错误的结构化出口）。 */
++function httpStatusOf(e: unknown): number {
++  if (!(e instanceof BridgeError)) return 500;
++  switch (e.code) {
++    case "GOAL_NOT_FOUND":
++      return 404;
++    case "GOAL_TERMINAL_STATE":
++    case "GOAL_PHASE_INVALID":
++      return 409;
++    case "GOAL_INPUT_INVALID":
++    case "GOAL_BODY_INVALID":
++    case "GOAL_ACTION_INVALID":
++    case "GOAL_ID_INVALID":
++    case "GOAL_CURSOR_INVALID":
++    case "GOAL_LIMIT_INVALID":
++      return 400;
++    default:
++      return 500;
++  }
++}
+ 
+-/** 组装守护进程句柄：HTTP 路由、token 鉴权、幂等 start/stop（T3-04 增对账钩子）。 */
+-export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks): DaemonHandle {
++/** 统一错误响应：BridgeError 结构化字段全量透出；未知错误 INTERNAL 500。 */
++function sendError(res: http.ServerResponse, e: unknown): void {
++  const be = e instanceof BridgeError ? e : undefined;
++  const payload = {
++    error: {
++      code: be?.code ?? "INTERNAL",
++      message: e instanceof Error ? e.message : String(e),
++      ...(be?.remediation !== undefined ? { remediation: be.remediation } : {}),
++    },
++  };
++  try {
++    sendJson(res, httpStatusOf(e), payload);
++  } catch (sendErr) {
++    // 响应已终结（客户端断开等 socket 级失败）：无可控出口，stderr 留痕即止
++    console.error(`[codearts-bridge] 错误响应发送失败：${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
++  }
++}
++
++/** 读取并解析 JSON 请求体（上限 MAX_BODY_BYTES；超限/非 JSON 显式 400）。 */
++function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
++  return new Promise<unknown>((resolve, reject) => {
++    const chunks: Buffer[] = [];
++    let size = 0;
++    let settled = false;
++    const fail = (e: BridgeError): void => {
++      if (settled) return;
++      settled = true;
++      reject(e);
++    };
++    req.on("data", (c: Buffer) => {
++      size += c.length;
++      if (size > MAX_BODY_BYTES) {
++        fail(new BridgeError("GOAL_BODY_INVALID", `请求体超过 ${MAX_BODY_BYTES} 字节上限`));
++        req.destroy();
++        return;
++      }
++      chunks.push(c);
++    });
++    req.on("end", () => {
++      if (settled) return;
++      settled = true;
++      const text = Buffer.concat(chunks).toString("utf8");
++      try {
++        resolve(JSON.parse(text) as unknown);
++      } catch {
++        reject(new BridgeError("GOAL_BODY_INVALID", "请求体非合法 JSON"));
++      }
++    });
++    req.on("error", (e: Error) => {
++      fail(new BridgeError("GOAL_BODY_INVALID", `读取请求体失败：${e.message}`, { cause: e }));
++    });
++  });
++}
++
++/** logs 分页参数解析：cursor/limit 须为非负/正整数（显式 400）。 */
++function parseLogsQuery(url: URL): { cursor?: number; limit?: number } {
++  const out: { cursor?: number; limit?: number } = {};
++  const cursorRaw = url.searchParams.get("cursor");
++  if (cursorRaw !== null && cursorRaw !== "") {
++    if (!/^\d+$/.test(cursorRaw)) {
++      throw new BridgeError("GOAL_CURSOR_INVALID", `cursor 须为非负整数（实际 ${JSON.stringify(cursorRaw)}）`);
++    }
++    out.cursor = Number(cursorRaw);
++  }
++  const limitRaw = url.searchParams.get("limit");
++  if (limitRaw !== null && limitRaw !== "") {
++    if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1) {
++      throw new BridgeError("GOAL_LIMIT_INVALID", `limit 须为正整数（实际 ${JSON.stringify(limitRaw)}）`);
++    }
++    out.limit = Number(limitRaw);
++  }
++  return out;
++}
++
++/* ───── createDaemon（R-d1~R-d4、R-dg1~R-dg5） ───── */
++
++/**
++ * 组装守护进程句柄：HTTP 路由（含 /goals* 目标域）、token 鉴权、pidfile、
++ * 幂等 start/stop。
++ *
++ * @param cfg   守护配置（端口/状态根，唯一真相源 loadConfig）
++ * @param hooks 可选钩子（T3-04 对账测试缝；挂载 goals 时透传给 GoalHost.start）
++ * @param goals 可选目标域宿主（T3-05；缺省未挂载 → /goals* 显式 501，生产装配
++ *              归守护服务任务 T3-07）
++ */
++export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks, goals?: GoalHost): DaemonHandle {
+   const port = daemonPortOf(cfg.daemonUrl); // R-d1：端口唯一来源 = daemonUrl 端口段
+   let token: string | undefined; // start() 载入；请求处理闭包读取
+   let startedAtMs: number | undefined; // uptime 基准（start 时置位）
+   let listening = false; // stop 幂等判据（listen 成功才置 true）
+   let startPromise: Promise<{ port: number }> | undefined; // start 幂等复用句柄
+ 
+-  const server = http.createServer((req, res) => {
+-    try {
+-      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+-      // R-d3：仅 "GET + /health" 免鉴权（探活零依赖）；其余一律先鉴权再路由
+-      const isHealthRoute = req.method === "GET" && url.pathname === "/health";
+-      if (!isHealthRoute) {
+-        const presented = bearerTokenOf(req);
+-        if (presented === undefined || token === undefined || !tokenMatches(presented, token)) {
+-          sendJson(res, 401, {
+-            error: {
+-              code: "UNAUTHORIZED",
+-              message: "缺少或错误的 Authorization: Bearer 令牌（token 见 <stateDir>/daemon-token）",
+-            },
+-          });
+-          return;
+-        }
++  /** /goals* 路由分发（goals 宿主已挂载前提；领域逻辑在 GoalHost）。 */
++  async function handleGoalRoute(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
++    if (goals === undefined) {
++      // R-dg1：未挂载目标域 → 显式 501（功能未接线，禁静默假装存在）
++      sendJson(res, 501, {
++        error: {
++          code: "GOAL_HOST_DISABLED",
++          message: "守护未挂载目标域宿主（GoalHost），/goals* 端点不可用",
++          remediation: "以 createDaemon(cfg, hooks, goals) 挂载 GoalHost 后启动（生产装配见守护服务任务）。",
++        },
++      });
++      return;
++    }
++    const segs = url.pathname.split("/").filter((s) => s.length > 0); // ["goals", ...]
++    if (segs[0] !== "goals") return; // 理论不可达（调用方已判前缀）；防御保持类型收窄
++    if (segs.length === 1) {
++      if (req.method === "GET") {
++        sendJson(res, 200, await goals.listGoals());
++        return;
++      }
++      if (req.method === "POST") {
++        const body = await readJsonBody(req);
++        sendJson(res, 200, await goals.createGoal(body));
++        return;
+       }
+-      if (isHealthRoute) {
+-        const uptimeSeconds = startedAtMs === undefined ? 0 : (Date.now() - startedAtMs) / 1000;
+-        sendJson(res, 200, { ok: true, version: PLUGIN_VERSION, uptime: uptimeSeconds });
++    } else if (segs.length === 2 || segs.length === 3) {
++      const goalId = segs[1] as string;
++      const sub = segs.length === 3 ? (segs[2] as string) : undefined;
++      if (sub === undefined && req.method === "GET") {
++        sendJson(res, 200, await goals.getGoal(goalId));
++        return;
++      }
++      if (sub === "logs" && req.method === "GET") {
++        const q = parseLogsQuery(url);
++        sendJson(res, 200, await goals.getLogs(goalId, q.cursor, q.limit));
++        return;
++      }
++      if (sub === "control" && req.method === "POST") {
++        const body = (await readJsonBody(req)) as Record<string, unknown>;
++        const state = await goals.control(goalId, body["action"]);
++        sendJson(res, 200, { state });
++        return;
++      }
++    }
++    sendJson(res, 404, {
++      error: { code: "NOT_FOUND", message: `未知路由：${req.method} ${url.pathname}` },
++    });
++  }
++
++  /** 请求处理主体（async：/goals 写路径需要读体与领域 await）。 */
++  async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
++    const url = new URL(req.url ?? "/", "http://127.0.0.1");
++    // R-d3：仅 "GET + /health" 免鉴权（探活零依赖）；其余一律先鉴权再路由
++    const isHealthRoute = req.method === "GET" && url.pathname === "/health";
++    if (!isHealthRoute) {
++      const presented = bearerTokenOf(req);
++      if (presented === undefined || token === undefined || !tokenMatches(presented, token)) {
++        sendJson(res, 401, {
++          error: {
++            code: "UNAUTHORIZED",
++            message: "缺少或错误的 Authorization: Bearer 令牌（token 见 <stateDir>/daemon-token）",
++          },
++        });
+         return;
+       }
+-      // 鉴权已通过但无此路由（T3-05 的 /goals 端点挂载前，一切非 /health 路由均 404）
+-      sendJson(res, 404, {
+-        error: { code: "NOT_FOUND", message: `未知路由：${req.method} ${url.pathname}` },
++    }
++    if (isHealthRoute) {
++      const uptimeSeconds = startedAtMs === undefined ? 0 : (Date.now() - startedAtMs) / 1000;
++      // actives：在册活跃目标数（spec §7.2；未挂载目标域恒 0）
++      sendJson(res, 200, {
++        ok: true,
++        version: PLUGIN_VERSION,
++        uptime: uptimeSeconds,
++        actives: goals?.activeCount() ?? 0,
+       });
+-    } catch (e) {
+-      // 处理器意外异常：结构化 500（可见性优先，禁静默吞掉）
+-      sendJson(res, 500, { error: { code: "INTERNAL", message: String(e) } });
++      return;
+     }
++    if (url.pathname === "/goals" || url.pathname.startsWith("/goals/")) {
++      await handleGoalRoute(req, res, url);
++      return;
++    }
++    // 鉴权已通过但无此路由
++    sendJson(res, 404, {
++      error: { code: "NOT_FOUND", message: `未知路由：${req.method} ${url.pathname}` },
++    });
++  }
++
++  const server = http.createServer((req, res) => {
++    // async 路由主体：异常统一结构化映射（BridgeError code → HTTP 状态）
++    void handleRequest(req, res).catch((e: unknown) => {
++      sendError(res, e);
++    });
+   });
+ 
+   function start(): Promise<{ port: number }> {
+     // R-d4 幂等：进行中/已完成的 start 复用同一 Promise（不重复 listen）
+     if (startPromise !== undefined) return startPromise;
+     startPromise = (async () => {
+-      await ensureStateDirs(cfg); // 状态根先行（token 落点；T1-02 幂等原语）
++      await ensureStateDirs(cfg); // 状态根先行（token/pidfile 落点；T1-02 幂等原语）
+       token = await loadOrCreateToken(cfg);
+-      // R-d6：启动对账（监听建立前）：失败显式拒绝 start，不带病服务
+-      if (hooks?.reconcileOnStart !== undefined) {
++      await acquirePidfile(cfg); // R-dg5-③：单守护前提（双守护会双对账双注入）
++      if (goals !== undefined) {
++        // T3-05：目标域装配（对账 → 落盘状态 roster → sweep 循环）；对账实现
++        // 可被 hooks.reconcileOnStart 替换（测试缝）；失败显式拒绝 start
++        const r = await goals.start(hooks?.reconcileOnStart);
++        console.error(
++          `[codearts-bridge] 启动对账完成：resumed=${r.resumed.length} blocked=${r.blocked.length}`,
++        );
++      } else if (hooks?.reconcileOnStart !== undefined) {
++        // 旧路径兼容：未挂载目标域但显式注入了对账钩子（T3-04 语义原样保留）
+         const r = await hooks.reconcileOnStart(cfg.stateDir);
+-        // 守护暂无日志器（spdlog 接线属后续任务）：启动摘要走 stderr，与既有
+-        // server 错误输出同通道（可见性优先）。
+         console.error(
+           `[codearts-bridge] 启动对账完成：resumed=${r.resumed.length} blocked=${r.blocked.length}`,
+         );
+       }
+       startedAtMs = Date.now();
+       await listenOnce(server, port, "127.0.0.1"); // R-d1：绑定地址恒 127.0.0.1
+       listening = true;
+       // 监听建立后的偶发 socket 错误：显式落 stderr（可见），保持守护存活
+       // （探活宿主进程崩溃会连锁打断被监督目标的续跑，属"保持运行"的显式语义而非吞错）
+       server.on("error", (e: Error) => {
+@@ -244,43 +559,53 @@ export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks): DaemonHand
+     })();
+     // 失败后清空幂等句柄，允许调用方修正配置后重试 start（成功态不受影响）
+     startPromise.catch(() => {
+       startPromise = undefined;
+     });
+     return startPromise;
+   }
+ 
+   async function stop(): Promise<void> {
+     startPromise = undefined; // 允许 stop 后再次 start（重启复用 token 的重启路径）
+-    if (!listening) return; // 未启动/已停止：幂等空操作
++    goals?.stop(); // 先摘目标 sweep 循环（不再产生 tick）；会话与状态不销毁（重启对账续跑）
++    if (!listening) {
++      // 未启动/已停止：幂等空操作；pidfile 若在本进程 start 失败路径残留，
++      // 也按自身声明清除（content 校验使未持有者不会被误删）
++      await releasePidfile(cfg);
++      return;
++    }
+     listening = false;
+     startedAtMs = undefined;
+     // R-d4：先斩全部 keep-alive 连接再 close（否则活动连接令 close 回调悬挂，
+     // bun test 进程不退出——任务书"测试防悬挂"要求）
+     server.closeAllConnections();
+     // 运行时差异（Bun 1.4 实证）：closeAllConnections() 在 Bun 中会顺带停掉监听
+     // （listening=false、端口即释），此时再 close(cb) 会以 ERR_SERVER_NOT_RUNNING
+     // 回调报错；Node 中 closeAllConnections 不动监听，必须显式 close。
+     // 以 server.listening 实际状态分派两条路径——非兜底：两条路径的收敛不变量一致
+     // （stop 返回后端口已释放、keep-alive 连接已全断），差异只是"由谁停的监听"。
+-    if (!server.listening) return;
++    if (!server.listening) {
++      await releasePidfile(cfg);
++      return;
++    }
+     await new Promise<void>((resolve, reject) => {
+       server.close((e) => {
+         if (e !== undefined && e !== null) {
+           reject(
+             new BridgeError("DAEMON_STOP_FAILED", `关闭守护失败：${e.message}`, { cause: e }),
+           );
+         } else {
+           resolve();
+         }
+       });
+     });
++    await releasePidfile(cfg);
+   }
+ 
+   return { server, start, stop };
+ }
+ 
+ /** listen 的 Promise 化（一次性 error 监听，成功后摘除，避免污染后续错误通道）。 */
+ function listenOnce(srv: http.Server, port: number, host: string): Promise<void> {
+   return new Promise<void>((resolve, reject) => {
+     const onError = (e: Error) => {
+       reject(
+diff --git a/plugins/codearts-bridge/test/daemon-goals.test.ts b/plugins/codearts-bridge/test/daemon-goals.test.ts
+new file mode 100644
+index 0000000000..17644300c8
+--- /dev/null
++++ b/plugins/codearts-bridge/test/daemon-goals.test.ts
+@@ -0,0 +1,713 @@
++/**
++ * T3-05 守护-目标对接测试（bun:test）——daemon + FakeTransport + 假时钟 + 手动循环。
++ *
++ * 裁定依据（progress.md Task 18 派发记录）：
++ * - R-dg1：POST /goals → 建状态 → 以落盘状态构造 GoalRunner → saveGoal →
++ *   tick 循环宿主（生产 setInterval 5s，测试经 TickLoop 手动驱动 sweep）；
++ *   启动时以落盘状态 roster + reconcile（对账契约已入 injected 指纹，
++ *   tick 重锚不重复注入）。
++ * - R-dg2：control pause=相位翻转（此后 sweep 不再注入）；resume=注入继续；
++ *   stop=终态；全部即时生效（端点响应前完成 runner 动作 + 审计冲刷）。
++ * - R-dg3：logs 分页 cursor 前进、顺序稳定、不重复不遗漏。
++ * - R-dg4：并发多目标独立状态隔离（专测）。
++ * - R-dg5：① autoNudge 接线 runner（阈值配置经 cfg + 逐目标覆盖）；
++ *   ② reconcile 时钟经 ReconcileDeps.clock 注入（M72，假时钟同一条时间线）；
++ *   ③ pidfile 固化单守护前提（daemon.pid，陈旧清除/存活显式拒绝）。
++ *
++ * 纪律：
++ * - 绝不触碰真实 HOME：stateDir 一律注入 <插件根>/.tmp/daemon-goals-test/；
++ *   端口一律 0（内核随机分配）；env 显传 {} 与真实 process.env 隔离。
++ * - runner 保持 R-rn1 纯 tick：本套件经手动 TickLoop 驱动 sweep，不依赖真实定时器。
++ */
++import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
++import { mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { createDaemon, type DaemonHandle } from "../src/daemon";
++import { GoalHost, type TickLoop } from "../src/daemon-goals";
++import { FakeTransport } from "../src/core/transport/fake";
++import { saveGoal } from "../src/core/goal/state";
++import { BridgeError } from "../src/core/errors";
++import type { GoalState } from "../src/core/goal/runner";
++import { CONTINUE_PROMPT } from "../src/core/goal/protocol";
++
++/** 插件根目录（test/ 的上一级）。 */
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++/** 本套件专属临时目录（.tmp/ 已 gitignore）。 */
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "daemon-goals-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  // 只删本套件专属目录，不动 .tmp/ 根（可能被其他套件并行使用）
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/* ───── 防悬挂兜底登记（测试基础设施，非业务兜底）：每个用例结束统一停守护 ───── */
++
++const openDaemons: DaemonHandle[] = [];
++
++afterEach(async () => {
++  while (openDaemons.length > 0) {
++    const d = openDaemons.pop() as DaemonHandle;
++    await d.stop().catch(() => undefined);
++  }
++});
++
++/* ───── 测试台架：FakeTransport + 假时钟 + 手动 TickLoop + 守护 ───── */
++
++/** 手动循环句柄（测试驱动 sweep；wake 只计数不驱动——驱动权在用例手里）。 */
++interface ManualLoop {
++  loop: TickLoop;
++  sweepOnce(): Promise<void>;
++  wakeCount(): number;
++}
++
++function makeManualLoop(): ManualLoop {
++  let sweepFn: (() => Promise<void>) | undefined;
++  let wakes = 0;
++  return {
++    loop: {
++      start(sweep: () => Promise<void>) {
++        sweepFn = sweep;
++      },
++      wake() {
++        wakes += 1;
++      },
++      stop() {
++        sweepFn = undefined;
++      },
++    },
++    sweepOnce: async () => {
++      await sweepFn?.();
++    },
++    wakeCount: () => wakes,
++  };
++}
++
++interface Harness {
++  cfg: BridgeConfig;
++  transport: FakeTransport;
++  host: GoalHost;
++  daemon: DaemonHandle;
++  port: number;
++  token: string;
++  loop: ManualLoop;
++  advance(ms: number): void;
++  now(): number;
++}
++
++/**
++ * 组装并启动一套守护台架（goals 宿主接线 FakeTransport + 假时钟 + 手动循环）。
++ * opts.autoNudge 注入 cfg.autoNudge（缺省走 loadConfig 默认 true）。
++ */
++async function makeHarness(opts?: { autoNudge?: boolean }): Promise<Harness> {
++  const name = `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
++  const cfg = loadConfig(
++    {
++      stateDir: path.join(TEST_ROOT, name),
++      daemonUrl: "http://127.0.0.1:0",
++      ...(opts?.autoNudge !== undefined ? { autoNudge: opts.autoNudge } : {}),
++    },
++    {},
++  );
++  const transport = new FakeTransport();
++  let t = 1_000_000;
++  const clock = { now: () => t };
++  const loop = makeManualLoop();
++  const host = new GoalHost({
++    cfg,
++    transport,
++    clock,
++    loop: loop.loop,
++    verifyRun: async () => ({ ok: true, out: "OK" }),
++  });
++  const daemon = createDaemon(cfg, undefined, host);
++  openDaemons.push(daemon);
++  const { port } = await daemon.start();
++  return {
++    cfg,
++    transport,
++    host,
++    daemon,
++    port,
++    token: await readFile(path.join(cfg.stateDir, "daemon-token"), "utf8"),
++    loop,
++    advance: (ms: number) => {
++      t += ms;
++    },
++    now: () => t,
++  };
++}
++
++/* ───── HTTP 助手 ───── */
++
++interface HttpResult {
++  status: number;
++  body: unknown;
++}
++
++async function call(
++  port: number,
++  method: "GET" | "POST",
++  pathname: string,
++  token: string,
++  body?: unknown,
++): Promise<HttpResult> {
++  const res = await fetch(`http://127.0.0.1:${port}${pathname}`, {
++    method,
++    headers: {
++      authorization: `Bearer ${token}`,
++      ...(body !== undefined ? { "content-type": "application/json" } : {}),
++    },
++    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
++  });
++  const text = await res.text();
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(text) as unknown;
++  } catch {
++    parsed = text;
++  }
++  return { status: res.status, body: parsed };
++}
++
++function errCode(r: HttpResult): string {
++  const b = r.body;
++  if (typeof b !== "object" || b === null) return "";
++  const e = (b as Record<string, unknown>)["error"];
++  if (typeof e !== "object" || e === null) return "";
++  return ((e as Record<string, unknown>)["code"] as string | undefined) ?? "";
++}
++
++/** control 响应的 state 载荷（形状守卫：缺失给空对象，交由断言暴露）。 */
++function stateOf(r: HttpResult): Record<string, unknown> {
++  const b = r.body;
++  if (typeof b !== "object" || b === null) return {};
++  const s = (b as Record<string, unknown>)["state"];
++  return (typeof s === "object" && s !== null ? s : {}) as Record<string, unknown>;
++}
++
++/** 建目标并完成首轮 sweep（引导：建会话 + 契约注入）。返回 goalId。 */
++async function createGoal(h: Harness, body?: Record<string, unknown>): Promise<string> {
++  const r = await call(h.port, "POST", "/goals", h.token, body ?? { objective: "实现登录页" });
++  expect(r.status).toBe(200);
++  const goalId = (r.body as Record<string, string>)["goalId"] ?? "";
++  expect(goalId).not.toBe("");
++  await h.loop.sweepOnce(); // 引导 tick（建会话 + 注入契约）
++  return goalId;
++}
++
++/* ───── R-dg1：POST /goals 全流程 ───── */
++
++describe("POST /goals 全流程到 complete（R-dg1）", () => {
++  it("start → 步进 → [GOAL-DONE] → verify 双过 → complete，且健康 actives 归零", async () => {
++    const h = await makeHarness();
++    const goalId = await createGoal(h);
++    expect(goalId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
++    expect(h.loop.wakeCount()).toBeGreaterThanOrEqual(1); // 创建即事件驱动唤醒
++
++    // 契约已注入 1 次
++    expect(h.transport.injections.length).toBe(1);
++
++    // 健康端点 actives=1（在册 active 目标数）
++    const health = await fetch(`http://127.0.0.1:${h.port}/health`).then((x) => x.json() as Promise<Record<string, unknown>>);
++    expect(health["actives"]).toBe(1);
++
++    // 步进：第 2 步标记出现 → 第 1 步记完成（回显守卫窗口先越过）
++    h.advance(4000);
++    const ref = h.transport.injections[0]!.ref;
++    h.transport.emit(ref, "output", "[GOAL-STEP 2/2] 收尾联调 | 推荐方案: 先回归主链路");
++    await h.loop.sweepOnce();
++
++    let st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
++    expect(st["phase"]).toBe("active");
++    expect(st["steps"]).toEqual([1]);
++    expect(st["rounds"]).toBe(1);
++
++    // AI 自报完成 → 双过核验（verifyRun 恒过）→ complete
++    h.advance(4000);
++    h.transport.emit(ref, "output", "全部步骤完成 [GOAL-DONE]");
++    await h.loop.sweepOnce();
++
++    st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
++    expect(st["phase"]).toBe("complete");
++
++    // 列表与终态可见性；actives 归零；终态移出循环（再 sweep 不产生注入）
++    const list = (await call(h.port, "GET", "/goals", h.token)).body as Array<Record<string, unknown>>;
++    const item = list.find((x) => x["goalId"] === goalId) as Record<string, unknown>;
++    expect(item["state"]).toBe("complete");
++    expect(item["rounds"]).toBe(1);
++    expect(typeof item["objective"]).toBe("string");
++    const health2 = await fetch(`http://127.0.0.1:${h.port}/health`).then((x) => x.json() as Promise<Record<string, unknown>>);
++    expect(health2["actives"]).toBe(0);
++    const injectionsBefore = h.transport.injections.length;
++    await h.loop.sweepOnce();
++    expect(h.transport.injections.length).toBe(injectionsBefore);
++  });
++
++  it("POST /goals 未知路由形态（DELETE 语义不存在）→ 404；未知目标 → 404 GOAL_NOT_FOUND", async () => {
++    const h = await makeHarness();
++    const res = await fetch(`http://127.0.0.1:${h.port}/goals/does-not-exist`, {
++      method: "PUT",
++      headers: { authorization: `Bearer ${h.token}` },
++    });
++    expect(res.status).toBe(404);
++    const r = await call(h.port, "GET", "/goals/no-such-goal", h.token);
++    expect(r.status).toBe(404);
++    expect(errCode(r)).toBe("GOAL_NOT_FOUND");
++  });
++});
++
++/* ───── R-dg2：control 语义 ───── */
++
++describe("control 语义（R-dg2：pause/resume/stop 即时生效）", () => {
++  it("pause → phase=paused 且 sweep 不再注入；resume → 注入继续指令；stop → 终态且移出循环", async () => {
++    const h = await makeHarness();
++    const goalId = await createGoal(h);
++    expect(h.transport.injections.length).toBe(1);
++
++    // pause：即时生效 + 落盘 + 审计冲刷后才响应
++    let r = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "pause" });
++    expect(r.status).toBe(200);
++    expect(stateOf(r)["phase"]).toBe("paused");
++
++    // paused 期间信号与 sweep 都不产生注入
++    h.advance(4000);
++    const ref = h.transport.injections[0]!.ref;
++    h.transport.emit(ref, "output", "[GOAL-STEP 2/2] 任意输出 | 推荐方案: x");
++    h.advance(61_000); // 越过停滞阈值：paused 也不允许 nudge
++    await h.loop.sweepOnce();
++    expect(h.transport.injections.length).toBe(1);
++
++    // resume：注入继续指令（含 CONTINUE_PROMPT 语义）
++    r = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "resume" });
++    expect(r.status).toBe(200);
++    expect(stateOf(r)["phase"]).toBe("active");
++    expect(h.transport.injections.length).toBe(2);
++    expect(h.transport.injections[1]!.text).toContain(CONTINUE_PROMPT);
++
++    // stop：终态；后续 sweep 不再驱动
++    r = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "stop" });
++    expect(r.status).toBe(200);
++    expect(stateOf(r)["phase"]).toBe("stopped");
++    await h.loop.sweepOnce();
++    expect(h.transport.injections.length).toBe(2);
++    // 终态目标仍可查询（读磁盘）
++    const st = await call(h.port, "GET", `/goals/${goalId}`, h.token);
++    expect(st.status).toBe(200);
++    expect(((st.body as Record<string, unknown>)["phase"] as string)).toBe("stopped");
++  });
++
++  it("非法 action → 400 GOAL_ACTION_INVALID；未知目标 control → 404；终态 control → 409", async () => {
++    const h = await makeHarness();
++    const bad = await call(h.port, "POST", "/goals/x/control", h.token, { action: "reboot" });
++    expect(bad.status).toBe(400);
++    expect(errCode(bad)).toBe("GOAL_ACTION_INVALID");
++
++    const goalId = await createGoal(h);
++    await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "stop" });
++    const onTerminal = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "pause" });
++    expect(onTerminal.status).toBe(409);
++    expect(errCode(onTerminal)).toBe("GOAL_TERMINAL_STATE");
++
++    const missing = await call(h.port, "POST", "/goals/no-such/control", h.token, { action: "pause" });
++    expect(missing.status).toBe(404);
++    expect(errCode(missing)).toBe("GOAL_NOT_FOUND");
++  });
++
++  it("blocked 目标：pause 显式拒绝（409）；resume 归一恢复并注入继续", async () => {
++    const h = await makeHarness();
++    // 直接触发 blocked：error 信号 + refusal 分类（runner fatal 路径）
++    const goalId = await createGoal(h);
++    h.advance(4000);
++    const ref = h.transport.injections[0]!.ref;
++    h.transport.emit(ref, "error", "content policy refused");
++    await h.loop.sweepOnce();
++    let st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
++    expect(st["phase"]).toBe("blocked");
++
++    const pause = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "pause" });
++    expect(pause.status).toBe(409);
++    expect(errCode(pause)).toBe("GOAL_PHASE_INVALID");
++
++    // resume：blocked → active + 注入继续（R-dg2 语义）
++    const resume = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "resume" });
++    expect(resume.status).toBe(200);
++    expect(stateOf(resume)["phase"]).toBe("active");
++    expect(h.transport.injections.length).toBe(2);
++    expect(h.transport.injections[1]!.text).toContain(CONTINUE_PROMPT);
++  });
++});
++
++/* ───── R-dg3：logs 分页 ───── */
++
++describe("GET /goals/:id/logs 分页（R-dg3：cursor 前进、顺序稳定）", () => {
++  it("cursor 步进遍历：不重复、不遗漏、seq 单调递增，空 cursor 从头开始", async () => {
++    const h = await makeHarness();
++    const goalId = await createGoal(h);
++    await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "pause" });
++    await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "resume" });
++    // 此刻审计流：goal.start, goal.inject, goal.pause, goal.resume, goal.inject ≥5 条
++
++    const seen: number[] = [];
++    const types: string[] = [];
++    let cursor = 0;
++    for (let guard = 0; guard < 50; guard++) {
++      const page = (await call(
++        h.port,
++        "GET",
++        `/goals/${goalId}/logs?cursor=${cursor}&limit=2`,
++        h.token,
++      )).body as { events: Array<Record<string, unknown>>; nextCursor: number };
++      expect(page.events.length).toBeLessThanOrEqual(2);
++      for (const e of page.events) {
++        const seq = e["seq"] as number;
++        expect(seq).toBeGreaterThan(cursor); // 不重复：严格前进
++        seen.push(seq);
++        types.push(e["type"] as string);
++      }
++      if (page.events.length === 0) break;
++      expect(page.nextCursor).toBe(seen[seen.length - 1]!);
++      cursor = page.nextCursor;
++      if (page.events.length < 2) break;
++    }
++    // 不遗漏：1..max 连续覆盖
++    expect(seen.length).toBeGreaterThanOrEqual(5);
++    expect(seen).toEqual(Array.from({ length: seen.length }, (_, i) => i + 1));
++    expect(types[0]).toBe("goal.start");
++    expect(types).toContain("goal.pause");
++    expect(types).toContain("goal.resume");
++    expect(types).toContain("goal.inject");
++  });
++
++  it("非法 cursor / limit → 400 结构化；未知目标 → 404", async () => {
++    const h = await makeHarness();
++    const goalId = await createGoal(h);
++    const badCursor = await call(h.port, "GET", `/goals/${goalId}/logs?cursor=abc`, h.token);
++    expect(badCursor.status).toBe(400);
++    expect(errCode(badCursor)).toBe("GOAL_CURSOR_INVALID");
++    const badLimit = await call(h.port, "GET", `/goals/${goalId}/logs?limit=0`, h.token);
++    expect(badLimit.status).toBe(400);
++    expect(errCode(badLimit)).toBe("GOAL_LIMIT_INVALID");
++    const missing = await call(h.port, "GET", "/goals/no-such/logs", h.token);
++    expect(missing.status).toBe(404);
++    expect(errCode(missing)).toBe("GOAL_NOT_FOUND");
++    // cursor 越过末尾：空页 + nextCursor 原样回传（轮询续读语义，R-dg3）
++    const past = (await call(h.port, "GET", `/goals/${goalId}/logs?cursor=99999`, h.token)).body as {
++      events: unknown[];
++      nextCursor: number;
++    };
++    expect(past.events).toEqual([]);
++    expect(past.nextCursor).toBe(99999);
++    // limit 超上限：显式 400（禁静默钳位）
++    const overLimit = await call(h.port, "GET", `/goals/${goalId}/logs?limit=1001`, h.token);
++    expect(overLimit.status).toBe(400);
++    expect(errCode(overLimit)).toBe("GOAL_LIMIT_INVALID");
++  });
++});
++
++/* ───── R-dg4：多目标隔离 ───── */
++
++describe("并发多目标隔离（R-dg4）", () => {
++  it("两个目标独立会话/状态：驱动 A 到 complete 不影响 B；pause B 不影响 A", async () => {
++    const h = await makeHarness();
++    const a = await createGoal(h, { objective: "目标A" });
++    const b = await createGoal(h, { objective: "目标B" });
++    expect(a).not.toBe(b);
++    await h.loop.sweepOnce(); // A、B 同轮各自引导
++    expect(h.transport.injections.length).toBe(2);
++    const [refA, refB] = h.transport.injections.map((i) => i.ref);
++    expect(refA!.id).not.toBe(refB!.id); // 独立会话
++
++    // B 暂停后 A 继续驱动到完成
++    await call(h.port, "POST", `/goals/${b}/control`, h.token, { action: "pause" });
++    h.advance(4000);
++    h.transport.emit(refA!, "output", "[GOAL-STEP 2/2] 收尾 | 推荐方案: x"); // 2/2 → 步 1 记完成
++    h.advance(4000);
++    h.transport.emit(refA!, "output", "done [GOAL-DONE]");
++    await h.loop.sweepOnce();
++
++    const sa = (await call(h.port, "GET", `/goals/${a}`, h.token)).body as Record<string, unknown>;
++    const sb = (await call(h.port, "GET", `/goals/${b}`, h.token)).body as Record<string, unknown>;
++    expect(sa["phase"]).toBe("complete");
++    expect(sb["phase"]).toBe("paused");
++    expect(sa["steps"]).toEqual([1]);
++    expect(sb["steps"]).toEqual([]);
++
++    // B 恢复后注入继续，A 已终态不受影响
++    await call(h.port, "POST", `/goals/${b}/control`, h.token, { action: "resume" });
++    expect(h.transport.injections.length).toBe(3);
++    expect(h.transport.injections[2]!.ref.id).toBe(refB!.id);
++    const sa2 = (await call(h.port, "GET", `/goals/${a}`, h.token)).body as Record<string, unknown>;
++    expect(sa2["phase"]).toBe("complete");
++  });
++});
++
++/* ───── R-dg1/R-st4/M72：启动对账接线（落盘状态构造 runner + 不重复注入 + 时钟注入） ───── */
++
++describe("守护启动对账接线（R-dg1 落盘构造 / R-st4 不重复注入 / M72 时钟注入）", () => {
++  it("重启后以落盘状态 roster：reconcile 重锚恰一次，tick 不重复注入；对账时刻取注入时钟", async () => {
++    const stateDir = path.join(TEST_ROOT, `reconcile-${Date.now().toString(36)}`);
++    const cfg = loadConfig({ stateDir, daemonUrl: "http://127.0.0.1:0" }, {});
++    const transport = new FakeTransport();
++    let t = 1_000_000;
++    const clock = { now: () => t };
++    // 预置：已存在会话的 active 目标（injected 空 → 对账重锚分支）
++    const ref = await transport.start(cfg);
++    const seed: GoalState = {
++      goalId: "g-seed-1",
++      objective: "预置目标",
++      verify: [],
++      phase: "active",
++      rounds: 0,
++      steps: [],
++      strikes: 0,
++      injected: [],
++      lastProgressAt: 555, // 陈旧值：对账后应被注入时钟刷新为 1_000_000（而非墙钟）
++      session: ref,
++    };
++    await saveGoal(stateDir, seed);
++
++    const loop = makeManualLoop();
++    const host = new GoalHost({ cfg, transport, clock, loop: loop.loop, verifyRun: async () => ({ ok: true, out: "OK" }) });
++    const daemon = createDaemon(cfg, undefined, host);
++    openDaemons.push(daemon);
++    const errors: string[] = [];
++    const origError = console.error;
++    console.error = (...args: unknown[]) => {
++      errors.push(args.map((a) => String(a)).join(" "));
++    };
++    let port: number;
++    try {
++      port = (await daemon.start()).port;
++    } finally {
++      console.error = origError;
++    }
++    const token = await readFile(path.join(stateDir, "daemon-token"), "utf8");
++
++    // 启动摘要可见（resumed=1）
++    expect(errors.join("\n")).toContain("resumed=1");
++
++    // 对账重锚：恰一次注入
++    expect(transport.injections.length).toBe(1);
++    // M72：对账刷新的 lastProgressAt 取注入时钟（1_000_000），不是系统墙钟（~1.7e12）
++    const st = (await call(port, "GET", "/goals/g-seed-1", token)).body as Record<string, unknown>;
++    expect(st["lastProgressAt"]).toBe(1_000_000);
++    expect(st["rounds"]).toBe(1);
++
++    // roster runner 首轮 sweep：injected 指纹在场 → 不重复注入（R-st4/R-dg1）
++    await loop.sweepOnce();
++    expect(transport.injections.length).toBe(1);
++    // 越过停滞阈值再 sweep：会话活、无信号 → nudge 注入继续（证明 roster runner 在驱动）
++    t += 61_000;
++    await loop.sweepOnce();
++    expect(transport.injections.length).toBe(2);
++    expect(transport.injections[1]!.text).toContain(CONTINUE_PROMPT);
++  });
++});
++
++/* ───── R-dg5-①：autoNudge 接线 ───── */
++
++describe("autoNudge 接线（R-dg5-①：宿主 cfg 默认 + 逐目标覆盖）", () => {
++  it("cfg.autoNudge=false：停滞不注入、strikes 不累计；逐目标 autoNudge=true 覆盖后恢复注入", async () => {
++    const h = await makeHarness({ autoNudge: false });
++    const quiet = await createGoal(h);
++    expect(h.transport.injections.length).toBe(1);
++    h.advance(61_000);
++    await h.loop.sweepOnce();
++    expect(h.transport.injections.length).toBe(1); // 停滞不自动续跑
++    let st = (await call(h.port, "GET", `/goals/${quiet}`, h.token)).body as Record<string, unknown>;
++    expect(st["strikes"]).toBe(0); // 未尝试恢复 → 不计 strike
++
++    // 逐目标显式覆盖 true：停滞注入继续
++    const loud = await createGoal(h, { objective: "覆盖目标", autoNudge: true });
++    await h.loop.sweepOnce();
++    expect(h.transport.injections.length).toBe(2);
++    h.advance(61_000);
++    await h.loop.sweepOnce();
++    expect(h.transport.injections.length).toBe(3);
++    expect(h.transport.injections[2]!.text).toContain(CONTINUE_PROMPT);
++    st = (await call(h.port, "GET", `/goals/${loud}`, h.token)).body as Record<string, unknown>;
++    expect(st["strikes"]).toBe(1);
++  });
++});
++
++/* ───── R-dg5-③：pidfile 单守护前提 ───── */
++
++describe("daemon.pid 单守护前提（R-dg5-③）", () => {
++  async function pidPathOf(cfg: BridgeConfig): Promise<string> {
++    return path.join(cfg.stateDir, "daemon.pid");
++  }
++
++  it("start 写入自身 pid（0600）；stop 清除；重启再写", async () => {
++    const cfg = loadConfig(
++      { stateDir: path.join(TEST_ROOT, `pid-${Date.now().toString(36)}`), daemonUrl: "http://127.0.0.1:0" },
++      {},
++    );
++    const pidPath = await pidPathOf(cfg);
++    const daemon = createDaemon(cfg);
++    openDaemons.push(daemon);
++    await daemon.start();
++    const content = await readFile(pidPath, "utf8");
++    expect(content).toBe(`${process.pid}\n`);
++    const st = await stat(pidPath);
++    expect(st.mode & 0o777).toBe(0o600);
++    await daemon.stop();
++    await expect(readFile(pidPath, "utf8")).rejects.toThrow(); // 已清除
++    const again = createDaemon(cfg);
++    openDaemons.push(again);
++    await again.start(); // 重启可再写
++    expect(await readFile(pidPath, "utf8")).toBe(`${process.pid}\n`);
++    await again.stop();
++    await unlink(pidPath).catch(() => undefined);
++  });
++
++  it("陈旧 pid（进程已死）→ 启动成功并覆写", async () => {
++    const dead = Bun.spawn(["true"]);
++    await dead.exited; // 保证 pid 已死
++    const cfg = loadConfig(
++      { stateDir: path.join(TEST_ROOT, `pid-stale-${Date.now().toString(36)}`), daemonUrl: "http://127.0.0.1:0" },
++      {},
++    );
++    await mkdir(cfg.stateDir, { recursive: true });
++    await writeFile(path.join(cfg.stateDir, "daemon.pid"), `${dead.pid}\n`);
++    const daemon = createDaemon(cfg);
++    openDaemons.push(daemon);
++    await daemon.start(); // 不抛：陈旧清除
++    expect(await readFile(path.join(cfg.stateDir, "daemon.pid"), "utf8")).toBe(`${process.pid}\n`);
++  });
++
++  it("活进程 pid → DAEMON_ALREADY_RUNNING 显式拒绝；内容非法 → DAEMON_PIDFILE_INVALID", async () => {
++    const sleeper = Bun.spawn(["sleep", "30"]);
++    try {
++      const cfg = loadConfig(
++        { stateDir: path.join(TEST_ROOT, `pid-live-${Date.now().toString(36)}`), daemonUrl: "http://127.0.0.1:0" },
++        {},
++      );
++      await mkdir(cfg.stateDir, { recursive: true });
++      await writeFile(path.join(cfg.stateDir, "daemon.pid"), `${sleeper.pid}\n`);
++      const daemon = createDaemon(cfg);
++      let caught: unknown;
++      try {
++        await daemon.start();
++      } catch (e) {
++        caught = e;
++      }
++      expect(caught).toBeInstanceOf(BridgeError);
++      expect((caught as BridgeError).code).toBe("DAEMON_ALREADY_RUNNING");
++      await daemon.stop().catch(() => undefined);
++
++      const cfg2 = loadConfig(
++        { stateDir: path.join(TEST_ROOT, `pid-corrupt-${Date.now().toString(36)}`), daemonUrl: "http://127.0.0.1:0" },
++        {},
++      );
++      await mkdir(cfg2.stateDir, { recursive: true });
++      await writeFile(path.join(cfg2.stateDir, "daemon.pid"), "not-a-pid\n");
++      const daemon2 = createDaemon(cfg2);
++      let caught2: unknown;
++      try {
++        await daemon2.start();
++      } catch (e) {
++        caught2 = e;
++      }
++      expect((caught2 as BridgeError).code).toBe("DAEMON_PIDFILE_INVALID");
++    } finally {
++      sleeper.kill();
++    }
++  });
++});
++
++/* ───── 目标域未接线 → 显式 501（禁静默假装功能存在） ───── */
++
++describe("未接线 GoalHost 的守护（显式 501）", () => {
++  it("GET/POST /goals → 501 GOAL_HOST_DISABLED 结构化", async () => {
++    const cfg = loadConfig(
++      { stateDir: path.join(TEST_ROOT, `nohost-${Date.now().toString(36)}`), daemonUrl: "http://127.0.0.1:0" },
++      {},
++    );
++    const daemon = createDaemon(cfg);
++    openDaemons.push(daemon);
++    const { port } = await daemon.start();
++    const token = await readFile(path.join(cfg.stateDir, "daemon-token"), "utf8");
++    const g = await call(port, "GET", "/goals", token);
++    expect(g.status).toBe(501);
++    expect(errCode(g)).toBe("GOAL_HOST_DISABLED");
++    const p = await call(port, "POST", "/goals", token, { objective: "x" });
++    expect(p.status).toBe(501);
++    expect(errCode(p)).toBe("GOAL_HOST_DISABLED");
++  });
++});
++
++/* ───── POST /goals 输入校验（显式 400，禁静默截断/补缺） ───── */
++
++describe("POST /goals 输入校验", () => {
++  it("objective 缺失/空白、verify 非数组、workdir 相对路径、maxRounds 非正整数 → 400 GOAL_INPUT_INVALID", async () => {
++    const h = await makeHarness();
++    const cases: Array<Record<string, unknown>> = [
++      {},
++      { objective: "   " },
++      { objective: "x", verify: "bun test" },
++      { objective: "x", workdir: "relative/path" },
++      { objective: "x", maxRounds: 0 },
++      { objective: "x", autoNudge: "yes" },
++    ];
++    for (const body of cases) {
++      const r = await call(h.port, "POST", "/goals", h.token, body);
++      expect(r.status).toBe(400);
++      expect(errCode(r)).toBe("GOAL_INPUT_INVALID");
++    }
++  });
++
++  it("非 JSON 请求体 → 400 GOAL_BODY_INVALID", async () => {
++    const h = await makeHarness();
++    const res = await fetch(`http://127.0.0.1:${h.port}/goals`, {
++      method: "POST",
++      headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json" },
++      body: "{not-json",
++    });
++    expect(res.status).toBe(400);
++    expect(errCode({ status: res.status, body: await res.json() })).toBe("GOAL_BODY_INVALID");
++  });
++
++  it("合法可选字段（workdir/maxRounds/autoNudge）持久化并在 GET 中可见", async () => {
++    const h = await makeHarness();
++    const goalId = await createGoal(h, {
++      objective: "带元数据目标",
++      verify: ["echo ok"],
++      workdir: "/tmp/project-x",
++      maxRounds: 20,
++      autoNudge: false,
++    });
++    const st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
++    expect(st["workdir"]).toBe("/tmp/project-x");
++    expect(st["maxRounds"]).toBe(20);
++    expect(st["autoNudge"]).toBe(false);
++    expect(st["verify"]).toEqual(["echo ok"]);
++  });
++});
++
++/* ───── HTTP 形态卫生 ───── */
++
++describe("响应形态卫生", () => {
++  it("所有 /goals 响应均为 application/json", async () => {
++    const h = await makeHarness();
++    const res = await fetch(`http://127.0.0.1:${h.port}/goals`, {
++      headers: { authorization: `Bearer ${h.token}` },
++    });
++    expect(res.headers.get("content-type")).toContain("application/json");
++    expect(res.status).toBe(200);
++    expect(await res.json()).toEqual([]);
++  });
++
++  it("GET /health 免鉴权且含 actives 字段（无目标=0）", async () => {
++    const h = await makeHarness();
++    const body = (await fetch(`http://127.0.0.1:${h.port}/health`).then((r) => r.json())) as Record<string, unknown>;
++    expect(body["ok"]).toBe(true);
++    expect(body["actives"]).toBe(0);
++  });
++});
+diff --git a/plugins/codearts-bridge/test/runner.test.ts b/plugins/codearts-bridge/test/runner.test.ts
+index 436d4988d0..1a75bd8785 100644
+--- a/plugins/codearts-bridge/test/runner.test.ts
++++ b/plugins/codearts-bridge/test/runner.test.ts
+@@ -616,10 +616,43 @@ describe("注入留痕", () => {
+     for (let i = 0; i < 7; i++) {
+       h.advance(61_000);
+       await r.tick();
+     }
+     expect(r.state().rounds).toBe(8); // 契约 + 7 nudge
+     expect(r.state().injected.length).toBe(6);
+     // 最旧的是第 3 次注入（第 1、2 条被挤出）
+     expect(r.state().injected[0]).toBe(h.transport.injections[2]!.text);
+   });
+ });
++
++/* ───── quiesce 排空窗口（T3-05 守护集成实证缺陷回归） ───── */
++
++describe("quiesce 同块连推多信号（T3-05 集成发现回归）", () => {
++  it("同一同步块内连推步进+完成信号：一次 tick 全部消费（决策前消费契约）", async () => {
++    // 缺陷史：quiesce 单轮采样在 async generator 唤醒管线（恢复→yield→泵续，
++    // 2~3 个微任务轮）未走完时误判排空——同块连推的第 2+ 个信号迟到决策后，
++    // done 被推迟到下一次 tick 才核验。修复后：连续 4 轮稳定窗口覆盖管线深度。
++    const h = makeHarness();
++    const r = await boot(h);
++    const ref = r.state().session!;
++    h.advance(4000); // 越过回显守卫窗口
++    h.transport.emit(ref, "output", "[GOAL-STEP 1/1] 完成 | 推荐方案: x");
++    h.transport.emit(ref, "output", "全部完成 [GOAL-DONE]");
++    await r.tick(); // 同一 tick：步进标记落地 + done 申报 + 双过核验
++    expect(r.state().phase).toBe("complete");
++    // 1/1 标记 = 当前步语义（C++ steps[i].done：n 号标记把 1..n-1 记完成）→ 无完成步
++    expect(r.state().steps).toEqual([]);
++  });
++
++  it("同块连推 5 个信号（压力形态）：一次 tick 全部消费、无遗漏", async () => {
++    const h = makeHarness();
++    const r = await boot(h);
++    const ref = r.state().session!;
++    h.advance(4000);
++    for (let i = 1; i <= 5; i++) {
++      h.transport.emit(ref, "output", `chunk-${i} 文本${i}`);
++    }
++    h.transport.emit(ref, "output", "done [GOAL-DONE]");
++    await r.tick();
++    expect(r.state().phase).toBe("complete"); // done 未迟到（6 信号全消费）
++  });
++});

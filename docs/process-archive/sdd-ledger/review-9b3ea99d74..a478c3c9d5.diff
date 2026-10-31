@@ -1,0 +1,138 @@
+# Review package: 9b3ea99d74..a478c3c9d5
+
+## Commits
+a478c3c9d5 codearts-bridge(T2-02): 修复评审发现 — R-p4 终止机理注释更正为真实两级机制（组杀/ SIGHUP 级联/残余风险/缓解路径） — I1
+
+## Files changed
+ .../src/core/transport/pty-script.ts               | 25 ++++++++++++++++------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-script.ts b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+index 1a5caf61a8..6aae1aa460 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-script.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+@@ -12,23 +12,29 @@
+  *   文本含 \r/\n 显式抛 INJECT_TEXT_MULTILINE（与两段式契约冲突，禁静默截断）。
+  * - R-p2 日志信号源：observe 额外 tail `<kernelDataDir>/log/kernel-*.log`
+  *   增量（kernelDataDir 经 ObserveOptions 传参，缺省 ~/.codeartsdoer/cli-data，
+  *   不扩展 BridgeConfig——与 R-h3/R-h5 同风格）；`service=` 行转为 output
+  *   信号补充。日志源不可用（目录/文件缺失、读取错误）**一律不报错、不影响
+  *   PTY 通道**，来源可用性在 snapshot.meta.log 如实标注（本裁定显式豁免
+  *   "禁静默兜底"全局约束于日志源；PTY 侧错误仍显式抛出）。
+  * - R-p3 abort 对齐（T9 基准）：observe 尊重 opts.signal——挂起等待中 abort
+  *   迭代立即正常落定、残存信号不交付当前消费者但保留给下一次 observe
+  *   （与 FakeTransport 同态）、不 flush、不抛错。
+- * - R-p4 进程组终止：生产 spawnPty 以 detached:true 使子进程为进程组长，
+- *   stop 经 process.kill(-pid, SIGKILL) 整组终止（含孙进程），杜绝
+- *   createNodeExec 同款"只杀 shell 残孙子"问题；ESRCH 视为终止目标已达成
++ * - R-p4 进程终止（真实两级机理，探针+family 测试实证；评审 I1 更正）：
++ *   ① 组杀：生产 spawnPty 以 detached:true 使 script 进程为新进程组长，
++ *   stop 经 process.kill(-pid, SIGKILL) 终止该组——覆盖 script 本体；
++ *   ② SIGHUP 级联：script -c 的命令子进程经 setsid 成独立会话，**不在组内**，
++ *   子树（目标 TUI 及其后代）的终止依赖 script 死亡后 PTY master 关闭触发的
++ *   SIGHUP 级联（探针实测 <300ms 全灭）；③ 残余风险：目标若忽略/捕获 SIGHUP
++ *   可能残留（script 宿主固有拓扑）；④ 缓解路径：T2-03 tmux 宿主
++ *   （kill-session 原生整树终止）、T2-05 结构化传输（无 PTY 树），后代
++ *   /proc 清扫登记为候选项（本轮不实现）。ESRCH 视为终止目标已达成
+  *   （stop 幂等语义），其余错误显式抛 PTY_STOP_FAILED。
+  * - R-p5 PtyChild 注入：exec.spawnPty(args, env) 注入 seam；生产缺省实现
+  *   nodeScriptSpawnPty = `script -qefc <cmd> /dev/null`，参数一律 argv 数组
+  *   传递（本实现不做 shell 字符串拼接；script -c 本身为 sh 语义，故对
+  *   配置路径做 shQuote 转义——数据源仅限配置路径，非用户文本）。
+  * - R-p6 UTF-8：PTY 流按 chunk 到达，stdout/stderr 各持独立 StringDecoder，
+  *   多字节序列跨 chunk 完整还原（两流独立解码器，交错不破坏字节边界）。
+  *
+  * 语义裁决（显式报错，禁静默兜底；与 FakeTransport 对齐项注明）：
+  * - 未知 ref：全部方法抛 SESSION_UNKNOWN（与 Fake 同）；
+@@ -118,37 +124,38 @@ function lookPath(exe: string, env: NodeJS.ProcessEnv): string | null {
+       // 该目录不存在此文件：继续搜下一目录（搜索语义，非兜底）
+     }
+   }
+   return null;
+ }
+ 
+ /**
+  * 生产缺省 spawnPty：spawn args[0]（detached，子进程为进程组长），stdio 三管道。
+  * - 可执行文件缺失：同步抛 PTY_HOST_UNAVAILABLE（无竞态，先探测后 spawn）；
+  * - R-p6：stdout/stderr 各持独立 StringDecoder，多字节跨 chunk 完整还原；
+- * - R-p4：kill = process.kill(-pid, SIGKILL) 整组终止；ESRCH = 已死（幂等）。
++ * - R-p4：kill = process.kill(-pid, SIGKILL) 组杀（覆盖 script 本体；子树靠
++ *   master 关闭 SIGHUP 级联，两级机理见文件头 R-p4）；ESRCH = 已死（幂等）。
+  */
+ export function nodeScriptSpawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
+   const exe = args[0];
+   if (exe === undefined || exe === "") {
+     throw new BridgeError("PTY_HOST_UNAVAILABLE", "spawnPty 参数缺少可执行文件名", {
+       remediation: "检查 ptyHost=script 的传输装配参数。",
+     });
+   }
+   const resolved = lookPath(exe, env);
+   if (resolved === null) {
+     throw new BridgeError("PTY_HOST_UNAVAILABLE", `PATH 上未找到可执行文件：${exe}`, {
+       remediation: "安装 util-linux（提供 script(1)），或将 ptyHost 配置为 tmux。",
+     });
+   }
+   const child = spawn(resolved, args.slice(1), {
+-    detached: true, // R-p4：新会话/进程组，供 kill(-pid) 整树终止
++    detached: true, // R-p4：script 为新进程组长，供 kill(-pid) 组杀（子树终止靠 SIGHUP 级联，见文件头 R-p4）
+     env,
+     stdio: ["pipe", "pipe", "pipe"],
+   });
+   if (child.pid === undefined) {
+     throw new BridgeError("PTY_SPAWN_FAILED", `进程 spawn 失败：${exe}`);
+   }
+   const pid: number = child.pid; // 收窄捕获（闭包内 child.pid 类型为 number|undefined）
+ 
+   let exited = false;
+   const decOut = new StringDecoder("utf8"); // R-p6：每流独立解码器
+@@ -180,21 +187,25 @@ export function nodeScriptSpawnPty(args: string[], env: NodeJS.ProcessEnv): PtyC
+     pid,
+     onData(cb) {
+       sink = cb;
+     },
+     write(data) {
+       child.stdin?.write(data);
+     },
+     kill() {
+       if (exited) return;
+       try {
+-        process.kill(-pid, "SIGKILL"); // R-p4：负 pid = 整个进程组
++        // R-p4 第一级：负 pid = SIGKILL script 进程组（覆盖 script 本体）。
++        // 子树（目标 TUI）不在组内（script -c 子进程 setsid 独立会话）——
++        // script 死亡 → PTY master 关闭 → SIGHUP 级联终止子树（第二级）；
++        // 完整两级机理与残余风险见文件头 R-p4。
++        process.kill(-pid, "SIGKILL");
+       } catch (e) {
+         const code = (e as NodeJS.ErrnoException | null)?.code;
+         if (code !== "ESRCH") {
+           throw new BridgeError(
+             "PTY_STOP_FAILED",
+             `进程组终止失败：pid=${pid} errno=${code ?? String(e)}`,
+             { cause: e },
+           );
+         }
+         // ESRCH：进程组已不存在——终止目标已达成（stop 幂等），非静默兜底
+@@ -586,21 +597,21 @@ export function createScriptTransport(
+ 
+     async alive(ref: SessionRef): Promise<boolean> {
+       const s = requireSession(ref);
+       return !s.closed && s.child.alive();
+     },
+ 
+     async stop(ref: SessionRef): Promise<void> {
+       const s = requireSession(ref);
+       if (!s.closed) {
+         s.closed = true;
+-        if (s.child.alive()) s.child.kill(); // R-p4：整组 SIGKILL（实现见 nodeScriptSpawnPty）
++        if (s.child.alive()) s.child.kill(); // R-p4：组杀 + SIGHUP 级联两级终止（机理见文件头 R-p4）
+       }
+       wakeAll(s);
+     },
+ 
+     async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
+       const s = requireSession(ref);
+       return {
+         raw: s.raw,
+         meta: {
+           id: s.ref.id,

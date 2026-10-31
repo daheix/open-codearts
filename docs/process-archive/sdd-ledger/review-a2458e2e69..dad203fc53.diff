@@ -1,0 +1,2001 @@
+# Review package: a2458e2e69..dad203fc53
+
+## Commits
+dad203fc53 codearts-bridge(T4-02): 修复真机验收暴露的 5 缺陷 — alive 布尔契约/死会话重启风暴/PTY 多行注入/verifyRun 接线/resume 重建 — ④③②①⑤
+c5df019a1d codearts-bridge(T4-01): 全局接入与使用文档 — 2.2.5 全局 autoload 实测生效、开发文档更新 — 正式接入形态实测定案：全局自动加载目录 ~/.config/opencode/plugins/codearts-bridge.ts（一行 re-export 指向稳定公开检出 /home/wsc/wsc/open-codearts），写入后 0.25s 热加载（日志 loading plugin 行+依赖图 watcher 64 订阅+零 failed to load），opencode plugin list 与服务端 GET /api/plugin 双端点在册 status=active，会话内活调 codearts_daemon_status 成功（守护 version=dev uptime=3839s）；全局 opencode.jsonc 零改动（形态 1 生效无需形态 2 配置键方案，未重启服务）；2.2.5 加载行为增量：package.json exports 被采用（entrypoint=src/server.ts）；README 开发文档更新：当前阶段 M1-M3 完成+使用文档指针指向公开仓库、新增全局接入（T4-01 实测）节含证据链五步与双实例注意；配套公开仓库提交 5a8a440（CHANGELOG.md v0.3.0-dev、README 故障排查四项+双版本加载对照表、同步 matrix.test.ts 463 全绿）；全量 bun test 463 计数（462 pass+1 skip）/0 fail、typecheck 零错误
+
+## Files changed
+ plugins/codearts-bridge/README.md                  |  35 ++++-
+ plugins/codearts-bridge/src/cli.ts                 |  70 +++++++++
+ plugins/codearts-bridge/src/core/goal/runner.ts    |  32 +++-
+ plugins/codearts-bridge/src/core/transport/fake.ts |  33 +++-
+ .../src/core/transport/pty-script.ts               | 161 +++++++++++++-------
+ .../codearts-bridge/src/core/transport/pty-tmux.ts |  23 +--
+ .../src/core/transport/structured.ts               |  24 ++-
+ .../codearts-bridge/src/core/transport/types.ts    |  16 +-
+ plugins/codearts-bridge/src/daemon-goals.ts        |  14 +-
+ plugins/codearts-bridge/test/daemon-goals.test.ts  |  71 ++++++++-
+ plugins/codearts-bridge/test/run-tool.test.ts      |  16 +-
+ plugins/codearts-bridge/test/runner.test.ts        | 166 ++++++++++++++++++++-
+ plugins/codearts-bridge/test/service.test.ts       | 117 +++++++++++++++
+ plugins/codearts-bridge/test/state.test.ts         |  16 ++
+ .../codearts-bridge/test/transport-fake.test.ts    |  13 +-
+ .../codearts-bridge/test/transport-script.test.ts  | 104 +++++++++++--
+ .../test/transport-structured.test.ts              |  21 ++-
+ .../codearts-bridge/test/transport-tmux.test.ts    |  18 ++-
+ 18 files changed, 841 insertions(+), 109 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/README.md b/plugins/codearts-bridge/README.md
+index 5b7a24c580..ae396fa321 100644
+--- a/plugins/codearts-bridge/README.md
++++ b/plugins/codearts-bridge/README.md
+@@ -1,17 +1,19 @@
+ # codearts-bridge
+ 
+ opencode V2 插件（薄壳）+ 核心库 + 守护进程：为 CodeArts CLI 提供安装管家、
+ 双传输（structured/PTY）、目标引擎与健康治理能力。
+ 
+ - 设计文档：`docs/superpowers/specs/2026-10-30-codearts-integration-opencode-design.md`
+-- 当前阶段：M1 基础骨架（T1-01 包骨架与加载验证）
++- 当前阶段：M1+M2+M3 全部完成（463 计数测试全绿）；**使用文档（安装/AK-SK/工具速查/
++  故障排查/CHANGELOG）以公开仓库为准**：https://github.com/daheix/open-codearts
++  （稳定检出 `/home/wsc/wsc/open-codearts`）。本 README 定位为开发文档。
+ 
+ ## 目录结构
+ 
+ ```
+ plugins/codearts-bridge/
+ ├── package.json        # name: codearts-bridge；exports["."/"./server"] → src/server.ts
+ ├── tsconfig.json       # strict + moduleResolution bundler + bun-types
+ ├── index.ts            # 目录加载兼容入口（见下"加载方式（实测）"）
+ ├── plugin/index.ts     # 裸目录 shim（备用入口，实测注释）
+ ├── src/
+@@ -61,15 +63,46 @@ bun run typecheck    # tsc --noEmit
+ 加入本插件目录的**绝对路径**，入口为根 `index.ts`：
+ 
+ ```jsonc
+ {
+   "plugin": [
+     "/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge"
+   ]
+ }
+ ```
+ 
++## 全局接入（T4-01 实测，2026-10-31）
++
++**正式接入形态：全局自动加载目录，实测生效**（opencode **2.2.5** 后台服务；
++全程未重启服务，全局 `opencode.jsonc` 零改动——无需形态 2 的配置键方案）：
++
++```ts
++// ~/.config/opencode/plugins/codearts-bridge.ts（新文件，sha256 997bda02…f8e）
++// codearts-bridge 全局自动加载入口（T4-01，R-gj1 形态 1）。
++// 指向稳定公开检出 /home/wsc/wsc/open-codearts（非 worktree 瞬态路径）。
++export { default } from "/home/wsc/wsc/open-codearts/index.ts";
++```
++
++**证据链**（`~/.local/share/opencode/log/opencode.log`）：
++
++1. 写入后约 0.25s：`msg="loading plugin" id=/home/wsc/.config/opencode/plugins/codearts-bridge.ts
++   entrypoint=file:///home/wsc/.config/opencode/plugins/codearts-bridge.ts`；
++2. 依赖图 watcher 跟踪公开检出全部模块（`/home/wsc/wsc/open-codearts/src/**` 64 行订阅，零
++   `failed to load plugin`）；
++3. `opencode plugin list`（2.2.5 CLI）：`codearts-bridge  local  /home/wsc/.config/opencode/plugins/codearts-bridge.ts` 在册；
++4. 服务端 `GET /api/plugin`（2.2.5 新端点）：`{"id":"codearts-bridge","source":{"type":"local",
++   "path":"/home/wsc/.config/opencode/plugins/codearts-bridge.ts"},"state":{"status":"active"}}`；
++5. 会话内活调 `codearts_daemon_status` 成功（守护 version=dev, uptime=3839s, actives=0）。
++
++**2.2.5 加载行为增量**（对照 2.1.4 结论）：`package.json` 的 `exports` **被采用**
++（dev 接线目录的 entrypoint 为 `src/server.ts` 而非根 `index.ts`）；全局 autoload 目录
++`.ts` 单文件入口直接热加载。双版本对照表见公开仓库 README"加载方式（实测）"节。
++
++**双实例注意**：本 worktree 的项目级 `opencode.json` 仍有 dev 接线（本地改动，台账在案、
++不提交）——从本 worktree 打开的会话会同时加载全局与项目两个实例（`plugin list` 可见两行）。
++工具名重复注册行为未系统实测；全局接入已覆盖后，dev 接线仅在插件开发调试时需要。
++
+ ## 兼容入口说明
+ 
+ - `index.ts`（根）：2.1.4 目录加载的实体入口（`export { default } from "./src/server.ts"`）。
+ - `plugin/index.ts`：裸目录 shim 备用入口（若未来把插件目录整体发布为 npm 包，
+   可将配置指向该裸子目录以绕过包解析路径）。
+diff --git a/plugins/codearts-bridge/src/cli.ts b/plugins/codearts-bridge/src/cli.ts
+index 612a945d79..3bb694fd76 100644
+--- a/plugins/codearts-bridge/src/cli.ts
++++ b/plugins/codearts-bridge/src/cli.ts
+@@ -37,20 +37,21 @@
+  *   （timeout/连接拒绝/non-json/ok-mismatch/http-5xx）入 stderr（journald 经
+  *   SyslogIdentifier=codearts-bridge-watchdog 落账，R-sv4）。
+  *   有应答即事件循环存活（任意状态码）→ 计数清零；体级异常只留痕不重启——
+  *   重启无法修复"端口被其他进程占用"类问题，留痕排障才是正解（dsh 原型口径）。
+  *
+  * 可测试性设计：全部命令函数接收显式 cfg 与注入 deps（exec/fetch/时钟/路径），
+  * 返回退出码而非直接 process.exit；daemonCommand 另设 hooks.onReady 供测试
+  * 确定性驱动 SIGINT，生产不传即无感。
+  */
+ import { mkdir, readFile, unlink } from "node:fs/promises";
++import { spawn as nodeSpawn } from "node:child_process";
+ import { homedir } from "node:os";
+ import * as path from "node:path";
+ import type { BridgeConfig } from "./core/config";
+ import { PLUGIN_ID, PLUGIN_VERSION, loadConfig, readAksk } from "./core/config";
+ import { BridgeError } from "./core/errors";
+ import { atomicWriteFile, errnoOf } from "./core/fsx";
+ import { createNodeExec, statOrEnoent } from "./core/install";
+ import type { Exec, ExecResult } from "./core/install";
+ import {
+   SERVICE_UNIT_NAMES,
+@@ -146,20 +147,88 @@ export interface DaemonCommandHooks {
+ /** daemon 命令注入缝（T3-07 生产装配可替换项；测试注入确定性实现）。 */
+ export interface DaemonCommandDeps {
+   /** tmux 可用性探测（缺省 probeTmuxAvailable；测试注入 false 免真实 spawn）。 */
+   tmuxProbe?: () => Promise<boolean>;
+   /** 传输工厂（缺省 defaultBuildTransport；测试注入 FakeTransport）。 */
+   buildTransport?: (sel: TransportSelection) => CodeartsTransport;
+   /** 时钟（缺省 defaultRunClock；GoalHost 与 runner 同源——M72 口径）。 */
+   clock?: RunClock;
+   /** sweep 循环宿主（缺省 defaultTickLoop(GOAL_SWEEP_INTERVAL_MS)）。 */
+   loop?: TickLoop;
++  /**
++   * 独立验收执行器（修复环裁定① 2026-10-31：缺省 execVerify——生产 GoalHost
++   * 必接线 verifyRun，否则带 verify 的 POST /goals 生产必失败（真机 T4-02 实证
++   * GOAL_VERIFY_RUN_MISSING + 半成品目标落盘）；测试注入 fake 断言透传）。
++   */
++  execVerify?: (cmd: string[], cwd?: string) => Promise<{ ok: boolean; out: string }>;
++}
++
++/* ───── verify 独立验收执行器（修复环裁定① 生产缺省实现） ───── */
++
++/** verify 命令超时（裁定①：60s；超时 SIGKILL 并记验收失败）。 */
++export const VERIFY_TIMEOUT_MS = 60_000;
++
++/** verify 输出截断上限（字符）：审计/注入文案取摘要，防超大输出拖垮守护。 */
++export const VERIFY_OUT_MAX_CHARS = 8_000;
++
++function capVerifyOut(s: string): string {
++  return s.length > VERIFY_OUT_MAX_CHARS
++    ? `${s.slice(0, VERIFY_OUT_MAX_CHARS)}…(+${s.length - VERIFY_OUT_MAX_CHARS} 字符截断)`
++    : s;
++}
++
++/**
++ * 生产缺省 verifyRun（修复环裁定① 2026-10-31）：child_process 直 exec（不经
++ * shell、argv 数组传递）；60s 超时强杀；输出截断上限；cwd 透传（GoalHost 逐
++ * 目标绑定 = 缺省目标 workdir；目标无 workdir → 守护进程 cwd）。
++ * 退出码非 0 / 超时 / spawn 失败一律 ok=false 且 out 携带显式失败原因——"无法
++ * 完成验收"本身就是验收未过的事实，失败详情上供给 runner 注入续跑（非静默
++ * 兜底：错误可见、目标不被误判完成）；cmd[0] 缺失属调用方缺陷，显式抛错。
++ */
++export async function execVerify(cmd: string[], cwd?: string): Promise<{ ok: boolean; out: string }> {
++  const file = cmd[0];
++  if (file === undefined || file === "") {
++    throw new BridgeError("GOAL_VERIFY_CMD_INVALID", `验收命令为空（cmd[0] 缺失）：${JSON.stringify(cmd)}`);
++  }
++  return await new Promise<{ ok: boolean; out: string }>((resolve) => {
++    let out = "";
++    let settled = false;
++    const child = nodeSpawn(file, cmd.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"] });
++    const collect = (b: Buffer): void => {
++      if (out.length <= VERIFY_OUT_MAX_CHARS) out += b.toString("utf8");
++    };
++    const finish = (reason: string): void => {
++      if (settled) return;
++      settled = true;
++      resolve({ ok: false, out: capVerifyOut(`${reason}${out}`) });
++    };
++    const timer = setTimeout(() => {
++      child.kill("SIGKILL");
++      finish(`验收命令超时（>${VERIFY_TIMEOUT_MS}ms）已被终止。`);
++    }, VERIFY_TIMEOUT_MS);
++    child.stdout?.on("data", collect);
++    child.stderr?.on("data", collect);
++    child.on("error", (e: NodeJS.ErrnoException) => {
++      clearTimeout(timer);
++      finish(`验收命令无法执行：${e.code ?? "UNKNOWN"}（${e.message}）。`);
++    });
++    child.on("exit", (code) => {
++      clearTimeout(timer);
++      if (code === 0) {
++        if (settled) return;
++        settled = true;
++        resolve({ ok: true, out: capVerifyOut(out.trim()) });
++      } else {
++        finish(`验收命令退出码=${code ?? "null"}。`);
++      }
++    });
++  });
+ }
+ 
+ /**
+  * 守护生产传输装配（R-cr1 同一套选择逻辑，登记项①）：
+  * readAksk → 按需 tmux 探测 → selectTransport → 传输工厂。
+  * 与 runOnce 逐行同构（凭据口径/tmux 探测条件一致），杜绝第二套选择真相源。
+  */
+ async function resolveProductionTransport(
+   cfg: BridgeConfig,
+   deps: DaemonCommandDeps,
+@@ -191,20 +260,21 @@ export async function daemonCommand(
+   deps: DaemonCommandDeps = {},
+ ): Promise<number> {
+   // 生产装配（登记项①）：传输选择失败（凭据文件损坏/tmux 探测异常）显式拒绝
+   // 启动——目标域不可用的守护不该装作健康（禁静默降级为 501 形态）。
+   const transport = await resolveProductionTransport(cfg, deps);
+   const goals = new GoalHost({
+     cfg,
+     transport,
+     clock: deps.clock ?? defaultRunClock,
+     loop: deps.loop ?? defaultTickLoop(GOAL_SWEEP_INTERVAL_MS),
++    verifyRun: deps.execVerify ?? execVerify, // 修复环裁定①：生产必接线（真机缺陷①治理）
+   });
+   const daemon = createDaemon(cfg, undefined, goals);
+   const signals = ["SIGINT", "SIGTERM"] as const;
+   let stopping = false; // 信号去重（SIGINT+SIGTERM 连发只停一次）
+   let resolveSignal: (sig: string) => void = () => undefined;
+   const signalReceived = new Promise<string>((resolve) => {
+     resolveSignal = resolve;
+   });
+   const removeSignalListeners = () => {
+     for (const sig of signals) process.removeListener(sig, onSignal);
+diff --git a/plugins/codearts-bridge/src/core/goal/runner.ts b/plugins/codearts-bridge/src/core/goal/runner.ts
+index bbe93bc5b3..dcca0c5756 100644
+--- a/plugins/codearts-bridge/src/core/goal/runner.ts
++++ b/plugins/codearts-bridge/src/core/goal/runner.ts
+@@ -804,70 +804,96 @@ export class GoalRunner {
+       consecutive: this.retry.consecutive,
+       nextRetryAtMs: this.retry.nextRetryAtMs,
+     });
+     this.pendingRetry = { kind };
+   }
+ 
+   /* ───── 注入与文案 ───── */
+ 
+   /**
+    * 统一注入入口（C++ noteInjection+inject 合流）：留痕（上限 6）→ 开回显守卫
+-   * 窗 → 审计 → 传输注入 → 复位三计时（C++ injectContract/Nudge 尾段同语义）。
+-   * 调用方保证 phase=active 且 session 在场。
++   * 窗 → 传输注入 → 成功后落审计并复位三计时（C++ injectContract/Nudge 尾段
++   * 同语义）。调用方保证 phase=active 且 session 在场。
++   *
++   * 修复环裁定②（2026-10-31，状态失真治理）：留痕指纹与守卫窗**先于字节上线**
++   * （注入回显可能在本函数 await 窗口内经信号泵到达，stripInjectionEcho 的指纹
++   * 必须已就位）；审计与计时在传输成功后落——传输拒绝（显式上抛前）回滚
++   * injected 指纹 / rounds / 守卫窗，杜绝"注入被拒仍留 injected 指纹与 rounds+1"
++   * 的状态失真（真机 T4-02 实证：契约被传输拒绝却留下注入痕迹）。
+    */
+   private async injectPrompt(text: string, kind: InjectKind): Promise<void> {
+     const now = this.now();
++    const prevDeafUntil = this.deafUntilMs;
+     this.st.injected.push(text);
+     while (this.st.injected.length > RECENT_INJECTION_CAP) this.st.injected.shift();
+     this.deafUntilMs = now + this.deps.thresholds.echoGuardMs;
+     this.st.rounds += 1;
++    try {
++      await this.deps.transport.inject(this.st.session as SessionRef, text);
++    } catch (e) {
++      // 回滚（text 是刚 push 的最后一条；shift 只可能移除更早条目，pop 恒正确）
++      this.st.injected.pop();
++      this.st.rounds -= 1;
++      this.deafUntilMs = prevDeafUntil;
++      throw e;
++    }
+     this.deps.audit({
+       type: "goal.inject",
+       goalId: this.st.goalId,
+       at: now,
+       kind,
+       rounds: this.st.rounds,
+     });
+-    await this.deps.transport.inject(this.st.session as SessionRef, text);
+     this.lastFeedAt = this.lastActiveAt = this.lastProgressAt = now;
+     this.st.lastProgressAt = now;
+   }
+ 
+   /**
+    * 轻量继续指令（C++ continuePrompt 移植；总步数不可知故不带进度计数——
+    * parseProgress 不外露 N，task-15 M61 口径；CONTINUE_PROMPT 常量承载核心语义）。
+    */
+   private continueText(): string {
+     return (
+       "【/goal 继续】对话已中断，目标不变、进度保留。\n" +
+       `请**${CONTINUE_PROMPT}**，不要重新开始：直接从下一步按协议输出 ` +
+       "[GOAL-STEP n/N] <步骤> | 推荐方案: …，全部完成后输出 [GOAL-DONE]。\n"
+     );
+   }
+ 
+   /* ───── resume / stop 锁内实现 ───── */
+ 
++  /**
++   * 人工恢复：paused/blocked → active 并注入继续指令；终态显式报错。
++   * 修复环裁定⑤（2026-10-31）：resume 前置存活检查——死会话先按进程死重建
++   * 路径（裁定③，restartLocked：销毁残留→重建活会话→断点/全文契约注入），
++   * 再返回 active；不再对死会话直接注入而永久 SESSION_NOT_ALIVE（真机控制三连
++   * 实证：死会话目标 resume 永久失败，仅 stop 可达终态）。
++   */
+   private async resumeLocked(): Promise<GoalState> {
+     if (this.st.phase === "complete" || this.st.phase === "stopped") {
+       throw new BridgeError(
+         "GOAL_TERMINAL_STATE",
+         `目标已终态（${this.st.phase}），不可恢复：goalId=${this.st.goalId}`,
+         { remediation: "终态目标不可恢复驱动；如需重跑请新建目标。" },
+       );
+     }
+     if (this.st.phase === "active") return this.snap(); // 幂等
+     this.st.phase = "active";
+     this.deps.audit({ type: "goal.resume", goalId: this.st.goalId, at: this.now() });
+     if (this.st.session === undefined) {
+       await this.bootstrapLocked(); // 暂停中的全新目标：恢复即引导
+       return this.snap();
+     }
++    if (!(await this.deps.transport.alive(this.st.session))) {
++      await this.restartLocked(this.now()); // ⑤：死会话 → 重建 + resume 契约
++      return this.snap();
++    }
+     await this.injectPrompt(this.continueText(), "continue");
+     return this.snap();
+   }
+ 
+   private async stopLocked(): Promise<GoalState> {
+     if (this.st.phase === "stopped" || this.st.phase === "complete") return this.snap(); // 幂等
+     this.pumpAbort.abort(); // 观察流随会话终止
+     if (this.st.session !== undefined) await this.deps.transport.stop(this.st.session);
+     this.st.phase = "stopped";
+     const now = this.now();
+diff --git a/plugins/codearts-bridge/src/core/transport/fake.ts b/plugins/codearts-bridge/src/core/transport/fake.ts
+index 86db0d51d7..31b7becb7b 100644
+--- a/plugins/codearts-bridge/src/core/transport/fake.ts
++++ b/plugins/codearts-bridge/src/core/transport/fake.ts
+@@ -12,21 +12,24 @@
+  * - ② 注入留痕：`injections` 按调用顺序记录每次 inject 的 {ref, text, at}，
+  *   供"两步提交/注入留痕"断言；stop 后留痕不丢。
+  * - ③ alive 可切换：stop → false；start 复用同一 ref（恢复语义）→ true。
+  * - ④ stop 后 observe 正常终止（挂起中的 next 得 done）、后续 observe 立即
+  *   正常结束（空迭代）、alive=false；stop 幂等。
+  * - ⑤ `at` 时间线：**调用序计数器**（二选一裁定：弃注入时钟），会话级单调
+  *   递增、inject 与 emit 共享同一刻度（与真实传输的事件序一致）；
+  *   start 复用归零（新生命期的确定性起点）。
+  *
+  * 语义裁决（显式报错，禁静默兜底）：
+- * - 未知 ref：全部方法同步抛 `SESSION_UNKNOWN`，不产生任何副作用；
++ * - 未知 ref：inject/observe/stop/snapshot 同步抛 `SESSION_UNKNOWN`，不产生任何
++ *   副作用；alive 为**布尔查询**返回 false、start 采纳未知 ref 为新会话
++ *   （修复环第 1 轮裁定③④，2026-10-31：与真实传输同源对齐——守护重启对账
++ *   必经未知 ref，alive=false 走重建、start(未知 ref)=采纳重建）；
+  * - 对非存活会话 inject：抛 `SESSION_NOT_ALIVE` 且不留痕；
+  * - 同一 ref 并发第二个 observe：同步抛 `OBSERVER_ACTIVE`（单观察者模型，
+  *   消除多消费者争抢信号的歧义；迭代器结束/return/abort 释放后可重新 observe）；
+  * - observe 的 signal abort：迭代**立即正常结束**（"立即放弃"语义——已入队
+  *   未消费的残存信号丢弃，不抛错，R-tr2）；
+  * - snapshot.raw：会话 raw 缓冲按序拼接的 output/error 信号 text（入队时
+  *   累积、与是否被 observe 消费无关，模拟终端缓冲区）；其余信号类型与无
+  *   text 信号不进 raw。meta 含 id/kind/alive/closed/injections/signalCount
+  *   （signalCount = 累计入队信号总数，含已消费）。
+  */
+@@ -84,21 +87,43 @@ export class FakeTransport implements CodeartsTransport {
+   constructor(opts: FakeTransportOptions = {}) {
+     this.kind = opts.kind ?? "pty";
+   }
+ 
+   /* ───── CodeartsTransport 六方法 ───── */
+ 
+   async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
+     // cfg 仅满足接口签名；Fake 不读配置、无副作用（R-tr4）。显式标注以示故意。
+     void cfg;
+     if (ref !== undefined) {
+-      const s = this.requireSession(ref);
++      if (ref.kind !== this.kind) {
++        // kind 不符 = 非本传输的引用（与 script/tmux 非法引用同裁决：SESSION_UNKNOWN）
++        throw new BridgeError("SESSION_UNKNOWN", `非法会话引用：kind=${ref.kind} id=${ref.id}`, {
++          remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
++        });
++      }
++      let s = this.sessions.get(ref.id);
++      if (s === undefined) {
++        // 修复环裁定③（2026-10-31）：未知但形态合法的 ref = 跨守护重启对账
++        // 语义（与真实传输对齐）：采纳为新会话（id 保留调用方值）。
++        s = {
++          ref: { ...ref },
++          alive: true,
++          closed: false,
++          pending: [],
++          signalCount: 0,
++          raw: "",
++          atNext: 0,
++          waiters: [],
++          observer: null,
++        };
++        this.sessions.set(ref.id, s);
++      }
+       // 复用/恢复语义：复活会话并归零时间线；信号队列、raw 缓冲、注入留痕
+       // 一律保留（留痕是审计事实，重启不抹除）。
+       s.alive = true;
+       s.closed = false;
+       s.atNext = 0;
+       return { ...s.ref };
+     }
+     const id = `fake-${++this.idNext}`;
+     const created: SessionRef = { kind: this.kind, id };
+     this.sessions.set(id, {
+@@ -184,21 +209,23 @@ export class FakeTransport implements CodeartsTransport {
+         terminated = true;
+         self.releaseObserver(s, token);
+         self.wakeAll(s);
+         return inner.throw(e);
+       },
+     };
+     return { [Symbol.asyncIterator]: () => iterator };
+   }
+ 
+   async alive(ref: SessionRef): Promise<boolean> {
+-    return this.requireSession(ref).alive;
++    // 修复环裁定④（2026-10-31）：布尔查询——未知 ref → false（不抛错，
++    // 与真实传输同源对齐；守护重启对账凭 false 走重建路径）。
++    return this.sessions.get(ref.id)?.alive ?? false;
+   }
+ 
+   async stop(ref: SessionRef): Promise<void> {
+     const s = this.requireSession(ref);
+     s.alive = false;
+     s.closed = true;
+     this.wakeAll(s);
+   }
+ 
+   async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-script.ts b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+index b5df752187..c4ebf4ee38 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-script.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+@@ -2,21 +2,23 @@
+  * codearts-bridge script(1) PTY 宿主（T2-02）。
+  *
+  * 职责：CodeartsTransport 的第一个真实传输——经 util-linux script(1) 为目标
+  * TUI 提供真实 PTY（无 tmux 环境的零依赖宿主；tmux 宿主见 T2-03）。
+  * 契约唯一真相源为 types.ts；本文件实现其全部六方法，并对齐 T2-01
+  * FakeTransport 的可观测语义（T3-03 监督状态机以此为可迁移基准）。
+  *
+  * 主控裁定对照（2026-10-31，逐条落实）：
+  * - R-p1 两段式注入：inject = write(text) → 可注入时钟等待 120ms →
+  *   write("\r") 单独提交（v0.2.6 教训：文本+回车同块会被粘贴识别吞掉）。
+- *   文本含 \r/\n 显式抛 INJECT_TEXT_MULTILINE（与两段式契约冲突，禁静默截断）。
++ *   文本允许多行（修复环裁定② 2026-10-31：整块写入 = TUI 粘贴语义；原
++ *   INJECT_TEXT_MULTILINE 拒绝分支已删——多行契约是目标协议正文，拒绝即
++ *   PTY 形态下任何目标的首个契约都无法送达，真机 T4-02 实证）。
+  * - R-p2 日志信号源：observe 额外 tail `<kernelDataDir>/log/kernel-*.log`
+  *   增量（kernelDataDir 经 ObserveOptions 传参，缺省 ~/.codeartsdoer/cli-data，
+  *   不扩展 BridgeConfig——与 R-h3/R-h5 同风格）；`service=` 行转为 output
+  *   信号补充。日志源不可用（目录/文件缺失、读取错误）**一律不报错、不影响
+  *   PTY 通道**，来源可用性在 snapshot.meta.log 如实标注（本裁定显式豁免
+  *   "禁静默兜底"全局约束于日志源；PTY 侧错误仍显式抛出）。
+  * - R-p3 abort 对齐（T9 基准）：observe 尊重 opts.signal——挂起等待中 abort
+  *   迭代立即正常落定、残存信号不交付当前消费者但保留给下一次 observe
+  *   （与 FakeTransport 同态）、不 flush、不抛错。
+  * - R-p4 进程终止（真实两级机理，探针+family 测试实证；评审 I1 更正）：
+@@ -36,28 +38,47 @@
+  * - 修复环裁定①（2026-10-31 修复轮）：PTY 宿主改经官方 wrapper
+  *   `<installDir>/codearts` 启动（原 `<installDir>/bin/codearts` bin 直启）。
+  *   依据：真机冒烟实证 bin 直启裸传父环境（无 SCENARIO/KERNEL_DATA_DIR 等内核
+  *   env）→ TUI 停在交互式授权门（"Waiting for authorization..."）；官方
+  *   wrapper 设置全量内核 env，是单一环境真相源（与 TUI 桌面快捷方式语义一致）。
+  *   wrapper 缺失 → WRAPPER_MISSING（remediation=检查 installers 完整性/重装），
+  *   禁静默回退 bin 直启。structured 通道维持 bin 直启（无头 run 子命令 +
+  *   AK/SK 前置，无 TUI 授权门，见 structured.ts 同名注释）。
+  * - R-p6 UTF-8：PTY 流按 chunk 到达，stdout/stderr 各持独立 StringDecoder，
+  *   多字节序列跨 chunk 完整还原（两流独立解码器，交错不破坏字节边界）。
++ * - 修复环第 1 轮（2026-10-31 真机 T4-02 验收裁定，逐条落实）：
++ *   ④ alive() 是**布尔查询**——未知 / kind 不符 / 已终态 / 已消亡 ref 一律返回
++ *   false（不抛错）。依据：守护重启后进程内存 sessions 表为空，磁盘目标的
++ *   session ref 必然未知，reconcile（state.ts）凭 alive=false 走重建路径；若
++ *   抛 SESSION_UNKNOWN 则 reconcile 上抛 → 守护崩溃循环（演练 B 实证：存在
++ *   活跃目标时守护被杀 = 永久下线）。仅"无法判定"的基础设施错误才抛（本宿主
++ *   为纯内存判定，无此路径）。
++ *   ③ start(ref) 对已存在但已亡的同名会话：**销毁旧会话残留（组杀清理）并
++ *   新建活会话**（同名重建，与 tmux 宿主对账语义同构）；对未知但形态合法的
++ *   ref（跨守护重启对账）同样采纳重建。回传前自检 child 存活——不满足则
++ *   显式抛 PTY_START_FAILED（契约：start 回传的 ref 必须满足 alive(ref)=true，
++ *   禁回传死 ref 制造重启风暴，演练 A 实证）。非法 ref（kind 不符/空 id）
++ *   仍显式 SESSION_UNKNOWN。
++ *   ② inject 多行合法——目标契约天然多行（协议正文），整块一次性写入全部
++ *   文本（TUI 粘贴语义；开启括号粘贴的 TUI 将整块视作字面文本），随后独立
++ *   "\r" 提交（R-p1 两段式时序保留）。**回退开关登记（裁定②原文）**：若真机
++ *   复验发现目标 TUI 无括号粘贴、多行块被逐行提前提交（契约截断），回退方案
++ *   为注入前将 \n 替换为空格的单行扁平化（在此处加开关常量并同步 pty-tmux）。
++ *   先实测再定——截至本轮真机复验未观察到截断，维持整块语义。
+  *
+  * 语义裁决（显式报错，禁静默兜底；与 FakeTransport 对齐项注明）：
+- * - 未知 ref：全部方法抛 SESSION_UNKNOWN（与 Fake 同）；
++ * - 未知 ref：inject/observe/stop/snapshot 抛 SESSION_UNKNOWN（与 Fake 同）；
++ *   alive 返回 false、start 采纳重建（修复环④③裁定，见上）；
+  * - 对非存活会话 inject：抛 SESSION_NOT_ALIVE（与 Fake 同）；等待 120ms 提交
+  *   窗口期间会话死亡：同样显式抛出，不向死进程写字节；
+  * - 同一 ref 并发第二个 observe：抛 OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
+- * - start 带 ref 复用：存活会话幂等返回同 ref；已结束会话抛 SESSION_NOT_ALIVE
+- *   （真实 PTY 不可复活，禁静默重建）；
++ * - start 带 ref 复用：存活会话幂等返回同 ref；已亡/未知 → 同名重建（③）；
+  * - 进程自然退出：observe 产出一次性 done 信号（接口未携带退出码，text 省略）
+  *   后迭代正常结束；stop() 终止则不产 done、观察直接终止（与 Fake 同态）；
+  * - snapshot.raw = PTY 输出缓冲（全部 chunk 解码按序累积，模拟终端缓冲区，
+  *   与是否被 observe 消费无关）；日志源信号不进 raw（raw 仅 PTY 输出）。
+  *   meta.log = { available, file, serviceLines }：available = 观察进行中且正在
+  *   tail 某 kernel-*.log；file = 当前 tail 的文件名（basename）；serviceLines =
+  *   日志源产出的信号累计数（跨观察累计，留痕不丢）。
+  * - R-tm5 共享提取（T2-03 起）：日志 tailer/shQuote/lookPath/时钟类型已提取至
+  *   shared.ts（唯一真相源），本文件 import 复用并 re-export shQuote/PtyClock
+  *   保持既有导入面不变；行为与测试零改动。观察循环骨架（本文件与 pty-tmux
+@@ -268,83 +289,117 @@ export function createScriptTransport(
+     }
+     return s;
+   }
+ 
+   function assertInjectable(s: PtySession, ref: SessionRef): void {
+     if (s.closed || !s.child.alive()) {
+       throw new BridgeError(
+         "SESSION_NOT_ALIVE",
+         `会话已结束，拒绝操作：id=${ref.id}`,
+         {
+-          remediation: "script 宿主会话不可复活；请新建会话（start 不带 ref）。",
++          remediation: "以 transport.start(cfg, ref) 同名重建（修复环裁定③），或不带 ref 新建会话。",
+         },
+       );
+     }
+   }
+ 
++  /**
++   * 修复环裁定③：spawn 新会话体（同名重建共用）。wrapper 检查 → spawn →
++   * 接线 onData → 回传前自检存活（child 即刻死亡 = wrapper 启动即崩，显式
++   * PTY_START_FAILED，绝不回传死 ref）。失败路径不登记会话表。
++   */
++  function spawnSession(cfg: BridgeConfig, id: string, prev: PtySession | undefined): PtySession {
++    // 修复环裁定①（2026-10-31）：PTY 宿主一律经官方 wrapper <installDir>/codearts
++    // 启动（见 start 处原注释）；wrapper 缺失显式报错，禁静默回退 bin 直启。
++    const wrapper = path.join(cfg.installDir, "codearts");
++    if (!existsSync(wrapper)) {
++      throw new BridgeError("WRAPPER_MISSING", `官方启动 wrapper 缺失：${wrapper}`, {
++        remediation:
++          "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
++      });
++    }
++    const cmd = shQuote(wrapper);
++    // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
++    const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
++    const created: SessionRef = { kind, id };
++    const s: PtySession = {
++      ref: created,
++      child,
++      raw: "",
++      queue: [],
++      waiters: [],
++      observer: null,
++      closed: false,
++      exitHandled: false,
++      // 日志账目对象继承（I1 原地变更语义，与 tmux 同名重建同口径）
++      log: prev?.log ?? { available: false, file: null, serviceLines: 0 },
++    };
++    // onData 单播：start 时接线一次，输出持续入 raw + 队列（与是否观察无关）
++    child.onData((chunk) => {
++      s.raw += chunk;
++      s.queue.push({ t: "output", at: Date.now(), text: chunk });
++      wakeAll(s);
++    });
++    // ③ 自检：回传的 ref 必须满足 alive(ref)=true（spawn 后即刻死亡 = 启动
++    // 即崩，显式报错；禁回传死 ref 制造 restart→tick-failed 重启风暴）
++    if (!child.alive()) {
++      throw new BridgeError("PTY_START_FAILED", `会话进程启动即死，重建失败：id=${id}`, {
++        remediation: "检查官方 wrapper 与目标 TUI 可执行性（journal 可能有启动错误输出）。",
++      });
++    }
++    return s;
++  }
++
+   const transport: CodeartsTransport = {
+     kind,
+ 
+     async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
+       if (ref !== undefined) {
+-        const s = requireSession(ref);
+-        assertInjectable(s, ref);
+-        return { ...s.ref }; // 复用语义：存活会话幂等返回（真实 PTY 无恢复概念）
+-      }
+-      const id = `script-${++idNext}`;
+-      const created: SessionRef = { kind, id };
+-      // 修复环裁定①（2026-10-31）：PTY 宿主一律经官方 wrapper <installDir>/codearts
+-      // 启动——wrapper 设置全量内核 env（SCENARIO/KERNEL_DATA_DIR/OPENCODE_* 等，
+-      // 单一环境真相源，与 TUI 桌面快捷方式语义一致）；bin 直启裸传父环境会使
+-      // TUI 停在交互式授权门（真机冒烟实证）。wrapper 缺失显式报错，禁静默回退
+-      // bin 直启（回退即掩盖部署缺陷，与全局"禁静默兜底"约束同源）。
+-      const wrapper = path.join(cfg.installDir, "codearts");
+-      if (!existsSync(wrapper)) {
+-        throw new BridgeError("WRAPPER_MISSING", `官方启动 wrapper 缺失：${wrapper}`, {
+-          remediation:
+-            "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
+-        });
++        if (ref.kind !== kind || ref.id === "") {
++          throw new BridgeError("SESSION_UNKNOWN", `非法会话引用：kind=${ref.kind} id=${ref.id}`, {
++            remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
++          });
++        }
++        const prev = sessions.get(ref.id);
++        if (prev !== undefined && !prev.closed && prev.child.alive()) {
++          return { ...prev.ref }; // 存活会话幂等返回（真实 PTY 复用无恢复概念）
++        }
++        // 修复环裁定③：已亡（存在但死）或未知（跨守护重启对账）ref = 同名重建。
++        // 旧会话残留销毁：置 closed（旧观察循环见 closed 即按 stop 语义终止，
++        // I1 同款）→ 残余进程组杀（R-p4 两级终止）→ 唤醒释放等待者；新会话体
++        // 以全新 raw/队列起步（旧输出不属新生命期，与 tmux 同名重建同口径）。
++        if (prev !== undefined) {
++          prev.closed = true;
++          if (prev.child.alive()) prev.child.kill();
++          wakeAll(prev);
++        }
++        const s = spawnSession(cfg, ref.id, prev); // 失败抛错：不登记、不改旧账
++        sessions.set(ref.id, s);
++        return { ...s.ref };
+       }
+-      const cmd = shQuote(wrapper);
+-      // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
+-      const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
+-      const s: PtySession = {
+-        ref: created,
+-        child,
+-        raw: "",
+-        queue: [],
+-        waiters: [],
+-        observer: null,
+-        closed: false,
+-        exitHandled: false,
+-        log: { available: false, file: null, serviceLines: 0 },
+-      };
+-      // onData 单播：start 时接线一次，输出持续入 raw + 队列（与是否观察无关）
+-      child.onData((chunk) => {
+-        s.raw += chunk;
+-        s.queue.push({ t: "output", at: Date.now(), text: chunk });
+-        wakeAll(s);
+-      });
++      // 新会话：跳过已被外部采纳重建占用的 id（防碰撞覆写）
++      let id: string;
++      do {
++        id = `script-${++idNext}`;
++      } while (sessions.has(id));
++      const s = spawnSession(cfg, id, undefined);
+       sessions.set(id, s);
+-      return { ...created };
++      return { ...s.ref };
+     },
+ 
+     async inject(ref: SessionRef, text: string): Promise<void> {
+       const s = requireSession(ref);
+       assertInjectable(s, ref);
+-      if (text.includes("\r") || text.includes("\n")) {
+-        throw new BridgeError(
+-          "INJECT_TEXT_MULTILINE",
+-          `注入文本含换行符（长度=${text.length}），与两段式提交契约冲突`,
+-          { remediation: "单行文本注入；多行内容分行多次 inject，每段单独提交。" },
+-        );
+-      }
++      // 修复环裁定②：多行文本合法（目标契约天然多行）——整块一次性写入全部
++      // 文本（TUI 粘贴语义），随后独立 "\r" 提交（R-p1 两段式时序保留）。
++      // 回退开关登记：若真机复验发现目标 TUI 逐行提前提交（契约截断），在
++      // 此处加 \n→空格 扁平化开关（并同步 pty-tmux），见文件头修复环②条目。
+       s.child.write(text);
+       await clock(INJECT_COMMIT_DELAY_MS); // R-p1：两段式提交窗口
+       assertInjectable(s, ref); // 窗口期死亡：显式报错，不向死进程写 "\r"
+       s.child.write("\r");
+     },
+ 
+     observe(ref: SessionRef, observeOpts?: ObserveOptions): AsyncIterable<Signal> {
+       const s = requireSession(ref);
+       if (s.observer !== null) {
+         throw new BridgeError("OBSERVER_ACTIVE", `会话已有活跃观察者（单观察者模型）：id=${ref.id}`, {
+@@ -411,21 +466,25 @@ export function createScriptTransport(
+           terminated = true;
+           release();
+           wakeAll(s);
+           return inner.throw(e);
+         },
+       };
+       return { [Symbol.asyncIterator]: () => iterator };
+     },
+ 
+     async alive(ref: SessionRef): Promise<boolean> {
+-      const s = requireSession(ref);
++      // 修复环裁定④：alive 是布尔查询——未知 / kind 不符 / 已终态 / 已消亡
++      // ref 一律 false（不抛错）。守护重启后 reconcile 必经未知 ref 路径，
++      // false 使其走重建而非崩溃（见文件头修复环④条目）。
++      const s = ref.kind === kind ? sessions.get(ref.id) : undefined;
++      if (s === undefined) return false;
+       return !s.closed && s.child.alive();
+     },
+ 
+     async stop(ref: SessionRef): Promise<void> {
+       const s = requireSession(ref);
+       if (!s.closed) {
+         s.closed = true;
+         if (s.child.alive()) s.child.kill(); // R-p4：组杀 + SIGHUP 级联两级终止（机理见文件头 R-p4）
+       }
+       wakeAll(s);
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+index 70f71c8352..f20c5d375e 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+@@ -17,26 +17,32 @@
+  * - 修复环裁定①（2026-10-31 修复轮）：PTY 宿主改经官方 wrapper
+  *   `<installDir>/codearts` 启动（原 `<installDir>/bin/codearts` bin 直启）。
+  *   依据：真机冒烟实证 bin 直启裸传父环境（无 SCENARIO/KERNEL_DATA_DIR 等内核
+  *   env）→ TUI 停在交互式授权门；官方 wrapper 设置全量内核 env，是单一环境
+  *   真相源。wrapper 缺失 → WRAPPER_MISSING（仅在需 new-session 时检查；存活
+  *   会话重连不消费 wrapper），禁静默回退 bin 直启。structured 维持 bin 直启
+  *   （无头 run 子命令 + AK/SK 前置，见 structured.ts 同名注释）。
+  * - R-tm3 inject 两段式：`send-keys -t <target> <text>` 与
+  *   `send-keys -t <target> Enter` 为两次独立调用且保序；文本段加 `-l`
+  *   （字面文本——否则 "C-c"/"F1" 等会被 tmux 解释为键名，Enter 段刻意不加
+- *   -l 以发送键）；多行文本显式拒绝（与 T2-02 同码 INJECT_TEXT_MULTILINE）。
++ *   -l 以发送键）；多行文本合法（修复环裁定② 2026-10-31：契约天然多行，
++ *   -l 字面整块发送 + Enter 提交，原 INJECT_TEXT_MULTILINE 拒绝分支已删；
++ *   回退开关登记：若真机复验发现 TUI 逐行提前提交致契约截断，回退为注入前
++ *   \n→空格 单行扁平化，与 pty-script 同步登记）。
+  *   不设 120ms 时延窗口：send-keys 为 tmux 服务器侧原子操作，两次独立调用
+  *   的次序由服务器保证（v0.2.6 教训针对的是单块写入被粘贴识别吞回车）。
+  * - R-tm4 stop/alive/snapshot：stop=`kill-session -t <target>`（不存在→幂等，
+  *   复查 has-session 证实后标记 closed，非字符串匹配 stderr）；alive=
+  *   `has-session` 退出码；snapshot=`capture-pane -p -t <target>`（含 meta）。
++ *   alive 为**布尔查询**（修复环裁定④ 2026-10-31）：未知/kind 不符 ref 一律
++ *   false（不抛错）——守护重启后 reconcile 必经未知 ref 路径，false 使其走
++ *   tmux 既有同名重建对账语义而非崩溃（与 pty-script 修复环④同源）。
+  * - R-tm5 共享提取：日志 tailer/lookPath/shQuote/时钟类型提取至 shared.ts
+  *   （pty-script.ts 同步改为 import，行为与测试零改动）；观察循环骨架因两宿主
+  *   探测/生产机制差异不做提取，最小重复并标注来源。
+  * - R-tm6 语义对齐：abort=立即放弃（T9 基准，残存信号保留给下一次 observe、
+  *   不 flush、不抛错）；observe 尊重 opts.signal；stop 后 observe 终止（不产
+  *   done）；日志信号源与 T2-02 同语义（shared.armLogTailer，meta 如实标注）。
+  *
+  * 设计裁决（实现者决策，供评审）：
+  * - 签名：`createTmuxTransport(exec, opts)`——plan 卡写 `(cfg, exec)`，但
+  *   types.ts（T2-01 唯一真相源）以 start(cfg) 逐次交付配置；为避免 installDir
+@@ -393,27 +399,24 @@ export function createTmuxTransport(
+       } else if (!sessions.has(target)) {
+         // 采纳既有会话（跨守护重启重连）：本实例此前未见，从零建账
+         sessions.set(target, freshSession(target));
+       }
+       return { kind, id: target };
+     },
+ 
+     async inject(ref: SessionRef, text: string): Promise<void> {
+       const s = requireSession(ref);
+       await assertAlive(s, ref);
+-      if (text.includes("\r") || text.includes("\n")) {
+-        throw new BridgeError(
+-          "INJECT_TEXT_MULTILINE",
+-          `注入文本含换行符（长度=${text.length}），与两段式提交契约冲突`,
+-          { remediation: "单行文本注入；多行内容分行多次 inject，每段单独提交。" },
+-        );
+-      }
++      // 修复环裁定②：多行文本合法（目标契约天然多行）——-l 字面整块发送
++      // （换行符随字面文本进入 pane），Enter 段独立提交（两段式保序不变）。
++      // 回退开关登记：TUI 逐行提前提交致契约截断时回退 \n→空格 扁平化
++      // （与 pty-script 同步，见该文件修复环②条目）。
+       // R-tm3：两段独立调用且保序；文本段 -l 字面发送，Enter 段发键（见文件头）
+       const r1 = await exec.run(["send-keys", "-l", "-t", s.target, text]);
+       await ensureSent(r1, s, ref);
+       const r2 = await exec.run(["send-keys", "-t", s.target, "Enter"]);
+       await ensureSent(r2, s, ref);
+     },
+ 
+     observe(ref: SessionRef, observeOpts?: ObserveOptions): AsyncIterable<Signal> {
+       const s = requireSession(ref);
+       if (s.observer !== null) {
+@@ -488,21 +491,23 @@ export function createTmuxTransport(
+           terminated = true;
+           release();
+           wakeAll(s);
+           return inner.throw(e);
+         },
+       };
+       return { [Symbol.asyncIterator]: () => iterator };
+     },
+ 
+     async alive(ref: SessionRef): Promise<boolean> {
+-      const s = requireSession(ref);
++      // 修复环裁定④：布尔查询——未知 / kind 不符 ref → false（不抛错）。
++      if (ref.kind !== kind || !sessions.has(ref.id)) return false;
++      const s = sessions.get(ref.id) as TmuxSession;
+       if (s.closed) return false;
+       return hasSessionName(s.target); // R-tm4：alive = has-session 退出码
+     },
+ 
+     async stop(ref: SessionRef): Promise<void> {
+       const s = requireSession(ref);
+       if (s.closed) return; // 幂等：不再 kill-session
+       const r = await exec.run(["kill-session", "-t", s.target]); // R-tm4
+       if (r.exitCode !== 0 && (await hasSessionName(s.target))) {
+         // 会话仍在而 kill-session 失败：宿主故障，显式抛出（不存在 → 幂等达成）
+diff --git a/plugins/codearts-bridge/src/core/transport/structured.ts b/plugins/codearts-bridge/src/core/transport/structured.ts
+index fe2ac34481..fa39bde99a 100644
+--- a/plugins/codearts-bridge/src/core/transport/structured.ts
++++ b/plugins/codearts-bridge/src/core/transport/structured.ts
+@@ -54,21 +54,23 @@
+  *   全事件驱动，行回调/退出回调直接驱动，无需注入 clock）。
+  * - 语义映射：inject = 发起新回合（text 即本轮 prompt；接口注"注入一段文本
+  *  （如续跑指令）"的 structured 对应物）；prompt 允许多行/任意字符（argv 元素
+  *   直传，无 PTY 两段式提交问题，故无 INJECT_TEXT_MULTILINE 检查）；空串 prompt
+  *   显式拒绝（INJECT_TEXT_EMPTY——空回合必为调用方缺陷）。
+  * - alive() 语义：!closed（会话可接受新回合即"存活"）。回合进程存活与否属回合
+  *   状态，由 snapshot.meta.activeRound / lastExit 如实标注——回合失败（exit≠0）
+  *   产 error 信号但**不**宣告会话死亡（监督层可续接新回合重试，T3 依赖此语义；
+  *   与 PTY 宿主"进程死=会话死"的固有差异源于回合=进程模型）。
+  * - stop 为会话终态（closed）：终止活跃回合进程组、观察终止（不产 done）、
+- *   后续 inject/start(ref) 显式 SESSION_NOT_ALIVE（与 PTY 宿主终态语义一致）。
++ *   后续 inject 显式 SESSION_NOT_ALIVE；start(ref) 对终态会话 = 重建活会话
++ *   （修复环裁定③ 2026-10-31：codeartsSessionId 保留、回合账清零、滞留信号
++ *   清空——死 ref 重启风暴治理，与 PTY 双宿主同源裁定）。
+  * - stdout/stderr 合并为同一行流（按到达序）；每流独立 StringDecoder（多字节
+  *   跨 chunk 完整还原）；进程退出时冲刷残段（stdout 先于 stderr）——最后一行
+  *   无换行符的事件不丢失。
+  * - start(cfg) 不 spawn 任何进程（回合进程仅由 inject 发起）：start 只做 AK/SK
+  *   前置检查与会话登记；ref.id = `structured-<n>`（本实例内唯一不透明标识）。
+  *
+  * 语义裁决（显式报错，禁静默兜底；与 Fake/script 对齐项注明）：
+  * - 未知 ref（未注册/kind 不符）：SESSION_UNKNOWN（与 Fake 同）；
+  * - 活跃回合中 inject：ROUND_ACTIVE（并发=1，R-s4）；空 prompt：INJECT_TEXT_EMPTY；
+  * - 同一 ref 并发第二个 observe：OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
+@@ -384,23 +386,30 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+           "AKSK_MISSING",
+           `structured 传输要求 AK/SK 凭据（F2 实测：无头 run 命令强制 CODEARTS_CLI_AK/SK）：akskFile=${cfg.akskFile}`,
+           {
+             remediation: `在 https://codearts.huaweicloud.com/portal/settings/cli-auth 获取 CLI 凭据，写入 ${cfg.akskFile}（两行：AK=… / SK=…，权限 0600）后重试；如需免凭据交互请显式配置 pty 传输，本传输不静默切换。`,
+           },
+         );
+       }
+       if (ref !== undefined) {
+         const s = requireSession(ref);
+         if (s.closed) {
+-          throw new BridgeError("SESSION_NOT_ALIVE", `会话已停止，不可复用：id=${ref.id}`, {
+-            remediation: "structured 会话 stop 后为终态；请新建会话（start 不带 ref）。",
+-          });
++          // 修复环裁定③（2026-10-31）：已亡（stop 终态）同名会话 = 重建活会话，
++          // 不再永久拒绝（runner.restartLocked / 对账路径传死 ref 必须得到活会话，
++          // 否则 5s 周期 restart→tick-failed 风暴，真机演练 A 实证）。重建语义：
++          // 终态复位 + 回合账清零（活跃回合进程已由 stop 组杀，无残留可清理）+
++          // 终态期滞留信号清空（不属新生命期，与 tmux 同名重建同口径）；
++          // codeartsSessionId 保留——`--session` 续接是 structured 固有的断点
++          // 续跑通道，重建不抹除对话连续性；raw/roundSeq/lastExit 账目留痕不丢。
++          s.closed = false;
++          s.round = null;
++          s.queue.length = 0;
+         }
+         s.cfg = cfg; // 刷新绑定配置与凭据（下一回合装配用最新值）
+         s.aksk = aksk;
+         return { ...s.ref };
+       }
+       const id = `structured-${++idNext}`;
+       const created: SessionRef = { kind, id };
+       sessions.set(id, {
+         ref: created,
+         cfg,
+@@ -533,21 +542,26 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+           wakeAll(s);
+           return inner.throw(e);
+         },
+       };
+       return { [Symbol.asyncIterator]: () => iterator };
+     },
+ 
+     async alive(ref: SessionRef): Promise<boolean> {
+       // structured 语义：会话可接受新回合即"存活"（回合进程存活状态见
+       // snapshot.meta.activeRound/lastExit；回合失败不宣告会话死亡）。
+-      return !requireSession(ref).closed;
++      // 修复环裁定④（2026-10-31）：alive 是布尔查询——未知 / kind 不符 ref
++      // 一律 false（不抛错），守护重启对账凭 false 走重建路径（与 PTY 双宿主
++      // 同源裁定；本宿主跨守护 ref 采纳经 start(ref) 重建）。
++      const s = ref.kind === kind ? sessions.get(ref.id) : undefined;
++      if (s === undefined) return false;
++      return !s.closed;
+     },
+ 
+     async stop(ref: SessionRef): Promise<void> {
+       const s = requireSession(ref);
+       if (s.closed) return; // 幂等
+       s.closed = true;
+       // R-s4：直接杀进程+进程组（detached+负 PID；ESRCH=已达成，见生产实现注）
+       if (s.round !== null && !s.round.exitSeen && s.round.child.alive()) {
+         s.round.child.kill();
+       }
+diff --git a/plugins/codearts-bridge/src/core/transport/types.ts b/plugins/codearts-bridge/src/core/transport/types.ts
+index 9ef843a14f..a80ff1e0aa 100644
+--- a/plugins/codearts-bridge/src/core/transport/types.ts
++++ b/plugins/codearts-bridge/src/core/transport/types.ts
+@@ -42,34 +42,48 @@ export interface ObserveOptions {
+ }
+ 
+ /** 目标会话传输接口（最小完整，六方法）。 */
+ export interface CodeartsTransport {
+   /** 本传输的种类（构造即定；SessionRef.kind 与之一致）。 */
+   readonly kind: TransportKind;
+ 
+   /**
+    * 启动（或复用）一个目标会话。ref 缺省创建新会话；传入 start 返回过的 ref
+    * 表示复用/恢复该会话（语义由实现定义并注明）。
++   *
++   * 修复环裁定③（2026-10-31）：对已存在但已亡的同名会话（以及跨守护重启后
++   * 未知但形态合法的 ref），实现**必须销毁旧会话残留并新建活会话**（重建语义），
++   * 回传的 ref 必须满足 alive(ref)=true（回传前自检；自检不过显式报错，禁回传
++   * 死 ref）。依据：监督层进程死重建与对账路径都会把持久化的旧 ref 传回 start，
++   * 拒绝复活即制造 restart→tick-failed 重启风暴（真机 T4-02 演练 A 实证）。
+    */
+   start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef>;
+ 
+   /** 向会话注入一段文本（如续跑指令）。 */
+   inject(ref: SessionRef, text: string): Promise<void>;
+ 
+   /**
+    * 观察会话事件流。opts.signal abort → 迭代正常结束（不抛错，R-tr2）。
+    * abort 语义（本文件为唯一真相源）：**立即放弃**——残存未消费信号丢弃、
+    * 不 flush；真实传输（T2-02~04）须对齐该状态机行为（T3-03 经 FakeTransport
+    * 验证的行为以此为基准）。
+    * 并发观察策略由实现定义（FakeTransport 为单观察者，重复 observe 显式报错）。
+    */
+   observe(ref: SessionRef, opts?: ObserveOptions): AsyncIterable<Signal>;
+ 
+-  /** 会话是否存活。 */
++  /**
++   * 会话是否存活。
++   *
++   * 修复环裁定④（2026-10-31）：alive 是**布尔查询**——未知 / 已终态 / 已消亡
++   * ref 一律返回 false（不抛错）；只有"无法判定"的基础设施错误（如 exec 通道
++   * 崩溃）才抛。依据：守护重启后 reconcile 必经未知 ref（内存会话表为空），
++   * 抛错即 reconcile 上抛 → 守护崩溃循环 = 存在活跃目标时守护被杀永久下线
++   * （真机 T4-02 演练 B 实证）。
++   */
+   alive(ref: SessionRef): Promise<boolean>;
+ 
+   /** 停止会话；对已停止会话幂等。 */
+   stop(ref: SessionRef): Promise<void>;
+ 
+   /** 会话当前状态快照（raw 语义由实现定义并注明）。 */
+   snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }>;
+ }
+diff --git a/plugins/codearts-bridge/src/daemon-goals.ts b/plugins/codearts-bridge/src/daemon-goals.ts
+index d12d132841..0ee9115249 100644
+--- a/plugins/codearts-bridge/src/daemon-goals.ts
++++ b/plugins/codearts-bridge/src/daemon-goals.ts
+@@ -120,22 +120,26 @@ export function defaultTickLoop(intervalMs: number): TickLoop {
+ 
+ /** GoalHost 依赖注入（传输/时钟/循环/验收执行器）。 */
+ export interface GoalHostDeps {
+   cfg: BridgeConfig;
+   /** 目标会话传输（生产由守护装配层选型注入；测试注入 FakeTransport）。 */
+   transport: CodeartsTransport;
+   /** 时钟（与 runner 同源；R-rn1 纯 tick + M72 对账同源）。 */
+   clock: { now(): number };
+   /** sweep 循环宿主。 */
+   loop: TickLoop;
+-  /** 独立验收执行器（透传 RunnerDeps.verifyRun；目标声明 verify 时必配）。 */
+-  verifyRun?(cmd: string[]): Promise<{ ok: boolean; out: string }>;
++  /**
++   * 独立验收执行器（透传 RunnerDeps.verifyRun；目标声明 verify 时必配）。
++   * cwd 语义（修复环裁定① 2026-10-31）：cwd 缺省 = 目标 workdir（GoalHost 逐
++   * 目标绑定后传给执行器）；目标无 workdir → undefined（执行器自选落点）。
++   */
++  verifyRun?(cmd: string[], cwd?: string): Promise<{ ok: boolean; out: string }>;
+ }
+ 
+ /** POST /goals 请求体（任务书 API 契约 + autoNudge 逐目标覆盖）。 */
+ export interface GoalCreateInput {
+   objective: string;
+   verify: string[];
+   workdir?: string;
+   maxRounds?: number;
+   autoNudge?: boolean;
+ }
+@@ -428,31 +432,35 @@ export class GoalHost {
+     const page = matched.slice(0, lim);
+     const nextCursor = page.length > 0 ? (page[page.length - 1] as { seq: number }).seq : cur;
+     return { goalId, events: page.map((p) => p.event), nextCursor };
+   }
+ 
+   /* ───── 内部：roster / sweep / 解析 ───── */
+ 
+   /** 以（落盘）状态构造 runner 并入册（R-dg1）。 */
+   private rosterGoal(g: GoalState): RosterEntry {
+     const sink = makeAuditSink(this.stateDir, g.goalId);
++    // 修复环裁定①（2026-10-31）：cwd 缺省目标 workdir——宿主在此逐目标绑定
++    // （RunnerDeps.verifyRun 签名保持 (cmd)，workdir 属目标状态、runner 不感知）。
++    const verifyRun =
++      this.deps.verifyRun === undefined ? undefined : (cmd: string[]) => this.deps.verifyRun!(cmd, g.workdir);
+     const deps: RunnerDeps = {
+       clock: this.deps.clock,
+       transport: this.deps.transport,
+       audit: (e: object) => sink.push(e),
+       log: (e: object) => {
+         // 决策日志（非审计流）：stderr 结构化可见（守护暂无文件日志器，与既有
+         // server 启动摘要同通道）
+         console.error(`[codearts-bridge] ${JSON.stringify(e)}`);
+       },
+       thresholds: this.deps.cfg.thresholds,
+-      verifyRun: this.deps.verifyRun,
++      verifyRun,
+       cfg: this.deps.cfg,
+       autoNudge: g.autoNudge ?? this.deps.cfg.autoNudge, // R-dg5-① 生效值解析
+     };
+     const runner = new GoalRunner(g, deps);
+     const entry: RosterEntry = { runner, sink, lastSaved: JSON.stringify(g) };
+     this.roster.set(g.goalId, entry);
+     return entry;
+   }
+ 
+   /**
+diff --git a/plugins/codearts-bridge/test/daemon-goals.test.ts b/plugins/codearts-bridge/test/daemon-goals.test.ts
+index 17644300c8..d58e5be761 100644
+--- a/plugins/codearts-bridge/test/daemon-goals.test.ts
++++ b/plugins/codearts-bridge/test/daemon-goals.test.ts
+@@ -98,40 +98,46 @@ interface Harness {
+   token: string;
+   loop: ManualLoop;
+   advance(ms: number): void;
+   now(): number;
+ }
+ 
+ /**
+  * 组装并启动一套守护台架（goals 宿主接线 FakeTransport + 假时钟 + 手动循环）。
+  * opts.autoNudge 注入 cfg.autoNudge（缺省走 loadConfig 默认 true）。
+  */
+-async function makeHarness(opts?: { autoNudge?: boolean }): Promise<Harness> {
++async function makeHarness(
++  opts?: {
++    autoNudge?: boolean;
++    /** 修复环①：verifyRun 记录器注入（缺省恒通过）。 */
++    verifyRun?: (cmd: string[], cwd?: string) => Promise<{ ok: boolean; out: string }>;
++  },
++): Promise<Harness> {
+   const name = `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+   const cfg = loadConfig(
+     {
+       stateDir: path.join(TEST_ROOT, name),
+       daemonUrl: "http://127.0.0.1:0",
+       ...(opts?.autoNudge !== undefined ? { autoNudge: opts.autoNudge } : {}),
+     },
+     {},
+   );
+   const transport = new FakeTransport();
+   let t = 1_000_000;
+   const clock = { now: () => t };
+   const loop = makeManualLoop();
+   const host = new GoalHost({
+     cfg,
+     transport,
+     clock,
+     loop: loop.loop,
+-    verifyRun: async () => ({ ok: true, out: "OK" }),
++    verifyRun: opts?.verifyRun ?? (async () => ({ ok: true, out: "OK" })),
+   });
+   const daemon = createDaemon(cfg, undefined, host);
+   openDaemons.push(daemon);
+   const { port } = await daemon.start();
+   return {
+     cfg,
+     transport,
+     host,
+     daemon,
+     port,
+@@ -704,10 +710,71 @@ describe("响应形态卫生", () => {
+     expect(await res.json()).toEqual([]);
+   });
+ 
+   it("GET /health 免鉴权且含 actives 字段（无目标=0）", async () => {
+     const h = await makeHarness();
+     const body = (await fetch(`http://127.0.0.1:${h.port}/health`).then((r) => r.json())) as Record<string, unknown>;
+     expect(body["ok"]).toBe(true);
+     expect(body["actives"]).toBe(0);
+   });
+ });
++
++/* ───── 修复环第 1 轮（真机 T4-02 缺陷①：verifyRun 生产装配接线） ───── */
++
++describe("修复环① verifyRun 装配接线", () => {
++  it("带 verify 目标 done 后执行验收：cmd 逐字透传、cwd=goal.workdir；通过 → complete 落盘", async () => {
++    const calls: Array<{ cmd: string[]; cwd?: string }> = [];
++    const h = await makeHarness({
++      verifyRun: async (cmd, cwd) => {
++        calls.push({ cmd, cwd });
++        return { ok: true, out: "OK" };
++      },
++    });
++    const workdir = path.join(TEST_ROOT, "verify-wd");
++    await mkdir(workdir, { recursive: true });
++    const created = (await call(h.port, "POST", "/goals", h.token, {
++      objective: "制造验收物",
++      verify: ["echo hi", "ls -la"],
++      workdir,
++    })).body as { goalId: string };
++    await h.loop.sweepOnce(); // 引导：建会话 + 契约注入
++    const st0 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
++    if (st0.session === undefined) throw new Error("引导后 session 应在场");
++    h.advance(4_000); // 越过回显守卫窗
++    h.transport.emit(st0.session, "output", "完成 [GOAL-DONE]");
++    await h.loop.sweepOnce(); // done 核验 → verifyRun 逐条执行 → 双过
++    const st1 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
++    expect(st1.phase).toBe("complete");
++    expect(calls.map((c) => c.cmd)).toEqual([["echo", "hi"], ["ls", "-la"]]);
++    expect(calls.every((c) => c.cwd === workdir)).toBe(true); // cwd 缺省目标 workdir（裁定①）
++    await new Promise((r) => setTimeout(r, 30)); // 审计队列为异步追加（sweep 成功路径最终一致），让渡落盘
++    const audit = await readFile(path.join(h.cfg.stateDir, "audit", `${created.goalId}.jsonl`), "utf8");
++    expect(audit).toContain("goal.verify");
++    expect(audit).toContain("goal.complete");
++  });
++
++  it("验收未过 → 注入失败原因继续驱动（verifyRun 失败透传，不 complete）", async () => {
++    let n = 0;
++    const h = await makeHarness({
++      verifyRun: async () => {
++        n += 1;
++        return { ok: false, out: "断言失败" };
++      },
++    });
++    const created = (await call(h.port, "POST", "/goals", h.token, {
++      objective: "必然失败",
++      verify: ["false"],
++    })).body as { goalId: string };
++    await h.loop.sweepOnce();
++    const st0 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
++    if (st0.session === undefined) throw new Error("引导后 session 应在场");
++    h.advance(4_000);
++    h.transport.emit(st0.session, "output", "完成 [GOAL-DONE]");
++    await h.loop.sweepOnce();
++    const st1 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
++    expect(st1.phase).toBe("active"); // 验收未过：继续驱动
++    expect(n).toBe(1);
++    expect(h.transport.injections.length).toBe(2); // 契约 + 验收失败重注
++    expect(h.transport.injections[1]!.text).toContain("验收未通过");
++    expect(h.transport.injections[1]!.text).toContain("断言失败");
++  });
++});
+diff --git a/plugins/codearts-bridge/test/run-tool.test.ts b/plugins/codearts-bridge/test/run-tool.test.ts
+index 25a450fa2b..7ab993b571 100644
+--- a/plugins/codearts-bridge/test/run-tool.test.ts
++++ b/plugins/codearts-bridge/test/run-tool.test.ts
+@@ -661,36 +661,48 @@ describe("codearts_run 工具接线（server 层）", () => {
+       { prompt: "hi" },
+       { sessionID: "s", messageID: "m", id: "t", signal: external.signal } satisfies FakeToolCtx,
+     );
+     await injectedRef(tr);
+     external.abort();
+     const result = await runPromise;
+     const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+     expect(payload.status).toBe("cancelled");
+   });
+ 
+-  it("错误路径（R-t1）：续接未知会话 → SESSION_UNKNOWN 结构化 error content", async () => {
++  it("错误路径（R-t1）：续接非法会话引用（kind 不符）→ SESSION_UNKNOWN 结构化 error content；同 kind 未知 ref 按修复环③裁定采纳重建（不报错）", async () => {
+     root = mkdtempSync(path.join(TMP_ROOT, "exec-err-"));
+     const spy = makeBuildTransportSpy();
++    const tr = spy.transport as FakeTransport;
+     const added = await setupTools({
+       configOverrides: { stateDir: path.join(root, "state"), installDir: path.join(root, "installers"), transport: "pty", ptyHost: "script" },
+       buildTransport: spy.build,
+       clock: new FakeClock(),
+     });
+     const run = added.find((t) => t.name === "run")!;
+     const result = await run.execute(
+-      { prompt: "hi", session: { kind: "pty", id: "ghost" } },
++      { prompt: "hi", session: { kind: "structured", id: "ghost" } },
+       { sessionID: "s", messageID: "m", id: "t" } satisfies FakeToolCtx,
+     );
+     const payload = JSON.parse(result.content[0]!.text) as { error?: { code?: string } };
+     expect(payload.error?.code).toBe("SESSION_UNKNOWN");
+     expect(result.content[1]!.text).toContain("SESSION_UNKNOWN");
++    // 修复环③（2026-10-31）：同 kind 的未知 ref = 跨守护对账采纳语义——start
++    // 采纳重建并正常驱动（不再 SESSION_UNKNOWN；错误映射由 kind 不符路径承载）
++    const runPromise = run.execute(
++      { prompt: "hi", session: { kind: "pty", id: "adopted-1" } },
++      { sessionID: "s", messageID: "m", id: "t" } satisfies FakeToolCtx,
++    );
++    const adopted = await injectedRef(tr);
++    expect(adopted.id).toBe("adopted-1");
++    tr.emit(adopted, "done");
++    await runPromise;
++    expect(tr.injections.some((i) => i.ref.id === "adopted-1")).toBe(true);
+   });
+ 
+   it("输入校验（R-t1）：空 prompt / timeoutMs=0 → TOOL_INPUT_INVALID error content", async () => {
+     root = mkdtempSync(path.join(TMP_ROOT, "exec-invalid-"));
+     const added = await setupTools({
+       configOverrides: { stateDir: path.join(root, "state"), installDir: path.join(root, "installers") },
+       buildTransport: makeBuildTransportSpy().build,
+       clock: new FakeClock(),
+     });
+     const run = added.find((t) => t.name === "run")!;
+diff --git a/plugins/codearts-bridge/test/runner.test.ts b/plugins/codearts-bridge/test/runner.test.ts
+index 1a75bd8785..de4191ee4b 100644
+--- a/plugins/codearts-bridge/test/runner.test.ts
++++ b/plugins/codearts-bridge/test/runner.test.ts
+@@ -5,36 +5,40 @@
+  * 裁定依据（progress.md Task 16 派发记录）：
+  * - R-rn1 纯 tick：一切时间推进由假时钟 + tick() 驱动，runner 内无定时器；
+  * - R-rn2 并发串行化："pause 后并发 tick 不产生注入"有专测钉死；
+  * - R-rn3 策略默认：停滞 60s / 重试无上限（首立即 60s 封顶 ≥10 告警）/
+  *   strikes≥3 告警不终止 / done+verify 双过 / verify fail 注入继续；
+  * - R-rn4 增量口径：文本变化指纹 + 信号批次密度双口径（重绘欺骗与转轮
+  *   高频两类 v0.2.6 教训各有用例）；
+  * - R-rn5 classifyModelError/normalizeReceived 移植（含 `\\b`→`\b` 适配）。
+  */
+ import { describe, expect, it } from "bun:test";
++import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
++import * as path from "node:path";
+ import type { BridgeConfig } from "../src/core/config";
++import { loadConfig } from "../src/core/config";
+ import {
+   CONTINUE_PROMPT,
+   buildContract,
+   buildResumeContract,
+ } from "../src/core/goal/protocol";
+ import {
+   GoalRunner,
+   classifyModelError,
+   normalizeReceived,
+   type GoalState,
+   type RunnerDeps,
+ } from "../src/core/goal/runner";
+ import { BridgeError } from "../src/core/errors";
+ import { FakeTransport } from "../src/core/transport/fake";
+-import type { SessionRef } from "../src/core/transport/types";
++import { createScriptTransport, type PtyChild } from "../src/core/transport/pty-script";
++import type { CodeartsTransport, SessionRef } from "../src/core/transport/types";
+ 
+ /* ───── 测试台架：假时钟 + FakeTransport + 审计/log 收集 ───── */
+ 
+ interface AuditEvent {
+   type: string;
+   [k: string]: unknown;
+ }
+ 
+ interface Harness {
+   transport: FakeTransport;
+@@ -649,10 +653,170 @@ describe("quiesce 同块连推多信号（T3-05 集成发现回归）", () => {
+     const ref = r.state().session!;
+     h.advance(4000);
+     for (let i = 1; i <= 5; i++) {
+       h.transport.emit(ref, "output", `chunk-${i} 文本${i}`);
+     }
+     h.transport.emit(ref, "output", "done [GOAL-DONE]");
+     await r.tick();
+     expect(r.state().phase).toBe("complete"); // done 未迟到（6 信号全消费）
+   });
+ });
++
++/* ───── 修复环第 1 轮（真机 T4-02 五缺陷：③⑤②） ───── */
++
++// script 传输台架（真实 createScriptTransport + 受控 fake child）：重建语义在
++// 真实传输层验证（FakeTransport 的复活语义天然满足裁定，测不出风暴回归）。
++// wrapper fixture 落插件 test/.tmp/（用后即删由 rm -rf .tmp 纪律覆盖）。
++
++const T4_TMP = path.join(import.meta.dir, ".tmp", "runner-t4");
++const T4_INSTALL = path.join(T4_TMP, "install");
++mkdirSync(T4_INSTALL, { recursive: true });
++writeFileSync(path.join(T4_INSTALL, "codearts"), "#!/bin/sh\nexit 0\n", "utf8");
++chmodSync(path.join(T4_INSTALL, "codearts"), 0o755);
++const SCRIPT_CFG: BridgeConfig = loadConfig(
++  { stateDir: "/nonexistent/runner-t4", installDir: T4_INSTALL },
++  {},
++);
++
++interface T4Child extends PtyChild {
++  writes: string[];
++  isAlive: boolean;
++  die(): void;
++}
++
++function makeT4Child(pid: number): T4Child {
++  let cb: ((chunk: string) => void) | null = null;
++  const c: T4Child = {
++    pid,
++    writes: [],
++    isAlive: true,
++    onData(fn) {
++      cb = fn;
++    },
++    write(d) {
++      c.writes.push(d);
++    },
++    kill() {
++      c.isAlive = false;
++    },
++    alive() {
++      return c.isAlive;
++    },
++    die() {
++      c.isAlive = false;
++    },
++  };
++  return c;
++}
++
++interface ScriptHarness {
++  transport: CodeartsTransport;
++  audits: AuditEvent[];
++  deps: RunnerDeps;
++  state: GoalState;
++  children: T4Child[];
++  advance(ms: number): void;
++}
++
++function makeScriptHarness(): ScriptHarness {
++  const children: T4Child[] = [];
++  const transport = createScriptTransport({
++    spawnPty(): PtyChild {
++      const c = makeT4Child(600000 + children.length);
++      children.push(c);
++      return c;
++    },
++  });
++  const audits: AuditEvent[] = [];
++  let t = 1_000_000;
++  const state: GoalState = {
++    goalId: "g-script",
++    objective: "实现登录页",
++    verify: [],
++    phase: "active",
++    rounds: 0,
++    steps: [],
++    strikes: 0,
++    injected: [],
++    lastProgressAt: t,
++  };
++  const deps: RunnerDeps = {
++    clock: { now: () => t },
++    transport,
++    audit: (e) => audits.push(e as AuditEvent),
++    log: () => undefined,
++    thresholds: { stallSeconds: 60, retryCapSeconds: 60, strikes: 3, echoGuardMs: 3000 },
++    cfg: SCRIPT_CFG,
++  };
++  return {
++    transport,
++    audits,
++    deps,
++    state,
++    children,
++    advance: (ms: number) => {
++      t += ms;
++    },
++  };
++}
++
++/** 注入可拒绝的传输替身（② 状态失真回归用）：failNext 置位后下一次 inject 显式抛错。 */
++class RejectingInjectTransport extends FakeTransport {
++  failNext = false;
++  override async inject(ref: SessionRef, text: string): Promise<void> {
++    if (this.failNext) {
++      this.failNext = false;
++      throw new BridgeError("INJECT_REJECTED", "模拟传输拒绝注入（真机 INJECT_TEXT 场景同型）");
++    }
++    return super.inject(ref, text);
++  }
++}
++
++describe("修复环第 1 轮（真机 T4-02 五缺陷）", () => {
++  it("③ 一次 restart 后不再连续 restart（时钟推进两 tick 断言）：死会话 → 重建活会话 + 契约重发", async () => {
++    const h = makeScriptHarness();
++    const r = new GoalRunner(h.state, h.deps);
++    await r.tick(); // 引导：child0 + 契约注入
++    expect(h.children.length).toBe(1);
++    h.children[0]!.die(); // 进程死（模拟外部 kill -9）
++    h.advance(1_000);
++    await r.tick(); // restart：销毁残留 → 重建 child1 + 重发契约
++    expect(h.audits.filter((e) => e.type === "goal.restart").length).toBe(1);
++    expect(h.children.length).toBe(2);
++    expect(await h.transport.alive(r.state().session!)).toBe(true);
++    // 时钟推进两 tick：不再连续 restart（风暴期症状 = 每 tick 一次 restart/tick-failed）
++    h.advance(5_000);
++    await r.tick();
++    h.advance(5_000);
++    await r.tick();
++    expect(h.audits.filter((e) => e.type === "goal.restart").length).toBe(1);
++    expect(h.children.length).toBe(2); // 无新 spawn
++  });
++
++  it("⑤ 死会话 resume：先按重建路径复活会话 → 注入续跑契约 → phase=active（不再永久失败）", async () => {
++    const h = makeHarness();
++    const r = await boot(h);
++    const ref = r.state().session!;
++    r.pause();
++    await h.transport.stop(ref); // 暂停期间会话死亡
++    await r.resume();
++    expect(r.state().phase).toBe("active");
++    expect(await h.transport.alive(r.state().session!)).toBe(true);
++    expect(h.transport.injections.length).toBe(2); // 契约 + 重建后契约/续跑注入
++    expect(ofType(h, "goal.restart").length).toBe(1); // 死会话走重建路径（审计可溯）
++  });
++
++  it("② 注入被传输拒绝 → 状态零失真：injected 指纹回滚、rounds 不变、无 goal.inject 审计", async () => {
++    const h = makeHarness();
++    const rt = new RejectingInjectTransport();
++    h.deps.transport = rt;
++    h.transport = rt;
++    const r = await boot(h); // bootstrap 注入成功
++    expect(rt.injections.length).toBe(1);
++    rt.failNext = true;
++    h.advance(61_000);
++    await expect(r.tick()).rejects.toBeInstanceOf(BridgeError); // nudge 注入被拒 → 显式上抛
++    expect(r.state().rounds).toBe(1); // 回滚：rounds 不变（真机缺陷②"注入被拒仍 rounds+1"回归断言）
++    expect(rt.injections.length).toBe(1); // 无注入留痕
++    expect(h.audits.filter((e) => e.type === "goal.inject").length).toBe(1); // 仅 bootstrap 一条
++  });
++});
+diff --git a/plugins/codearts-bridge/test/service.test.ts b/plugins/codearts-bridge/test/service.test.ts
+index 264ab10619..018bedd92c 100644
+--- a/plugins/codearts-bridge/test/service.test.ts
++++ b/plugins/codearts-bridge/test/service.test.ts
+@@ -32,20 +32,21 @@ import {
+ import type { Exec } from "../src/core/install";
+ import {
+   daemonCommand,
+   main,
+   serviceInstallCommand,
+   serviceStatusCommand,
+   serviceUninstallCommand,
+   watchdogProbeCommand,
+ } from "../src/cli";
+ import type { FetchLike, ServiceDeps } from "../src/cli";
++import type { RunClock } from "../src/core/run";
+ 
+ const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
+ const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "service-test");
+ 
+ beforeEach(async () => {
+   await rm(TEST_ROOT, { recursive: true, force: true });
+   await mkdir(TEST_ROOT, { recursive: true });
+ });
+ 
+ afterAll(async () => {
+@@ -659,10 +660,126 @@ describe("daemonCommand 生产 GoalHost 装配（登记项①：/goals 不再 50
+     20000,
+   );
+ });
+ 
+ describe("CLI 分派（service 命令组）", () => {
+   it("main([\"service\"]) 无子命令 → rc 2 未知用法；既有未知命令行为不变", async () => {
+     expect(await main(["service"])).toBe(2);
+     expect(await main(["frobnicate"])).toBe(2);
+   });
+ });
++
++/* ───── 修复环第 1 轮（真机 T4-02 缺陷①：daemonCommand 生产 verifyRun 接线） ───── */
++
++describe("daemonCommand 生产 verifyRun 装配（①）", () => {
++  it("daemonCommand 装配的 GoalHost 携带 verifyRun：带 verify 目标创建成功（修复前 GOAL_VERIFY_RUN_MISSING）且 done 后经 fake execVerify 验收 → complete（cmd/cwd 透传）", async () => {
++    const { FakeTransport } = await import("../src/core/transport/fake");
++    const port = await freeTcpPort();
++    const stateDir = path.join(TEST_ROOT, "daemon-verify");
++    const cfg = loadConfig({ stateDir, daemonUrl: `http://127.0.0.1:${port}` }, {});
++    const transport = new FakeTransport();
++    const verifyCalls: Array<{ cmd: string[]; cwd?: string }> = [];
++    let sweepFn: (() => Promise<void>) | undefined;
++    const loop = {
++      start(s: () => Promise<void>) {
++        sweepFn = s;
++      },
++      wake() {},
++      stop() {
++        sweepFn = undefined;
++      },
++    };
++    let t = 1_000_000;
++    // RunClock 注入（now + 可取消 delay；本用例假时钟无真延时需求，delay 仅需形态合法）
++    const clock: RunClock = {
++      now: () => t,
++      delay(ms: number) {
++        let handle: ReturnType<typeof setTimeout> | undefined;
++        const promise = new Promise<void>((resolve) => {
++          handle = setTimeout(resolve, ms);
++        });
++        return {
++          promise,
++          cancel: () => {
++            if (handle !== undefined) clearTimeout(handle);
++          },
++        };
++      },
++    };
++    const rcPromise = daemonCommand(
++      cfg,
++      { onReady: () => undefined },
++      {
++        buildTransport: () => transport,
++        loop,
++        clock,
++        execVerify: async (cmd, cwd) => {
++          verifyCalls.push({ cmd, cwd });
++          return { ok: true, out: "OK" };
++        },
++      },
++    );
++    try {
++      const tokenPath = path.join(stateDir, "daemon-token");
++      const deadline = Date.now() + 5000;
++      while (!(await fileExists(tokenPath))) {
++        if (Date.now() > deadline) throw new Error("daemonCommand 启动超时（token 未生成）");
++        await new Promise((r) => setTimeout(r, 25));
++      }
++      const token = (await readFile(tokenPath, "utf8")).trim();
++      const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
++      // 带 verify + workdir 的目标：生产装配路径（daemonCommand → GoalHost → runner deps）。
++      // 修复前：GoalHost 未接线 verifyRun → 此 POST 即 500 GOAL_VERIFY_RUN_MISSING（真机缺陷①）。
++      const workdir = path.join(TEST_ROOT, "verify-wd");
++      await mkdir(workdir, { recursive: true });
++      const post = await fetch(`http://127.0.0.1:${port}/goals`, {
++        method: "POST",
++        headers: auth,
++        body: JSON.stringify({ objective: "制造验收物", verify: ["echo hi"], workdir }),
++      });
++      expect(post.status).toBe(200);
++      const created = (await post.json()) as { goalId: string };
++      await sweepFn?.(); // 引导 tick：建会话 + 契约注入
++      const st0 = (await fetch(`http://127.0.0.1:${port}/goals/${created.goalId}`, { headers: auth }).then((r) =>
++        r.json(),
++      )) as { session?: { id: string }; phase: string };
++      if (st0.session === undefined) throw new Error("引导后 session 应在场");
++      t += 4_000; // 越过回显守卫
++      transport.emit({ kind: "pty", id: st0.session.id }, "output", "完成 [GOAL-DONE]");
++      await sweepFn?.(); // done 核验 → verifyRun（fake execVerify）→ complete
++      const st1 = (await fetch(`http://127.0.0.1:${port}/goals/${created.goalId}`, { headers: auth }).then((r) =>
++        r.json(),
++      )) as { phase: string };
++      expect(st1.phase).toBe("complete");
++      expect(verifyCalls).toEqual([{ cmd: ["echo", "hi"], cwd: workdir }]); // cmd/cwd 逐字透传（裁定①）
++    } finally {
++      // 收尾：SIGTERM → daemonCommand 优雅停止（其处理器已注册，默认终止被接管）
++      process.kill(process.pid, "SIGTERM");
++      const rc = await Promise.race([
++        rcPromise,
++        new Promise<number>((_, rej) => setTimeout(() => rej(new Error("daemonCommand 未在限期优雅停止")), 5000)),
++      ]);
++      expect(rc).toBe(0);
++    }
++  }, 20000);
++
++  it("execVerify 生产缺省实现（真执行冒烟）：echo 通过 / 非零退出显式 ok=false", async () => {
++    const { execVerify } = await import("../src/cli");
++    const ok = await execVerify(["/bin/echo", "verify-ok"], undefined);
++    expect(ok.ok).toBe(true);
++    expect(ok.out).toContain("verify-ok");
++    const fail = await execVerify(["/bin/false"], undefined);
++    expect(fail.ok).toBe(false);
++    const missing = await execVerify(["/nonexistent/codearts-bridge-no-such-cmd"], undefined);
++    expect(missing.ok).toBe(false); // spawn 失败 = 验收未过（显式失败，非静默）
++  });
++});
++
++/** 文件存在性探测（轮询启动就绪用）。 */
++async function fileExists(p: string): Promise<boolean> {
++  try {
++    await stat(p);
++    return true;
++  } catch {
++    return false;
++  }
++}
+diff --git a/plugins/codearts-bridge/test/state.test.ts b/plugins/codearts-bridge/test/state.test.ts
+index e760ca05c1..52acbcee23 100644
+--- a/plugins/codearts-bridge/test/state.test.ts
++++ b/plugins/codearts-bridge/test/state.test.ts
+@@ -339,20 +339,36 @@ describe("reconcile 对账恢复", () => {
+     const dir = freshDir("reconcile-dead-fresh");
+     const transport = new FakeTransport();
+     const ref = await transport.start(EMPTY_CFG);
+     await saveGoal(dir, makeState("g1", { session: ref }));
+     await transport.stop(ref);
+     const r = await reconcile(dir, { transport });
+     expect(r.resumed).toEqual(["g1"]);
+     expect(transport.injections[0]!.text).toBe(buildContract("目标 g1", []));
+   });
+ 
++  it("④③ 跨守护重启（未知 ref）→ alive 布尔契约判死 → 重建路径恢复（守护崩溃循环回归断言）", async () => {
++    // 场景复刻演练 B：守护被杀重启后内存会话表为空，磁盘目标的 session ref 必然
++    // 未知——修复前 alive() 抛 SESSION_UNKNOWN → reconcile 崩溃 → 守护永久下线。
++    const dir = freshDir("reconcile-cross-daemon");
++    const transport = new FakeTransport(); // 新进程：从未见过该 ref
++    await saveGoal(dir, makeState("g1", { session: { kind: "pty", id: "fake-77" }, steps: [1] }));
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual(["g1"]);
++    expect(r.blocked).toEqual([]);
++    expect(transport.injections.length).toBe(1);
++    expect(transport.injections[0]!.ref.id).toBe("fake-77"); // 复用旧 ref 重建（断点续跑契约）
++    expect(transport.injections[0]!.text).toBe(buildResumeContract({ objective: "目标 g1", doneSteps: [1] }));
++    const after = (await loadGoals(dir)).goals.find((g) => g.goalId === "g1")!;
++    expect(after.phase).toBe("active");
++  });
++
+   it("重建失败 → phase=blocked 落盘 + fatal 审计 + blocked 列表", async () => {
+     const dir = freshDir("reconcile-rebuild-fail");
+     const transport = new FailingStartTransport();
+     const ref: SessionRef = { kind: "pty", id: "dead-1" };
+     await saveGoal(dir, makeState("g1", { session: ref }));
+ 
+     const r = await reconcile(dir, { transport });
+     expect(r.resumed).toEqual([]);
+     expect(r.blocked).toEqual(["g1"]);
+     const after = (await loadGoals(dir)).goals.find((g) => g.goalId === "g1")!;
+diff --git a/plugins/codearts-bridge/test/transport-fake.test.ts b/plugins/codearts-bridge/test/transport-fake.test.ts
+index 2ec7801029..b321b81009 100644
+--- a/plugins/codearts-bridge/test/transport-fake.test.ts
++++ b/plugins/codearts-bridge/test/transport-fake.test.ts
+@@ -63,33 +63,36 @@ describe("FakeTransport.start / 会话生命周期", () => {
+     expect(await t.alive(b)).toBe(true);
+   });
+ 
+   it("start 构造参数可指定 kind=structured（R-tr1 TransportKind 两值）", async () => {
+     const t = new FakeTransport({ kind: "structured" });
+     const ref = await t.start(CFG);
+     expect(ref.kind).toBe("structured");
+     expect(t.kind).toBe("structured");
+   });
+ 
+-  it("start 带 ref：复用已知 session（返回同一 ref、复活 alive）；未知 ref 显式抛 SESSION_UNKNOWN", async () => {
++  it("start 带 ref：复用已知 session（返回同一 ref、复活 alive）；未知 ref → 采纳为新会话（③ 跨守护对账对齐）", async () => {
+     const t = new FakeTransport();
+     const ref = await t.start(CFG);
+     await t.stop(ref);
+     expect(await t.alive(ref)).toBe(false);
+ 
+     const again = await t.start(CFG, ref);
+     expect(again).toEqual(ref);
+     expect(await t.alive(ref)).toBe(true);
+ 
++    // ③：未知但形态合法的 ref = 跨守护重启对账语义（与真实传输对齐）：采纳为新会话
+     const ghost: SessionRef = { kind: "pty", id: "fake-999" };
+-    // async 方法（alive）的未知 ref 以 rejection 形态显式报错；observe 的同步抛见下方"未知 ref"用例
+-    await expect(t.alive(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++    const adopted = await t.start(CFG, ghost);
++    expect(adopted).toEqual(ghost);
++    expect(await t.alive(ghost)).toBe(true);
++    await expect(t.inject(ghost, "x")).resolves.toBeUndefined(); // 采纳后可注入
+   });
+ });
+ 
+ describe("FakeTransport.inject 注入留痕（R-tr3-②）", () => {
+   it("inject 按 {text, at} 记录调用顺序，at 随调用序递增", async () => {
+     const t = new FakeTransport();
+     const ref = await t.start(CFG);
+     await t.inject(ref, "第一步");
+     await t.inject(ref, "第二步");
+     await t.inject(ref, "第三步");
+@@ -107,27 +110,27 @@ describe("FakeTransport.inject 注入留痕（R-tr3-②）", () => {
+     await t.stop(ref);
+     try {
+       await t.inject(ref, "死了");
+       expect.unreachable();
+     } catch (e) {
+       expect((e as BridgeError).code).toBe("SESSION_NOT_ALIVE");
+     }
+     expect(t.injections.map((i) => i.text)).toEqual(["活着"]);
+   });
+ 
+-  it("inject/observe/stop/snapshot 对未知 ref 一律显式抛 SESSION_UNKNOWN", async () => {
++  it("inject/observe/stop/snapshot 对未知 ref 一律显式抛 SESSION_UNKNOWN；alive 除外（④ 布尔查询 → false）", async () => {
+     const t = new FakeTransport();
+     const ghost: SessionRef = { kind: "pty", id: "nope" };
+     await expect(t.inject(ghost, "x")).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
+     await expect(t.stop(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
+     await expect(t.snapshot(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
+-    await expect(t.alive(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++    await expect(t.alive(ghost)).resolves.toBe(false); // ④：布尔查询不抛错
+     expect(() => t.observe(ghost)).toThrow(BridgeError);
+   });
+ });
+ 
+ describe("FakeTransport.observe 脚本化产出（R-tr3-①⑤）", () => {
+   it("push 预置脚本：observe 按序产出全部信号（Signal 形态逐字段钉死）", async () => {
+     const t = new FakeTransport();
+     const ref = await t.start(CFG);
+     t.push(ref, { t: "output", at: 100, text: "alpha" });
+     t.push(ref, { t: "step", at: 101 });
+diff --git a/plugins/codearts-bridge/test/transport-script.test.ts b/plugins/codearts-bridge/test/transport-script.test.ts
+index c5eaffa1b8..82308b25e2 100644
+--- a/plugins/codearts-bridge/test/transport-script.test.ts
++++ b/plugins/codearts-bridge/test/transport-script.test.ts
+@@ -128,20 +128,39 @@ function recordingExec(child: PtyChild) {
+     calls,
+     exec: {
+       spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
+         calls.push({ args, env });
+         return child;
+       },
+     },
+   };
+ }
+ 
++/** 多子进程 exec 记录器：每次 spawnPty 产出新 fake child（修复环裁定③ 重建语义测试用）。 */
++function multiChildExec() {
++  const children: FakeChild[] = [];
++  const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
++  return {
++    children,
++    calls,
++    exec: {
++      spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
++        calls.push({ args, env });
++        const c = makeFakeChild();
++        c.pid = 500000 + children.length;
++        children.push(c);
++        return c;
++      },
++    },
++  };
++}
++
+ /** 真实 spawn：经 nodeScriptSpawnPty 以 script(1) 包装 bash fixture（离线本地）。 */
+ function realExec(scenario?: string): { exec: { spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild } } {
+   const cmd = `bash ${shQuote(FIXTURE)}${scenario ? ` --scenario ${scenario}` : ""}`;
+   return {
+     exec: {
+       spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
+         // 透传传输层构造的 script 参数形态，仅替换 -c 的命令为 fixture（R-p5 允许真实 spawn）
+         return nodeScriptSpawnPty(["script", "-qefc", cmd, "/dev/null"], env);
+       },
+     },
+@@ -279,57 +298,120 @@ describe("createScriptTransport.start / R-p5 argv 形态", () => {
+     const cfg2 = loadConfig(
+       { stateDir: "/nonexistent/s", installDir: spaced },
+       {},
+     );
+     const { calls, exec } = recordingExec(makeFakeChild());
+     const t = makeTransport(exec);
+     await t.start(cfg2);
+     expect(calls[0]!.args![2]).toBe(shQuote(path.join(spaced, "codearts")));
+   });
+ 
+-  it("start 复用：存活会话幂等返回同 ref；已死会话显式 SESSION_NOT_ALIVE；未知 ref 显式 SESSION_UNKNOWN", async () => {
+-    const child = makeFakeChild();
+-    const t = makeTransport(recordingExec(child).exec);
++  it("start 复用：存活会话幂等返回同 ref；已死会话 → 同名重建（③）；未知 ref → 跨守护采纳重建（③）；非法 ref 显式拒绝", async () => {
++    const h = multiChildExec();
++    const t = makeTransport(h.exec);
+     const ref = await t.start(CFG);
+     const again = await t.start(CFG, ref);
+     expect(again).toEqual(ref);
++    expect(h.children.length).toBe(1); // 存活幂等：不重复 spawn
++
++    h.children[0]!.die();
++    const rebuilt = await t.start(CFG, ref); // ③：已死同名会话 → 重建活会话
++    expect(rebuilt).toEqual(ref);
++    expect(await t.alive(rebuilt)).toBe(true);
++    expect(h.children.length).toBe(2);
++
++    const adopted = await t.start(CFG, { kind: "pty", id: "script-42" }); // ③：跨守护重启（未知 ref）→ 采纳重建
++    expect(adopted.id).toBe("script-42");
++    expect(await t.alive(adopted)).toBe(true);
+ 
+-    child.die();
+-    await expect(t.start(CFG, ref)).rejects.toMatchObject({ code: "SESSION_NOT_ALIVE" });
+-    await expect(t.alive({ kind: "pty", id: "script-999" })).rejects.toMatchObject({
++    // 非法 ref（kind 不符 / 空 id）：显式拒绝，零 spawn
++    const before = h.calls.length;
++    await expect(t.start(CFG, { kind: "structured", id: "script-1" })).rejects.toMatchObject({
+       code: "SESSION_UNKNOWN",
+     });
++    await expect(t.start(CFG, { kind: "pty", id: "" })).rejects.toMatchObject({
++      code: "SESSION_UNKNOWN",
++    });
++    expect(h.calls.length).toBe(before);
++  });
++});
++
++describe("修复环第 1 轮（真机 T4-02 缺陷③④）：死会话重建与 alive 布尔契约", () => {
++  it("③ 已死会话 start(ref) 重建细节：新 child 承载新生命期（raw/队列清空、pid 更新）；已死 child 无残余可补杀", async () => {
++    const h = multiChildExec();
++    const t = makeTransport(h.exec);
++    const ref = await t.start(CFG);
++    h.children[0]!.emit("旧生命期输出");
++    h.children[0]!.die(); // 外部杀进程（非 stop）：child 已死，无进程组残留
++    const ref2 = await t.start(CFG, ref);
++    expect(ref2).toEqual(ref);
++    expect(h.children[0]!.killCalls).toBe(0); // 已死进程不补杀（存活守卫：仅残余进程才组杀）
++    expect(h.children.length).toBe(2);
++    h.children[1]!.emit("fresh");
++    const snap = await t.snapshot(ref2);
++    expect(snap.raw).toBe("fresh"); // 旧输出不属新生命期（与 tmux 同名重建同口径）
++    expect(snap.meta.pid).toBe(h.children[1]!.pid);
++    expect(snap.meta.alive).toBe(true);
++  });
++
++  it("③ 重建回传前自检：spawn 后 child 即刻死亡 → PTY_START_FAILED 显式报错（不回传死 ref）", async () => {
++    const h = multiChildExec();
++    const t = makeTransport(h.exec);
++    const ref = await t.start(CFG);
++    // 替换 spawn 行为：下一 spawn 直接产出已死 child（模拟 wrapper 启动即崩）
++    h.exec.spawnPty = (args, env) => {
++      const c = makeFakeChild();
++      c.die();
++      return c;
++    };
++    h.children[0]!.die();
++    await expect(t.start(CFG, ref)).rejects.toMatchObject({ code: "PTY_START_FAILED" });
++  });
++
++  it("④ alive 是布尔查询：未知 ref → false（不抛错）；已 stop ref → false（不抛错）", async () => {
++    const t = makeTransport(multiChildExec().exec);
++    await expect(t.alive({ kind: "pty", id: "script-999" })).resolves.toBe(false); // 守护重启对账必经路径
++    await expect(t.alive({ kind: "structured", id: "script-1" })).resolves.toBe(false); // kind 不符亦 false
++    const ref = await t.start(CFG);
++    await t.stop(ref);
++    await expect(t.alive(ref)).resolves.toBe(false);
+   });
+ });
+ 
+ describe("R-p1 两段式注入", () => {
+   it("inject = write(text) → 可注入时钟等待 120ms → write(\"\\r\")，三次调用依序", async () => {
+     const child = makeFakeChild();
+     const { exec } = recordingExec(child);
+     const order: string[] = [];
+     const clock = async (ms: number): Promise<void> => {
+       order.push(`clock:${ms}`);
+     };
+     const t = makeTransport(exec, { clock });
+     const ref = await t.start(CFG);
+     await t.inject(ref, "继续");
+     expect(order).toEqual(["clock:120"]);
+     expect(child.writes).toEqual(["继续", "\r"]);
+   });
+ 
+-  it("inject 文本含 \\r 或 \\n → INJECT_TEXT_MULTILINE 显式报错且不写任何字节", async () => {
++  it("② 多行注入（修复环裁定② 2026-10-31）：多行文本合法——整块一次性写入（TUI 粘贴语义）→ 120ms → 独立 \\r 提交", async () => {
+     const child = makeFakeChild();
+-    const t = makeTransport(recordingExec(child).exec);
++    const { exec } = recordingExec(child);
++    const order: string[] = [];
++    const clock = async (ms: number): Promise<void> => {
++      order.push(`clock:${ms}`);
++    };
++    const t = makeTransport(exec, { clock });
+     const ref = await t.start(CFG);
+-    await expect(t.inject(ref, "a\rb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
+-    await expect(t.inject(ref, "a\nb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
+-    expect(child.writes).toEqual([]);
++    const text = "【/goal 契约】\n目标：实现登录页\n步骤协议：[GOAL-STEP n/N] …";
++    await t.inject(ref, text);
++    expect(child.writes).toEqual([text, "\r"]); // 整块写入 + 独立提交（两段式时序保留）
++    expect(order).toEqual(["clock:120"]);
+   });
+ 
+   it("inject 对未知 ref → SESSION_UNKNOWN；对已 stop 会话 → SESSION_NOT_ALIVE 且不写", async () => {
+     const child = makeFakeChild();
+     const t = makeTransport(recordingExec(child).exec);
+     await expect(t.inject({ kind: "pty", id: "nope" }, "x")).rejects.toMatchObject({
+       code: "SESSION_UNKNOWN",
+     });
+     const ref = await t.start(CFG);
+     await t.stop(ref);
+diff --git a/plugins/codearts-bridge/test/transport-structured.test.ts b/plugins/codearts-bridge/test/transport-structured.test.ts
+index b7bbec81ba..fb1da28ea9 100644
+--- a/plugins/codearts-bridge/test/transport-structured.test.ts
++++ b/plugins/codearts-bridge/test/transport-structured.test.ts
+@@ -528,42 +528,55 @@ describe("R-s4 并发与生命周期", () => {
+     const pending = it.next(); // 挂起等待
+     await t.stop(ref);
+     const r = await pending;
+     expect(r.done).toBe(true); // 不产 done 信号，直接终止（与 Fake/PTY 同态）
+     expect(fake.procs[0]!.killed).toBe(1);
+     expect(await t.alive(ref)).toBe(false);
+     await t.stop(ref); // 幂等
+     expect(fake.procs[0]!.killed).toBe(1);
+   });
+ 
+-  it("stop 后：inject → SESSION_NOT_ALIVE；start(ref) → SESSION_NOT_ALIVE（stop 为会话终态）", async () => {
++  it("stop 后：inject → SESSION_NOT_ALIVE（终态拒绝注入）；start(ref) → 重建活会话（③ 裁定：可再发起新回合）", async () => {
+     const ctx = makeCtx();
+     const fake = makeFakeExec();
+     const t = createStructuredTransport(fake.exec);
+     const ref = await t.start(ctx.cfg);
+     await t.inject(ref, "p");
+     fake.procs[0]!.exit(0, null);
+     await t.stop(ref);
+     await expectBridgeError(() => t.inject(ref, "q"), "SESSION_NOT_ALIVE");
+-    await expectBridgeError(() => t.start(ctx.cfg, ref), "SESSION_NOT_ALIVE");
++    const ref2 = await t.start(ctx.cfg, ref); // ③：重建（终态复位）
++    expect(ref2).toEqual(ref);
++    expect(await t.alive(ref2)).toBe(true);
++    await t.inject(ref2, "r"); // 重建后可发起新回合
++    expect(fake.calls.length).toBe(2);
++  });
++
++  it("④ alive 布尔查询：未知 ref / kind 不符 → false（不抛错）", async () => {
++    const ctx = makeCtx();
++    const t = createStructuredTransport(makeFakeExec().exec);
++    await t.start(ctx.cfg);
++    const ghost: SessionRef = { kind: "structured", id: "structured-999" };
++    const wrongKind: SessionRef = { kind: "pty", id: "structured-1" };
++    await expect(t.alive(ghost)).resolves.toBe(false);
++    await expect(t.alive(wrongKind)).resolves.toBe(false);
+   });
+ 
+-  it("未知 ref（未注册 / kind 不符）→ 各方法 SESSION_UNKNOWN", async () => {
++  it("未知 ref（未注册 / kind 不符）→ 各方法 SESSION_UNKNOWN；alive 除外（④ 布尔查询）", async () => {
+     const ctx = makeCtx();
+     const t = createStructuredTransport(makeFakeExec().exec);
+     await t.start(ctx.cfg);
+     const ghost: SessionRef = { kind: "structured", id: "structured-999" };
+     const wrongKind: SessionRef = { kind: "pty", id: "structured-1" };
+     await expectBridgeError(() => t.inject(ghost, "x"), "SESSION_UNKNOWN");
+     await expectBridgeError(() => t.inject(wrongKind, "x"), "SESSION_UNKNOWN");
+     expectSyncBridgeError(() => t.observe(ghost), "SESSION_UNKNOWN");
+-    await expectBridgeError(() => t.alive(ghost), "SESSION_UNKNOWN");
+     await expectBridgeError(() => t.stop(ghost), "SESSION_UNKNOWN");
+     await expectBridgeError(() => t.snapshot(ghost), "SESSION_UNKNOWN");
+   });
+ 
+   it("并发第二 observe → OBSERVER_ACTIVE（单观察者）；结束后可重新 observe", async () => {
+     const ctx = makeCtx();
+     const fake = makeFakeExec();
+     const t = createStructuredTransport(fake.exec);
+     const ref = await t.start(ctx.cfg);
+     await t.inject(ref, "p");
+diff --git a/plugins/codearts-bridge/test/transport-tmux.test.ts b/plugins/codearts-bridge/test/transport-tmux.test.ts
+index ade0a0f1f4..edc448f9c5 100644
+--- a/plugins/codearts-bridge/test/transport-tmux.test.ts
++++ b/plugins/codearts-bridge/test/transport-tmux.test.ts
+@@ -363,28 +363,31 @@ describe("R-tm3 两段式注入", () => {
+     fake.calls.length = 0;
+     await t.inject(ref, "继续");
+     // 保序断言：存活检查（has-session）→ 文本段（-l 字面）→ Enter 段（发键）
+     expect(fake.calls.map((c) => c.args)).toEqual([
+       ["has-session", "-t", ref.id],
+       ["send-keys", "-l", "-t", ref.id, "继续"],
+       ["send-keys", "-t", ref.id, "Enter"],
+     ]);
+   });
+ 
+-  it("多行文本 → INJECT_TEXT_MULTILINE（与 T2-02 同码）且不产生任何 send-keys", async () => {
++  it("② 多行文本合法（修复环裁定② 2026-10-31）：-l 字面整块发送 + Enter 提交（两段式保序）", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     fake.calls.length = 0;
+-    await expect(t.inject(ref, "a\rb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
+-    await expect(t.inject(ref, "a\nb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
+-    expect(fake.calls.filter((c) => c.args[0] === "send-keys")).toHaveLength(0);
++    await t.inject(ref, "a\nb");
++    expect(fake.calls.map((c) => c.args)).toEqual([
++      ["has-session", "-t", ref.id],
++      ["send-keys", "-l", "-t", ref.id, "a\nb"],
++      ["send-keys", "-t", ref.id, "Enter"],
++    ]);
+   });
+ 
+   it("未知 ref → SESSION_UNKNOWN；会话已亡 → SESSION_NOT_ALIVE 且不注入", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     await expect(t.inject({ kind: "pty", id: "codearts-nope" }, "x")).rejects.toMatchObject({
+       code: "SESSION_UNKNOWN",
+     });
+     const ref = await t.start(CFG);
+     fake.setExists(false);
+@@ -413,30 +416,29 @@ describe("R-tm4 stop / alive / snapshot", () => {
+   it("stop 对已消失会话幂等（kill-session 报不存在 → 不抛错、标记 closed）", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     fake.setExists(false); // 外部已消亡
+     fake.failNext("kill-session", "can't find session");
+     await expect(t.stop(ref)).resolves.toBeUndefined(); // R-tm4：不存在 → 幂等
+     expect(await t.alive(ref)).toBe(false);
+   });
+ 
+-  it("alive = has-session 退出码；未知 ref → SESSION_UNKNOWN", async () => {
++  it("alive = has-session 退出码；未知 ref → false（④ 布尔查询，不抛错）", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     expect(await t.alive(ref)).toBe(true);
+     fake.setExists(false);
+     expect(await t.alive(ref)).toBe(false);
+-    await expect(t.alive({ kind: "pty", id: "codearts-nope" })).rejects.toMatchObject({
+-      code: "SESSION_UNKNOWN",
+-    });
++    await expect(t.alive({ kind: "pty", id: "codearts-nope" })).resolves.toBe(false);
++    await expect(t.alive({ kind: "structured", id: ref.id })).resolves.toBe(false); // kind 不符亦 false
+   });
+ 
+   it("snapshot：raw = capture-pane -p 输出；meta 含 host=tmux/target/alive/log；会话亡 → raw 空 + alive:false", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     fake.setPane("line-1\nline-2\n");
+     const snap = await t.snapshot(ref);
+     expect(snap.raw).toBe("line-1\nline-2\n");
+     expect(snap.meta).toMatchObject({

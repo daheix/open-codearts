@@ -1,0 +1,5 @@
+=== 演练 B 18:23:29 ===
+{"goalId":"gmvw96ozf-b17cad98"}
+-- bootstrap 后磁盘目标（含 session ref）
+phase active session {'kind': 'pty', 'id': 'script-2'} rounds 1
+604039 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null

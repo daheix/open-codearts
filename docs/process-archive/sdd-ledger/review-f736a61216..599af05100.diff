@@ -1,0 +1,1537 @@
+# Review package: f736a61216..599af05100
+
+## Commits
+599af05100 codearts-bridge(T3-07): systemd 服务与 watchdog — 自愈单元/探活重启/幂等安装 — R-sv1~R-sv4 落地：service.ts 纯函数层（renderServiceUnit/renderWatchdogUnits 单元生成器：Restart=always+RestartSec=3、ExecStart 引号绝对路径、Environment 钉 CODEARTS_BRIDGE_STATE_DIR 单一路径真相、journal 三件套、WantedBy=default.target/timers.target；evaluateProbe 纯评估：宽限跳过计数原样/任意非 0 状态码=事件循环存活清零/无响应连续 ≥2→restart 清零重新累计，非法输入显式 WATCHDOG_INPUT_INVALID）；cli.ts 增 service install|status|uninstall+watchdog-probe 四命令——install 幂等（同内容不重写 mtime 不变，atomicWriteFile 0644）+daemon-reload/enable --now 经注入 Exec（watchdog.service 由 timer 激活不单独 enable）、uninstall 只删自家三单元（disable 失败=幂等卸载预期 stderr 留痕后继续，非静默）、status 汇总在场性+is-active JSON（未装 SERVICE_NOT_INSTALLED rc1）、watchdog-probe 流水线（is-active 预检清计数退出→daemon.pid mtime 宽限戳 120s（stateDir 启动戳方案，免 systemctl 时间戳时区歧义，pid 缺失=启动未完成按宽限跳过）→fetch /health 15s→evaluateProbe 裁决→计数文件 stateDir/watchdog-fails/restart 执行，失败分类 timeout/errno/non-json/ok-mismatch/http-N 入 stderr 由 SyslogIdentifier 落 journald；计数损坏 stderr 留痕按 0 起算对齐 daemon.pid 陈旧清除先例）；登记项①落地：daemonCommand 生产装配挂载 GoalHost（resolveProductionTransport 与 runOnce 逐行同构：readAksk→按需 tmux 探测→selectTransport→defaultBuildTransport，run.ts needsTmuxProbe 增 export 防第二套真相源，装配失败显式拒绝启动）——真机实证 POST /goals 形态可用；33 新测试（生成器内容断言/评估纯函数七分支/安装幂等 mtime 钉死/卸载不动他单元/status 两态/探针九场景含宽限·健康·首败·重启·体异常三分类·计数损坏/真进程 daemon 装配 GET /goals 200 回归钉死），全量 455 计数（454 pass+1 skip）/0 fail/typecheck 零错误；真机观察（任务书 Step5，安装保留）：systemctl --user active 绿→kill -9 自愈（Restart=always 3s 内换 PID 重绑 4577，陈旧 pidfile 自愈路径生产验证）→watchdog journal 宽限跳过→healthy 探测留痕→幂等复装 written=[] mtime 不变
+
+## Files changed
+ plugins/codearts-bridge/src/cli.ts           | 488 ++++++++++++++++++-
+ plugins/codearts-bridge/src/core/run.ts      |   8 +-
+ plugins/codearts-bridge/src/core/service.ts  | 223 +++++++++
+ plugins/codearts-bridge/test/service.test.ts | 668 +++++++++++++++++++++++++++
+ 4 files changed, 1367 insertions(+), 20 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/cli.ts b/plugins/codearts-bridge/src/cli.ts
+index f35582b781..612a945d79 100644
+--- a/plugins/codearts-bridge/src/cli.ts
++++ b/plugins/codearts-bridge/src/cli.ts
+@@ -1,43 +1,98 @@
+ /**
+- * codearts-bridge CLI（T1-01 最小骨架 + T3-01 daemon/status，R-d5）。
++ * codearts-bridge CLI（T1-01 最小骨架 + T3-01 daemon/status + T3-07 service/watchdog）。
+  *
+- * 命令分派：version/help（T1-01 原样保留）、daemon（前台守护）、status（健康探测）；
+- * goal/service/upgrade 等子命令由后续任务卡按 TDD 落地。
++ * 命令分派：version/help（T1-01 原样保留）、daemon（前台守护）、status（健康探测）、
++ * service install|status|uninstall（systemd user 单元安装管家）、watchdog-probe
++ * （systemd timer 每分钟调用的探活命令）。
+  * 约定：未知用法显式报错并以非零码退出（禁止静默兜底）。
+  *
+  * R-d5 落点（主控裁定 2026-10-31）：
+  * - daemon：前台启动守护进程（createDaemon + start），SIGINT/SIGTERM 优雅 stop
+  *   后以退出码 0 结束（stop 失败 → stderr 结构化信息 + 退出码 1，不静默）。
+  *   进程退出码由 main() 统一 process.exit，命令函数只返回码（可测试性：测试在
+  *   进程内直调命令函数，不触发 exit）。
+  * - status：fetch <daemonUrl>/health（GET，免鉴权——R-d3 探活零依赖），3s 超时；
+  *   成功 → stdout 打印健康 JSON、退出码 0；不可达/非 200/非本守护响应 → stderr
+  *   结构化摘要（error.code=DAEMON_UNAVAILABLE 等）+ 非零退出码。
+  *
+- * 可测试性设计：daemonCommand/statusCommand 接收显式 cfg（缺省 loadConfig() 生产
+- * 口径），返回退出码而非直接 process.exit；daemonCommand 另设 hooks.onReady
+- * （start 完成且信号处理器就位后回调）供测试确定性驱动 SIGINT，生产不传即无感。
++ * T3-07 落点（主控裁定 R-sv1~R-sv4，progress.md Task 20）：
++ * - daemon 生产装配（T3-05/T3-06 登记项①）：启动前按 R-cr1 同一套选择逻辑
++ *   （readAksk → 按需 tmux 探测 → selectTransport → defaultBuildTransport）构造
++ *   生产传输并挂载 GoalHost（defaultTickLoop(GOAL_SWEEP_INTERVAL_MS) sweep）——
++ *   守护的生产运行形态下 /goals* 不再 501。装配失败显式拒绝启动（状态层坏不带
++ *   病服务）；测试经 DaemonCommandDeps 注入 tmuxProbe/buildTransport。
++ * - service install（R-sv3）：renderServiceUnit/renderWatchdogUnits 纯函数渲染 →
++ *   幂等写入 ~/.config/systemd/user/ 三个单元（同内容不重写，mtime 不变）→
++ *   systemctl daemon-reload + enable --now（经注入 exec，测试绝不真装）。
++ * - service uninstall（R-sv3）：只删本插件三个单元（他单元不碰）；disable --now
++ *   失败（未启用/未加载）属幂等卸载预期路径，stderr 留痕后继续（非静默——失败
++ *   可见且文件删除照常完成），daemon-reload 收尾。
++ * - service status：单元在场性 + is-active 状态汇总（stdout JSON；未安装 →
++ *   SERVICE_NOT_INSTALLED 非零退出）。
++ * - watchdog-probe（R-sv1/R-sv4）：is-active 预检（非 active → 清计数退出，崩溃
++ *   自愈归 systemd Restart=always）→ daemon.pid mtime 宽限戳（120s 内不探测，
++ *   stateDir 启动戳方案——daemon 每次启动覆写 daemon.pid，mtime 即启动时刻，
++ *   免 systemctl 时间戳解析的时区歧义）→ fetch /health（15s 超时）→
++ *   evaluateProbe 纯函数裁决 → 计数文件/restart 执行。失败原因分类
++ *   （timeout/连接拒绝/non-json/ok-mismatch/http-5xx）入 stderr（journald 经
++ *   SyslogIdentifier=codearts-bridge-watchdog 落账，R-sv4）。
++ *   有应答即事件循环存活（任意状态码）→ 计数清零；体级异常只留痕不重启——
++ *   重启无法修复"端口被其他进程占用"类问题，留痕排障才是正解（dsh 原型口径）。
++ *
++ * 可测试性设计：全部命令函数接收显式 cfg 与注入 deps（exec/fetch/时钟/路径），
++ * 返回退出码而非直接 process.exit；daemonCommand 另设 hooks.onReady 供测试
++ * 确定性驱动 SIGINT，生产不传即无感。
+  */
++import { mkdir, readFile, unlink } from "node:fs/promises";
++import { homedir } from "node:os";
++import * as path from "node:path";
+ import type { BridgeConfig } from "./core/config";
+-import { PLUGIN_ID, PLUGIN_VERSION, loadConfig } from "./core/config";
+-import { createDaemon } from "./daemon";
++import { PLUGIN_ID, PLUGIN_VERSION, loadConfig, readAksk } from "./core/config";
++import { BridgeError } from "./core/errors";
++import { atomicWriteFile, errnoOf } from "./core/fsx";
++import { createNodeExec, statOrEnoent } from "./core/install";
++import type { Exec, ExecResult } from "./core/install";
++import {
++  SERVICE_UNIT_NAMES,
++  WATCHDOG_FAILS_FILE,
++  WATCHDOG_GRACE_SECONDS,
++  WATCHDOG_PROBE_TIMEOUT_MS,
++  evaluateProbe,
++  renderServiceUnit,
++  renderWatchdogUnits,
++} from "./core/service";
++import type { ServiceUnitInput } from "./core/service";
++import {
++  defaultBuildTransport,
++  defaultRunClock,
++  needsTmuxProbe,
++  probeTmuxAvailable,
++  selectTransport,
++} from "./core/run";
++import type { RunClock, TransportSelection } from "./core/run";
++import type { CodeartsTransport } from "./core/transport/types";
++import { GOAL_SWEEP_INTERVAL_MS, GoalHost, defaultTickLoop } from "./daemon-goals";
++import type { TickLoop } from "./daemon-goals";
++import { createDaemon, daemonPidPath } from "./daemon";
+ 
+ const USAGE = `用法: codearts-bridge <命令>
+ 
+ 命令:
+-  version   打印插件版本
+-  status    探测守护进程健康（GET <daemonUrl>/health，3s 超时；不可达→非零退出）
+-  daemon    前台启动守护进程（SIGINT/SIGTERM 优雅停止）
+-  help      打印本帮助
+-
+-说明: goal/service/upgrade 等子命令在后续任务卡交付。`;
++  version            打印插件版本
++  status             探测守护进程健康（GET <daemonUrl>/health，3s 超时；不可达→非零退出）
++  daemon             前台启动守护进程（SIGINT/SIGTERM 优雅停止；挂载目标域 GoalHost）
++  service install    安装 systemd user 单元（守护 + watchdog timer）并 enable --now
++  service status     查看单元在场性与运行状态（stdout JSON）
++  service uninstall  卸载单元（只删本插件单元，不动其他单元）
++  watchdog-probe     watchdog 探测（systemd timer 每分钟调用；连续 2 次无响应重启守护）
++  help               打印本帮助`;
+ 
+ /** status 命令的探活超时（R-d5 固定 3s；导出供测试引用同一真相）。 */
+ export const STATUS_TIMEOUT_MS = 3000;
+ 
+ /** stderr 结构化错误出口（CLI 侧统一形态，与 HTTP/工具层 error.code 词汇一致）。 */
+ function printCliError(code: string, message: string, remediation?: string): void {
+   console.error(
+     JSON.stringify({ error: { code, message, ...(remediation !== undefined ? { remediation } : {}) } }, null, 2),
+   );
+ }
+@@ -81,31 +136,77 @@ export async function statusCommand(cfg: BridgeConfig): Promise<number> {
+   }
+   console.log(JSON.stringify(record, null, 2));
+   return 0;
+ }
+ 
+ /** daemonCommand 测试钩子（生产不传；onReady 在 start 完成+信号处理器就位后触发）。 */
+ export interface DaemonCommandHooks {
+   onReady?: (port: number) => void;
+ }
+ 
++/** daemon 命令注入缝（T3-07 生产装配可替换项；测试注入确定性实现）。 */
++export interface DaemonCommandDeps {
++  /** tmux 可用性探测（缺省 probeTmuxAvailable；测试注入 false 免真实 spawn）。 */
++  tmuxProbe?: () => Promise<boolean>;
++  /** 传输工厂（缺省 defaultBuildTransport；测试注入 FakeTransport）。 */
++  buildTransport?: (sel: TransportSelection) => CodeartsTransport;
++  /** 时钟（缺省 defaultRunClock；GoalHost 与 runner 同源——M72 口径）。 */
++  clock?: RunClock;
++  /** sweep 循环宿主（缺省 defaultTickLoop(GOAL_SWEEP_INTERVAL_MS)）。 */
++  loop?: TickLoop;
++}
++
++/**
++ * 守护生产传输装配（R-cr1 同一套选择逻辑，登记项①）：
++ * readAksk → 按需 tmux 探测 → selectTransport → 传输工厂。
++ * 与 runOnce 逐行同构（凭据口径/tmux 探测条件一致），杜绝第二套选择真相源。
++ */
++async function resolveProductionTransport(
++  cfg: BridgeConfig,
++  deps: DaemonCommandDeps,
++): Promise<CodeartsTransport> {
++  const aksk = await readAksk(cfg.akskFile);
++  const hasAksk =
++    aksk !== undefined && aksk.AK !== undefined && aksk.AK !== "" && aksk.SK !== undefined && aksk.SK !== "";
++  let tmuxAvailable = false;
++  if (needsTmuxProbe(cfg.transport, cfg.ptyHost, hasAksk)) {
++    tmuxAvailable = await (deps.tmuxProbe ?? probeTmuxAvailable)();
++  }
++  const sel = selectTransport({ transport: cfg.transport, ptyHost: cfg.ptyHost, hasAksk, tmuxAvailable });
++  console.error(`[codearts-bridge] 目标域传输：${sel.mode}（${sel.reason}）`);
++  return (deps.buildTransport ?? defaultBuildTransport)(sel);
++}
++
+ /**
+- * daemon 命令（R-d5）：前台启动守护，SIGINT/SIGTERM 优雅停止。
+- * 返回退出码：正常停止 0；停止失败 1（stderr 已有结构化信息）。
++ * daemon 命令（R-d5 + T3-07 登记项①）：前台启动守护，SIGINT/SIGTERM 优雅停止。
++ * 生产装配挂载 GoalHost（/goals* 可用）；返回退出码：正常停止 0；停止失败 1。
+  *
+  * 信号处理器先于 start() 注册：若先启动/打印就绪行再注册，"打印→注册"的窗口期
+  * 内到达的信号按默认处置直接杀进程、优雅停止失效（实测竞态概率可观——管道写
+  * 同步返回后父进程可立即 kill，子进程可能尚未完成注册）；先注册后启动使任何
+  * 时刻的信号都进入优雅路径：start 期间到达 → start 完成后立即优雅停止。
+  */
+-export async function daemonCommand(cfg: BridgeConfig = loadConfig(), hooks: DaemonCommandHooks = {}): Promise<number> {
+-  const daemon = createDaemon(cfg);
++export async function daemonCommand(
++  cfg: BridgeConfig = loadConfig(),
++  hooks: DaemonCommandHooks = {},
++  deps: DaemonCommandDeps = {},
++): Promise<number> {
++  // 生产装配（登记项①）：传输选择失败（凭据文件损坏/tmux 探测异常）显式拒绝
++  // 启动——目标域不可用的守护不该装作健康（禁静默降级为 501 形态）。
++  const transport = await resolveProductionTransport(cfg, deps);
++  const goals = new GoalHost({
++    cfg,
++    transport,
++    clock: deps.clock ?? defaultRunClock,
++    loop: deps.loop ?? defaultTickLoop(GOAL_SWEEP_INTERVAL_MS),
++  });
++  const daemon = createDaemon(cfg, undefined, goals);
+   const signals = ["SIGINT", "SIGTERM"] as const;
+   let stopping = false; // 信号去重（SIGINT+SIGTERM 连发只停一次）
+   let resolveSignal: (sig: string) => void = () => undefined;
+   const signalReceived = new Promise<string>((resolve) => {
+     resolveSignal = resolve;
+   });
+   const removeSignalListeners = () => {
+     for (const sig of signals) process.removeListener(sig, onSignal);
+   };
+   const onSignal = (sig: string) => {
+@@ -133,37 +234,388 @@ export async function daemonCommand(cfg: BridgeConfig = loadConfig(), hooks: Dae
+     return 0;
+   } catch (e) {
+     printCliError(
+       "DAEMON_STOP_FAILED",
+       `守护停止失败：${e instanceof Error ? e.message : String(e)}`,
+     );
+     return 1;
+   }
+ }
+ 
++/* ───── service 命令组（T3-07，R-sv2/R-sv3） ───── */
++
++/**
++ * fetch 结构子集（与全局 fetch 兼容；测试 fake 按此实现）。
++ * 不用 `typeof fetch`：Bun 的全局 fetch 带 preconnect 附加属性，测试的纯函数
++ * fake 无法满足该形态（T3-06 DaemonFetcher 同款先例）。
++ */
++export type FetchLike = (url: URL | string, init?: RequestInit) => Promise<Response>;
++
++/** service 命令注入缝（exec/unitDir/fetch/时钟/路径锚点；测试全部注入，绝不真装）。 */
++export interface ServiceDeps {
++  /** systemctl 执行器（缺省 createNodeExec；测试注入 fake 记录调用）。 */
++  exec?: Exec;
++  /** systemd user 单元目录（缺省 ~/.config/systemd/user；测试注入临时目录）。 */
++  unitDir?: string;
++  /** watchdog 探测 fetch（缺省全局 fetch；测试注入 fake）。 */
++  fetchImpl?: FetchLike;
++  /** watchdog 时钟（缺省 Date.now；测试注入固定值）。 */
++  nowMs?: () => number;
++  /** bun 绝对路径（缺省 process.execPath；测试注入确定值）。 */
++  bunPath?: string;
++  /** cli.ts 绝对路径（缺省本文件；测试注入确定值）。 */
++  cliPath?: string;
++}
++
++/** 单元目录缺省值（R-sv3：~/.config/systemd/user）。 */
++function defaultUnitDir(): string {
++  return path.join(homedir(), ".config", "systemd", "user");
++}
++
++/** cli.ts 锚点缺省值：本文件与 cli.ts 同目录（src/cli.ts），部署形态自含。 */
++function defaultCliPath(): string {
++  return path.join(import.meta.dir, "cli.ts");
++}
++
++/** 组装单元渲染输入（install 与 status 共用；状态根经 Environment 钉入单元）。 */
++function unitInputOf(cfg: BridgeConfig, deps: ServiceDeps): ServiceUnitInput {
++  return {
++    bunPath: deps.bunPath ?? process.execPath,
++    cliPath: deps.cliPath ?? defaultCliPath(),
++    stateDir: cfg.stateDir,
++  };
++}
++
++/** 统一 service 命令错误出口：BridgeError 携码透传，其余归 SERVICE_EXEC_FAILED。 */
++function serviceError(e: unknown): number {
++  const be = e instanceof BridgeError ? e : undefined;
++  printCliError(
++    be?.code ?? "SERVICE_EXEC_FAILED",
++    `${e instanceof Error ? e.message : String(e)}`,
++    be?.remediation,
++  );
++  return 1;
++}
++
++/** 执行 systemctl --user <args>；非零退出码显式转 BridgeError（含 stderr 摘要）。 */
++async function runSystemctl(exec: Exec, args: string[]): Promise<ExecResult> {
++  const cmd = ["systemctl", "--user", ...args];
++  let result: ExecResult;
++  try {
++    result = await exec.run(cmd);
++  } catch (e) {
++    throw new BridgeError(
++      "SERVICE_EXEC_FAILED",
++      `systemctl 执行失败（非 systemd 环境?）：${cmd.join(" ")}：${e instanceof Error ? e.message : String(e)}`,
++      { cause: e },
++    );
++  }
++  if (result.code !== 0) {
++    const stderr = result.stderr.trim();
++    throw new BridgeError(
++      "SERVICE_EXEC_FAILED",
++      `systemctl 退出码 ${result.code}：${cmd.join(" ")}${stderr.length > 0 ? `：${stderr}` : ""}`,
++    );
++  }
++  return result;
++}
++
++/**
++ * service install（R-sv3）：渲染三个单元 → 幂等写入（同内容不重写，mtime 不变）
++ * → daemon-reload → enable --now（守护 + watchdog timer；watchdog.service 由
++ * timer 激活，不单独 enable）。输出 stdout JSON {installed, written, skipped}。
++ */
++export async function serviceInstallCommand(cfg: BridgeConfig = loadConfig(), deps: ServiceDeps = {}): Promise<number> {
++  const exec = deps.exec ?? createNodeExec();
++  const unitDir = deps.unitDir ?? defaultUnitDir();
++  try {
++    const input = unitInputOf(cfg, deps);
++    const watchdog = renderWatchdogUnits(input);
++    const units: Array<[string, string]> = [
++      [SERVICE_UNIT_NAMES.daemon, renderServiceUnit(input)],
++      [SERVICE_UNIT_NAMES.watchdogService, watchdog.service],
++      [SERVICE_UNIT_NAMES.watchdogTimer, watchdog.timer],
++    ];
++    await mkdir(unitDir, { recursive: true });
++    const written: string[] = [];
++    const skipped: string[] = [];
++    for (const [name, content] of units) {
++      const target = path.join(unitDir, name);
++      let existing: string | undefined;
++      try {
++        existing = await readFile(target, "utf8");
++      } catch (e) {
++        if (errnoOf(e) !== "ENOENT") throw e;
++      }
++      if (existing === content) {
++        skipped.push(name); // 幂等：同内容不重写（mtime 不变，R-sv3"重复执行同内容"）
++        continue;
++      }
++      await atomicWriteFile(target, content, 0o644); // 原子替换：目标要么旧要么新
++      written.push(name);
++    }
++    await runSystemctl(exec, ["daemon-reload"]);
++    await runSystemctl(exec, ["enable", "--now", SERVICE_UNIT_NAMES.daemon, SERVICE_UNIT_NAMES.watchdogTimer]);
++    console.log(JSON.stringify({ installed: unitDir, written, skipped }));
++    return 0;
++  } catch (e) {
++    return serviceError(e);
++  }
++}
++
++/**
++ * service uninstall（R-sv3）：只删本插件三个单元文件（他单元不碰）。
++ * 未安装（三单元全缺）→ 幂等 rc 0 且零 systemctl 调用；disable --now 失败
++ * （未启用/未加载）属幂等卸载预期，stderr 留痕后继续删文件（失败可见非静默），
++ * daemon-reload 收尾让 systemd 遗忘已删单元。
++ */
++export async function serviceUninstallCommand(cfg: BridgeConfig = loadConfig(), deps: ServiceDeps = {}): Promise<number> {
++  const exec = deps.exec ?? createNodeExec();
++  const unitDir = deps.unitDir ?? defaultUnitDir();
++  try {
++    const allNames = [SERVICE_UNIT_NAMES.daemon, SERVICE_UNIT_NAMES.watchdogService, SERVICE_UNIT_NAMES.watchdogTimer];
++    const present: string[] = [];
++    for (const name of allNames) {
++      if ((await statOrEnoent(path.join(unitDir, name))) !== undefined) present.push(name);
++    }
++    if (present.length === 0) {
++      console.log(JSON.stringify({ uninstalled: [], unitDir, note: "未安装" }));
++      return 0;
++    }
++    try {
++      await runSystemctl(exec, ["disable", "--now", ...allNames]);
++    } catch (e) {
++      console.error(
++        `[codearts-bridge] systemctl disable --now 失败（幂等卸载：未启用/未加载属预期，继续删除单元文件）：${e instanceof Error ? e.message : String(e)}`,
++      );
++    }
++    for (const name of present) {
++      try {
++        await unlink(path.join(unitDir, name));
++      } catch (e) {
++        if (errnoOf(e) !== "ENOENT") throw e; // stat 与 unlink 之间的并发删除：容忍
++      }
++    }
++    await runSystemctl(exec, ["daemon-reload"]);
++    console.log(JSON.stringify({ uninstalled: present, unitDir }));
++    return 0;
++  } catch (e) {
++    return serviceError(e);
++  }
++}
++
++/**
++ * service status：单元在场性 + is-active 状态汇总（stdout JSON，rc 0）。
++ * 守护单元缺失 → SERVICE_NOT_INSTALLED 结构化 stderr + rc 1。
++ */
++export async function serviceStatusCommand(cfg: BridgeConfig = loadConfig(), deps: ServiceDeps = {}): Promise<number> {
++  const exec = deps.exec ?? createNodeExec();
++  const unitDir = deps.unitDir ?? defaultUnitDir();
++  try {
++    const units = {
++      daemon: (await statOrEnoent(path.join(unitDir, SERVICE_UNIT_NAMES.daemon))) !== undefined,
++      watchdogService: (await statOrEnoent(path.join(unitDir, SERVICE_UNIT_NAMES.watchdogService))) !== undefined,
++      watchdogTimer: (await statOrEnoent(path.join(unitDir, SERVICE_UNIT_NAMES.watchdogTimer))) !== undefined,
++    };
++    if (!units.daemon) {
++      printCliError(
++        "SERVICE_NOT_INSTALLED",
++        `codearts-bridge systemd 服务未安装：缺少 ${path.join(unitDir, SERVICE_UNIT_NAMES.daemon)}`,
++        "执行 codearts-bridge service install",
++      );
++      return 1;
++    }
++    // is-active 非零码=inactive/failed 属正常状态语义（不抛）；执行层失败（ENOENT）才抛
++    const activeState = async (unit: string): Promise<{ code: number; state: string }> => {
++      const r = await exec.run(["systemctl", "--user", "is-active", unit]);
++      return { code: r.code, state: r.stdout.trim().length > 0 ? r.stdout.trim() : "unknown" };
++    };
++    const daemonActive = await activeState(SERVICE_UNIT_NAMES.daemon);
++    const timerActive = await activeState(SERVICE_UNIT_NAMES.watchdogTimer);
++    console.log(
++      JSON.stringify({
++        unitDir,
++        stateDir: cfg.stateDir,
++        units,
++        active: { daemon: daemonActive.code === 0, watchdogTimer: timerActive.code === 0 },
++        states: { daemon: daemonActive.state, watchdogTimer: timerActive.state },
++      }),
++    );
++    return 0;
++  } catch (e) {
++    return serviceError(e);
++  }
++}
++
++/* ───── watchdog-probe 命令（R-sv1/R-sv4） ───── */
++
++/** 清除计数文件（ENOENT 容忍）；其他错误显式上抛。 */
++async function clearFailsFile(failsFile: string): Promise<void> {
++  try {
++    await unlink(failsFile);
++  } catch (e) {
++    if (errnoOf(e) !== "ENOENT") throw e;
++  }
++}
++
++/**
++ * 探测 /health 并归一结果（R-sv1/R-sv4）：
++ * - 拿到任何 HTTP 应答 → httpCode=状态码（事件循环存活）；reason 记健康/体异常分类；
++ * - 未拿到应答（连接拒绝/超时等）→ httpCode=0；reason=失败分类
++ *   （timeout / errno 码如 ECONNREFUSED / 错误名），供 stderr 留痕排障。
++ */
++async function probeHealth(fetchImpl: FetchLike, url: URL): Promise<{ httpCode: number; reason: string }> {
++  try {
++    const res = await fetchImpl(url, { signal: AbortSignal.timeout(WATCHDOG_PROBE_TIMEOUT_MS) });
++    if (res.status !== 200) {
++      return { httpCode: res.status, reason: `http-${res.status}` };
++    }
++    let body: unknown;
++    try {
++      body = await res.json();
++    } catch {
++      return { httpCode: res.status, reason: "non-json" };
++    }
++    const ok = typeof body === "object" && body !== null && (body as Record<string, unknown>)["ok"] === true;
++    return { httpCode: res.status, reason: ok ? "healthy" : "ok-mismatch" };
++  } catch (e) {
++    const name = e instanceof Error ? e.name : "";
++    const code = errnoOf(e);
++    return {
++      httpCode: 0,
++      reason: name === "TimeoutError" || name === "AbortError" ? "timeout" : (code ?? (name || "unknown")),
++    };
++  }
++}
++
++/**
++ * watchdog-probe（R-sv1）：systemd timer 每分钟调用一次的探活命令。
++ * 全流程见文件头注 T3-07 段；每轮在 stderr 留一行结构化结论（journald 落账）。
++ * 返回码：0 = 探测流程完成（含触发重启成功）；1 = 流程性失败（systemctl 不可用/
++ * 重启执行失败——timer journal 可见，下一分钟重试）。
++ */
++export async function watchdogProbeCommand(cfg: BridgeConfig = loadConfig(), deps: ServiceDeps = {}): Promise<number> {
++  const exec = deps.exec ?? createNodeExec();
++  const fetchImpl = deps.fetchImpl ?? fetch;
++  const now = (deps.nowMs ?? Date.now)();
++  const log = (line: string): void => {
++    console.error(`[codearts-bridge watchdog] ${new Date(now).toISOString()} ${line}`);
++  };
++  const failsFile = path.join(cfg.stateDir, WATCHDOG_FAILS_FILE);
++  try {
++    // 1) is-active 预检：非 active → 清计数退出（进程崩溃/停止归 systemd
++    //    Restart=always 管——dsh 原型分工：本探针只管"活着但卡死"）
++    let active: ExecResult;
++    try {
++      active = await exec.run(["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon]);
++    } catch (e) {
++      throw new BridgeError(
++        "SERVICE_EXEC_FAILED",
++        `watchdog-probe 无法执行 systemctl：${e instanceof Error ? e.message : String(e)}`,
++        { cause: e },
++      );
++    }
++    if (active.code !== 0) {
++      await clearFailsFile(failsFile);
++      log(`服务非 active（rc=${active.code}），跳过探测并清除计数`);
++      return 0;
++    }
++
++    // 2) 宽限期（R-sv1，stateDir 启动戳方案）：daemon.pid 由守护每次启动写/覆写
++    //    （daemon.ts acquirePidfile），mtime 即启动时刻——免 systemctl 时间戳解析
++    //    的时区歧义，也天然覆盖"容器/非 systemd 时间源"形态。pid 文件缺失 = 守护
++    //    尚未完成启动（pidfile 在 start 早期写入）→ 按宽限跳过，防启动慢被误杀。
++    const pidStat = await statOrEnoent(daemonPidPath(cfg));
++    if (pidStat === undefined) {
++      log(`daemon.pid 不存在（守护尚未完成启动），按宽限跳过`);
++      return 0;
++    }
++    const ageMs = now - pidStat.mtimeMs;
++    if (ageMs < WATCHDOG_GRACE_SECONDS * 1000) {
++      log(`守护启动 ${Math.round(Math.max(ageMs, 0) / 1000)}s 前（宽限 ${WATCHDOG_GRACE_SECONDS}s 内），跳过探测`);
++      return 0;
++    }
++
++    // 3) 既有计数：ENOENT → 0；内容非法/空 → stderr 留痕按 0 起算（对齐
++    //    daemon.pid 陈旧清除先例——计数是派生物，损失无害，留痕非静默）
++    let prevFails = 0;
++    let prevRaw: string | undefined;
++    try {
++      prevRaw = (await readFile(failsFile, "utf8")).trim();
++    } catch (e) {
++      if (errnoOf(e) !== "ENOENT") throw e;
++    }
++    if (prevRaw !== undefined) {
++      if (/^\d+$/.test(prevRaw)) {
++        prevFails = Number(prevRaw);
++      } else {
++        console.error(
++          `[codearts-bridge watchdog] 计数文件内容非法（按 0 起算，本轮覆写）：path=${failsFile} content=${JSON.stringify(prevRaw.slice(0, 64))}`,
++        );
++      }
++    }
++
++    // 4) fetch /health（R-sv1：15s 超时）：拿到任何应答 → httpCode=状态码；
++    //    未拿到 → 0，reason=失败分类（R-sv4，入 stderr/journal 留痕）
++    const { httpCode, reason } = await probeHealth(fetchImpl, new URL("/health", cfg.daemonUrl));
++
++    // 5) 纯函数裁决 + 执行（R-sv1）：ok 清计数 / increment 落新计数 / restart
++    //    清计数并 systemctl --user restart（重启失败显式 rc 1，timer journal 可见）
++    const verdict = evaluateProbe({ httpCode, prevFails, graceActive: false }, now);
++    if (verdict.action === "ok" && verdict.fails === 0) {
++      await clearFailsFile(failsFile);
++    } else if (verdict.action === "increment") {
++      await atomicWriteFile(failsFile, String(verdict.fails), 0o644);
++    } else {
++      await clearFailsFile(failsFile);
++      await runSystemctl(exec, ["restart", SERVICE_UNIT_NAMES.daemon]);
++    }
++    log(`code=${httpCode} reason=${reason} fails=${verdict.fails} action=${verdict.action}`);
++    return 0;
++  } catch (e) {
++    const be = e instanceof BridgeError ? e : undefined;
++    printCliError(
++      be?.code ?? "WATCHDOG_PROBE_FAILED",
++      `watchdog-probe 失败：${e instanceof Error ? e.message : String(e)}`,
++    );
++    return 1;
++  }
++}
++
+ /** CLI 命令分派（返回退出码；仅 import.meta.main 时由底部出口真正 exit）。 */
+ export async function main(argv: readonly string[]): Promise<number> {
+   const cmd = argv[0];
+   if (cmd === undefined || cmd === "help") {
+     console.log(USAGE);
+     return 0;
+   }
+   if (cmd === "version") {
+     console.log(`${PLUGIN_ID} ${PLUGIN_VERSION}`);
+     return 0;
+   }
+   if (cmd === "daemon") {
+     return daemonCommand(loadConfig());
+   }
+   if (cmd === "status") {
+     return statusCommand(loadConfig());
+   }
++  if (cmd === "service") {
++    const sub = argv[1];
++    if (sub === "install") return serviceInstallCommand(loadConfig());
++    if (sub === "status") return serviceStatusCommand(loadConfig());
++    if (sub === "uninstall") return serviceUninstallCommand(loadConfig());
++    console.error(`codearts-bridge: service 未知子命令 "${sub ?? ""}"（须为 install/status/uninstall）\n${USAGE}`);
++    return 2;
++  }
++  if (cmd === "watchdog-probe") {
++    return watchdogProbeCommand(loadConfig());
++  }
+   console.error(`codearts-bridge: 未知命令 "${cmd}"\n${USAGE}`);
+   return 2;
+ }
+ 
+ // 仅直接执行时进入命令分派（被测试/其他模块导入时不产生副作用）
+ if (import.meta.main) {
+   main(Bun.argv.slice(2)).then(
+     (code) => process.exit(code),
+     (e: unknown) => {
+       // 分派层意外异常：显式落 stderr + 非零退出（禁静默吞错）
+diff --git a/plugins/codearts-bridge/src/core/run.ts b/plugins/codearts-bridge/src/core/run.ts
+index d6f83aab03..983c40eea9 100644
+--- a/plugins/codearts-bridge/src/core/run.ts
++++ b/plugins/codearts-bridge/src/core/run.ts
+@@ -108,22 +108,26 @@ export function selectTransport(input: SelectTransportInput): TransportSelection
+   }
+   if (input.transport === "pty") {
+     return selectPtyHost(input.ptyHost, input.tmuxAvailable, "配置 transport=pty（显式）");
+   }
+   if (input.hasAksk) {
+     return { mode: "structured", reason: "auto：检测到 AK/SK 凭据 → structured" };
+   }
+   return selectPtyHost(input.ptyHost, input.tmuxAvailable, "auto：未检测到 AK/SK 凭据 → pty");
+ }
+ 
+-/** 是否需要 tmux 可用性探测（避免无谓 spawn：仅 ptyHost=auto 且决策可能落到 pty 时）。 */
+-function needsTmuxProbe(transport: BridgeConfig["transport"], ptyHost: BridgeConfig["ptyHost"], hasAksk: boolean): boolean {
++/**
++ * 是否需要 tmux 可用性探测（避免无谓 spawn：仅 ptyHost=auto 且决策可能落到 pty 时）。
++ * T3-07 起导出：daemon 生产装配（cli.ts resolveProductionTransport）与 runOnce
++ * 共用同一探测条件，杜绝第二套选择真相源（M78 双份同码教训）。
++ */
++export function needsTmuxProbe(transport: BridgeConfig["transport"], ptyHost: BridgeConfig["ptyHost"], hasAksk: boolean): boolean {
+   if (ptyHost !== "auto") return false;
+   if (transport === "pty") return true;
+   return transport === "auto" && !hasAksk;
+ }
+ 
+ /* ───── 生产装配（传输工厂 / tmux 探测 / 时钟） ───── */
+ 
+ /** 生产传输工厂：按选择结果构造对应真实传输（注入 seam 供测试替换）。 */
+ export function defaultBuildTransport(sel: TransportSelection): CodeartsTransport {
+   switch (sel.mode) {
+diff --git a/plugins/codearts-bridge/src/core/service.ts b/plugins/codearts-bridge/src/core/service.ts
+new file mode 100644
+index 0000000000..f8d77a16c6
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/service.ts
+@@ -0,0 +1,223 @@
++/**
++ * codearts-bridge systemd 服务与 watchdog 单元生成器（T3-07，纯函数层）。
++ *
++ * 职责边界（主控裁定 R-sv1/R-sv2，progress.md Task 20）：
++ * - 本文件只做两件事：① systemd 单元文件的字符串渲染（R-sv2 纯函数，内容走
++ *   快照/内容断言测试）；② watchdog 探测结果的纯评估（R-sv1 evaluateProbe）。
++ *   一切 FS 写入、systemctl 调用、fetch 探测都在 CLI 命令层（src/cli.ts）经注入
++ *   依赖执行——测试绝不真装单元、绝不真连守护、绝不真重启服务。
++ *
++ * 范式来源（用户既有 dsh-web 运维模式，bin/dsh-watchdog-probe.sh）：
++ * - 进程崩溃由 systemd Restart=always 处理；watchdog 只管"活着但卡死"
++ *   （事件循环阻塞时 HTTP 探测超时/无响应）；
++ * - 任何 HTTP 状态码（含 401/500）都证明事件循环活着——有应答即健康、计数清零；
++ * - 连续 2 次无响应 → systemctl --user restart，计数清零重新累计；
++ * - 启动后 120s 宽限期不探测（等引导完成，防启动慢被误杀）；
++ * - 计数文件落在状态目录，探测失败原因分类留痕（R-sv4：stderr/journal）。
++ *
++ * 裁定偏差登记（签名细化，语义不偏离）：
++ * - renderWatchdogUnits 接收与 renderServiceUnit 相同的 ServiceUnitInput：裁定文
++ *   写作 `renderWatchdogUnits()`，但 R-sv2 内容断言要求 watchdog 单元的 ExecStart
++ *   同样是"绝对路径"，无参签名无法嵌入 bun/cli 绝对路径——取同参签名保住绝对
++ *   路径断言，纯函数性质不变。
++ *
++ * 错误纪律（仓库铁律）：非法输入（相对路径/负数/非整数）就地显式抛 BridgeError，
++ * 禁止静默钳位或补默认值。
++ */
++import * as path from "node:path";
++import { BridgeError } from "./errors";
++
++/* ───── 常量（单一真相，CLI 命令层与单元渲染共用） ───── */
++
++/** 启动宽限期秒数（R-sv1：启动后 120s 内不探测，等引导完成）。 */
++export const WATCHDOG_GRACE_SECONDS = 120;
++
++/** 连续无响应重启阈值（R-sv1：连续 ≥2 次无响应 → restart）。 */
++export const WATCHDOG_FAIL_THRESHOLD = 2;
++
++/** 探测超时毫秒（R-sv1：fetch /health 15s 超时）。 */
++export const WATCHDOG_PROBE_TIMEOUT_MS = 15_000;
++
++/** 无响应计数文件名（位于状态根；R-sv1：stateDir/watchdog-fails）。 */
++export const WATCHDOG_FAILS_FILE = "watchdog-fails";
++
++/** 三个 systemd 单元文件名（R-sv3：~/.config/systemd/user/ 下的安装目标）。 */
++export const SERVICE_UNIT_NAMES = {
++  daemon: "codearts-bridge.service",
++  watchdogService: "codearts-bridge-watchdog.service",
++  watchdogTimer: "codearts-bridge-watchdog.timer",
++} as const;
++
++/** 守护崩溃重启间隔秒（Restart=always 的再拉起节拍；与 watchdog 分钟级探活互补）。 */
++export const SERVICE_RESTART_SEC = 3;
++
++/* ───── 单元生成器（R-sv2） ───── */
++
++/** 单元渲染输入（全部绝对路径；user 服务缺省省略 User= 指令）。 */
++export interface ServiceUnitInput {
++  /** bun 可执行绝对路径（安装时经 process.execPath 探测）。 */
++  bunPath: string;
++  /** cli.ts 绝对路径（ExecStart 第二段：bun <cli.ts> daemon|watchdog-probe）。 */
++  cliPath: string;
++  /** 状态根绝对路径（经 Environment 钉入，守护与 watchdog 同一真相源）。 */
++  stateDir: string;
++  /** 可选 User= 指令（系统级服务变体；user 服务不需要）。 */
++  user?: string;
++}
++
++/** 绝对路径校验（systemd ExecStart 硬性要求绝对路径；相对路径显式拒绝）。 */
++function requireAbsolute(field: string, value: string): string {
++  if (typeof value !== "string" || value.length === 0 || !path.isAbsolute(value)) {
++    throw new BridgeError(
++      "SERVICE_UNIT_INPUT_INVALID",
++      `${field} 必须为非空绝对路径（systemd ExecStart 要求），实际为 ${JSON.stringify(value)}`,
++    );
++  }
++  return value;
++}
++
++/**
++ * 渲染守护单元 codearts-bridge.service（R-sv2 纯函数）。
++ *
++ * - Restart=always + RestartSec：进程崩溃/退出的自愈归 systemd（watchdog 只管
++ *   挂起——dsh 原型分工注释原样保留）；
++ * - ExecStart 双路径加引号：路径含空格时 systemd 仍按单参数解析；
++ * - Environment 钉 CODEARTS_BRIDGE_STATE_DIR：守护进程与 watchdog-probe 命令
++ *   经同一环境变量取得状态根，杜绝两套路径真相源漂移；
++ * - 日志三件套（StandardOutput/StandardError=journal + SyslogIdentifier）：
++ *   stdout/stderr 全部落 journald，`journalctl --user -t codearts-bridge` 可查
++ *   （R-sv2"日志到 journal"断言对象）。
++ */
++export function renderServiceUnit(input: ServiceUnitInput): string {
++  const bunPath = requireAbsolute("bunPath", input.bunPath);
++  const cliPath = requireAbsolute("cliPath", input.cliPath);
++  const stateDir = requireAbsolute("stateDir", input.stateDir);
++  const userLine = input.user !== undefined ? `User=${input.user}\n` : "";
++  return [
++    "[Unit]",
++    "Description=codearts-bridge 守护进程（目标引擎常驻宿主）",
++    "After=network.target",
++    "",
++    "[Service]",
++    userLine,
++    `ExecStart="${bunPath}" "${cliPath}" daemon`,
++    "Restart=always",
++    `RestartSec=${SERVICE_RESTART_SEC}`,
++    `Environment="CODEARTS_BRIDGE_STATE_DIR=${stateDir}"`,
++    "StandardOutput=journal",
++    "StandardError=journal",
++    "SyslogIdentifier=codearts-bridge",
++    "",
++    "[Install]",
++    "WantedBy=default.target",
++    "",
++  ].join("\n");
++}
++
++/**
++ * 渲染 watchdog 单元对（R-sv2 纯函数）：oneshot 探测服务 + 每分钟触发 timer。
++ *
++ * - watchdog.service 由 timer 激活（不单独 enable），Type=oneshot 跑完即退；
++ * - timer OnCalendar=minutely 每分钟一次；Persistent=true 补跑休眠/停机期间
++ *   错过的触发（探针幂等，补跑无害）；
++ * - ExecStart 与守护单元同参渲染（绝对路径断言一致，见头注偏差登记）。
++ */
++export function renderWatchdogUnits(input: ServiceUnitInput): { service: string; timer: string } {
++  const bunPath = requireAbsolute("bunPath", input.bunPath);
++  const cliPath = requireAbsolute("cliPath", input.cliPath);
++  const service = [
++    "[Unit]",
++    `Description=codearts-bridge watchdog 探测（每分钟；连续 ${WATCHDOG_FAIL_THRESHOLD} 次无响应重启守护）`,
++    `After=${SERVICE_UNIT_NAMES.daemon}`,
++    "",
++    "[Service]",
++    "Type=oneshot",
++    `ExecStart="${bunPath}" "${cliPath}" watchdog-probe`,
++    "StandardOutput=journal",
++    "StandardError=journal",
++    "SyslogIdentifier=codearts-bridge-watchdog",
++    "",
++  ].join("\n");
++  const timer = [
++    "[Unit]",
++    "Description=codearts-bridge watchdog 探测定时器（每分钟）",
++    "",
++    "[Timer]",
++    "OnCalendar=minutely",
++    "Persistent=true",
++    `Unit=${SERVICE_UNIT_NAMES.watchdogService}`,
++    "",
++    "[Install]",
++    "WantedBy=timers.target",
++    "",
++  ].join("\n");
++  return { service, timer };
++}
++
++/* ───── 探测评估纯函数（R-sv1） ───── */
++
++/** 探测裁决动作（R-sv1 固定三值）。 */
++export type ProbeAction = "ok" | "increment" | "restart";
++
++/** evaluateProbe 输入（纯数据；命令层负责把真实探测归一到这三字段）。 */
++export interface EvaluateProbeInput {
++  /**
++   * 本轮探测的 HTTP 状态码：0 = 无响应（连接拒绝/超时等一切未拿到 HTTP 应答的
++   * 失败）；非 0 = 收到 HTTP 应答——任意状态码（含 401/500）都证明事件循环活着
++   * （dsh 原型口径；体级异常的分类留痕归命令层 stderr，不参与重启判定）。
++   */
++  httpCode: number;
++  /** 上一轮累计的连续无响应次数（计数文件读数；≥0）。 */
++  prevFails: number;
++  /** 宽限期内（不探测）：ok 且计数原样保留，不计数不清零（dsh 原型同语义）。 */
++  graceActive: boolean;
++}
++
++/** 探测裁决（R-sv1 输出形态 + atMs 时间戳供结构化日志）。 */
++export interface ProbeVerdict {
++  action: ProbeAction;
++  /**
++   * 本轮应落盘的计数：0 = 应清除计数文件；>0 = 应写入该值。
++   * 宽限期跳过时原样回传 prevFails（命令层对应"不动计数文件"）。
++   */
++  fails: number;
++  /** 评估时刻（入参 now 透传；stderr/journal 结构化行取时用）。 */
++  atMs: number;
++}
++
++function requireNonNegativeInt(field: string, value: number): number {
++  if (!Number.isInteger(value) || value < 0) {
++    throw new BridgeError(
++      "WATCHDOG_INPUT_INVALID",
++      `${field} 必须为非负整数，实际为 ${JSON.stringify(value)}`,
++    );
++  }
++  return value;
++}
++
++/**
++ * watchdog 探测裁决（R-sv1 纯函数）：
++ * - graceActive → ok（计数原样）：宽限期不探测、不动计数（含既有计数不清零，
++ *   对齐 dsh 原型"宽限期内直接退出"）；
++ * - httpCode > 0 → ok 且计数清零：有应答 = 事件循环存活；
++ * - httpCode = 0 → fails = prevFails + 1：达到阈值 → restart（计数清零，重启后
++ *   重新累计）；未达阈值 → increment（落盘新计数，等下一轮）。
++ */
++export function evaluateProbe(input: EvaluateProbeInput, now: number): ProbeVerdict {
++  const httpCode = requireNonNegativeInt("httpCode", input.httpCode);
++  const prevFails = requireNonNegativeInt("prevFails", input.prevFails);
++  if (!Number.isFinite(now)) {
++    throw new BridgeError("WATCHDOG_INPUT_INVALID", `now 必须为有限数字，实际为 ${JSON.stringify(now)}`);
++  }
++  if (input.graceActive) {
++    return { action: "ok", fails: prevFails, atMs: now };
++  }
++  if (httpCode > 0) {
++    return { action: "ok", fails: 0, atMs: now };
++  }
++  const fails = prevFails + 1;
++  if (fails >= WATCHDOG_FAIL_THRESHOLD) {
++    return { action: "restart", fails: 0, atMs: now };
++  }
++  return { action: "increment", fails, atMs: now };
++}
+diff --git a/plugins/codearts-bridge/test/service.test.ts b/plugins/codearts-bridge/test/service.test.ts
+new file mode 100644
+index 0000000000..264ab10619
+--- /dev/null
++++ b/plugins/codearts-bridge/test/service.test.ts
+@@ -0,0 +1,668 @@
++/**
++ * T3-07 systemd 服务与 watchdog 测试（bun:test）。
++ *
++ * 覆盖（主控裁定 R-sv1~R-sv4，progress.md Task 20）：
++ * - R-sv1 watchdog 内置化：evaluateProbe 纯评估函数 + watchdogProbeCommand
++ *   （fetch /health 15s 超时、计数文件、连续 ≥2 → systemctl --user restart）；
++ * - R-sv2 单元生成器纯函数：renderServiceUnit / renderWatchdogUnits 内容断言
++ *   （Restart=always、ExecStart 绝对路径、环境变量、日志到 journal）；
++ * - R-sv3 安装幂等：重复 install 同内容不重写、uninstall 只删自家单元、
++ *   systemctl 动作经注入 exec（测试绝不真装）；
++ * - R-sv4 探针诊断：失败原因分类（超时/连接拒绝/非 JSON/ok≠true）入 stderr/journal。
++ * - T3-05/T3-06 登记项①：daemonCommand 生产装配挂载 GoalHost（POST /goals 不再 501）。
++ *
++ * 隔离纪律（与 install.test.ts 同）：exec/fetch/时钟全部注入；FS 落点全部在
++ * .tmp/service-test/ 临时目录；绝不触碰真实 HOME 与真实 systemd。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import * as http from "node:http";
++import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import {
++  SERVICE_UNIT_NAMES,
++  WATCHDOG_FAIL_THRESHOLD,
++  WATCHDOG_GRACE_SECONDS,
++  evaluateProbe,
++  renderServiceUnit,
++  renderWatchdogUnits,
++} from "../src/core/service";
++import type { Exec } from "../src/core/install";
++import {
++  daemonCommand,
++  main,
++  serviceInstallCommand,
++  serviceStatusCommand,
++  serviceUninstallCommand,
++  watchdogProbeCommand,
++} from "../src/cli";
++import type { FetchLike, ServiceDeps } from "../src/cli";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "service-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 捕获 console 输出执行 fn（finally 必然还原，防污染其他用例输出）。 */
++async function captureConsole<T>(
++  fn: () => Promise<T>,
++): Promise<{ result: T; logs: string[]; errors: string[] }> {
++  const logs: string[] = [];
++  const errors: string[] = [];
++  const origLog = console.log;
++  const origError = console.error;
++  console.log = (...args: unknown[]) => {
++    logs.push(args.map((a) => String(a)).join(" "));
++  };
++  console.error = (...args: unknown[]) => {
++    errors.push(args.map((a) => String(a)).join(" "));
++  };
++  try {
++    const result = await fn();
++    return { result, logs, errors };
++  } finally {
++    console.log = origLog;
++    console.error = origError;
++  }
++}
++
++/* ───── fixture：生成器输入与 systemd exec fake ───── */
++
++const BUN = "/opt/bun/bin/bun";
++const CLI = "/opt/app/src/cli.ts";
++const STATE = "/home/u/.codearts-bridge";
++
++/** 可编程 systemctl fake：按 argv 前缀匹配返回退出码，并留痕全部调用。 */
++function makeSystemctlFake(script: Array<{ match: string[]; code: number; stdout?: string }> = []) {
++  const calls: string[][] = [];
++  const exec: Exec = {
++    async run(cmd) {
++      calls.push([...cmd]);
++      const hit = script.find((s) => s.match.every((m, i) => cmd[i] === m));
++      if (hit !== undefined) {
++        return { code: hit.code, stdout: hit.stdout ?? "", stderr: "" };
++      }
++      return { code: 0, stdout: "", stderr: "" };
++    },
++  };
++  return { exec, calls };
++}
++
++/** 隔离配置：stateDir 落临时目录；daemonUrl 指向不存在的端口（fetch 已注入，不会真连）。 */
++function cfgFor(name: string): BridgeConfig {
++  return loadConfig({ stateDir: path.join(TEST_ROOT, name), daemonUrl: "http://127.0.0.1:1" }, {});
++}
++
++/** 单元目录与三个单元文件路径。 */
++function unitPaths(unitDir: string) {
++  return {
++    daemon: path.join(unitDir, SERVICE_UNIT_NAMES.daemon),
++    watchdogService: path.join(unitDir, SERVICE_UNIT_NAMES.watchdogService),
++    watchdogTimer: path.join(unitDir, SERVICE_UNIT_NAMES.watchdogTimer),
++  };
++}
++
++/** 探测一个空闲 TCP 端口（监听 :0 → 取端口 → 立即关闭；仅测试定位用）。 */
++async function freeTcpPort(): Promise<number> {
++  const srv = http.createServer();
++  await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
++  const addr = srv.address();
++  if (addr === null || typeof addr === "string") throw new Error(`非预期地址形态：${String(addr)}`);
++  const port = addr.port;
++  await new Promise<void>((resolve) => srv.close(() => resolve()));
++  return port;
++}
++
++/* ───── R-sv2：单元生成器 ───── */
++
++describe("renderServiceUnit（R-sv2 内容断言）", () => {
++  it("Restart=always + RestartSec 在场（崩溃自愈语义钉死）", () => {
++    const unit = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(unit).toContain("[Service]");
++    expect(unit).toMatch(/^Restart=always$/m);
++    expect(unit).toMatch(/^RestartSec=\d+$/m);
++  });
++
++  it("ExecStart=引号包裹的绝对 bun 路径 + 绝对 cli.ts 路径 + daemon 子命令", () => {
++    const unit = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    const m = /^ExecStart=(.+)$/m.exec(unit);
++    expect(m).not.toBeNull();
++    expect(m?.[1]).toContain(`"${BUN}"`);
++    expect(m?.[1]).toContain(`"${CLI}"`);
++    expect(m?.[1]?.trim().endsWith("daemon")).toBe(true);
++  });
++
++  it("Environment 钉 CODEARTS_BRIDGE_STATE_DIR（守护与 watchdog 同一状态根）", () => {
++    const unit = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(unit).toContain(`Environment="CODEARTS_BRIDGE_STATE_DIR=${STATE}"`);
++  });
++
++  it("日志到 journal：StandardOutput/StandardError=journal + SyslogIdentifier", () => {
++    const unit = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(unit).toMatch(/^StandardOutput=journal$/m);
++    expect(unit).toMatch(/^StandardError=journal$/m);
++    expect(unit).toMatch(/^SyslogIdentifier=codearts-bridge$/m);
++  });
++
++  it("[Install] WantedBy=default.target（user 服务惯例）", () => {
++    const unit = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(unit).toMatch(/^WantedBy=default\.target$/m);
++  });
++
++  it("user 可选：传入出 User= 行，缺省不出", () => {
++    const withUser = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE, user: "u" });
++    expect(withUser).toMatch(/^User=u$/m);
++    const withoutUser = renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(withoutUser).not.toMatch(/^User=/m);
++  });
++
++  it("相对路径显式抛 BridgeError（bun/cli/stateDir 三字段各自校验，禁静默）", () => {
++    expect(() => renderServiceUnit({ bunPath: "bun", cliPath: CLI, stateDir: STATE })).toThrow(BridgeError);
++    expect(() => renderServiceUnit({ bunPath: BUN, cliPath: "cli.ts", stateDir: STATE })).toThrow(BridgeError);
++    expect(() => renderServiceUnit({ bunPath: BUN, cliPath: CLI, stateDir: ".codearts-bridge" })).toThrow(BridgeError);
++  });
++});
++
++describe("renderWatchdogUnits（R-sv2）", () => {
++  it("watchdog.service：Type=oneshot + ExecStart=watchdog-probe + journal 日志", () => {
++    const { service } = renderWatchdogUnits({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(service).toMatch(/^Type=oneshot$/m);
++    const m = /^ExecStart=(.+)$/m.exec(service);
++    expect(m?.[1]).toContain(`"${BUN}"`);
++    expect(m?.[1]).toContain(`"${CLI}"`);
++    expect(m?.[1]?.trim().endsWith("watchdog-probe")).toBe(true);
++    expect(service).toMatch(/^StandardOutput=journal$/m);
++    expect(service).toMatch(/^StandardError=journal$/m);
++  });
++
++  it("watchdog.timer：OnCalendar=minutely + Unit 指向 watchdog.service + WantedBy=timers.target", () => {
++    const { timer } = renderWatchdogUnits({ bunPath: BUN, cliPath: CLI, stateDir: STATE });
++    expect(timer).toMatch(/^OnCalendar=minutely$/m);
++    expect(timer).toContain(`Unit=${SERVICE_UNIT_NAMES.watchdogService}`);
++    expect(timer).toMatch(/^WantedBy=timers\.target$/m);
++  });
++
++  it("相对路径显式抛 BridgeError", () => {
++    expect(() => renderWatchdogUnits({ bunPath: "bun", cliPath: CLI, stateDir: STATE })).toThrow(BridgeError);
++  });
++});
++
++/* ───── R-sv1：探测评估纯函数 ───── */
++
++describe("evaluateProbe（R-sv1 纯评估）", () => {
++  it("宽限期内：ok 且计数原样保留（不探测不计数不清零，对齐 dsh 原型）", () => {
++    const v = evaluateProbe({ httpCode: 0, prevFails: 1, graceActive: true }, 1_000);
++    expect(v.action).toBe("ok");
++    expect(v.fails).toBe(1);
++  });
++
++  it("HTTP 200：ok 且计数清零", () => {
++    const v = evaluateProbe({ httpCode: 200, prevFails: 1, graceActive: false }, 1_000);
++    expect(v.action).toBe("ok");
++    expect(v.fails).toBe(0);
++  });
++
++  it("任意非 0 状态码（401/500）都证明事件循环存活 → ok 清零（dsh 模式）", () => {
++    expect(evaluateProbe({ httpCode: 401, prevFails: 1, graceActive: false }, 1_000).action).toBe("ok");
++    expect(evaluateProbe({ httpCode: 500, prevFails: 1, graceActive: false }, 1_000).fails).toBe(0);
++  });
++
++  it("无响应首败：increment 且 fails=prevFails+1（未达阈值不重启）", () => {
++    const v = evaluateProbe({ httpCode: 0, prevFails: 0, graceActive: false }, 1_000);
++    expect(v.action).toBe("increment");
++    expect(v.fails).toBe(1);
++  });
++
++  it(`连续第 ${WATCHDOG_FAIL_THRESHOLD} 次无响应：restart 且计数清零（重启后重新计数）`, () => {
++    const v = evaluateProbe({ httpCode: 0, prevFails: WATCHDOG_FAIL_THRESHOLD - 1, graceActive: false }, 1_000);
++    expect(v.action).toBe("restart");
++    expect(v.fails).toBe(0);
++  });
++
++  it("now 透传到 atMs（结构化日志取时）", () => {
++    expect(evaluateProbe({ httpCode: 200, prevFails: 0, graceActive: false }, 1_700_000_000_000).atMs).toBe(
++      1_700_000_000_000,
++    );
++  });
++
++  it("非法输入显式抛（负/非整数 httpCode、负 prevFails、非有限 now）", () => {
++    expect(() => evaluateProbe({ httpCode: -1, prevFails: 0, graceActive: false }, 1_000)).toThrow(BridgeError);
++    expect(() => evaluateProbe({ httpCode: 1.5, prevFails: 0, graceActive: false }, 1_000)).toThrow(BridgeError);
++    expect(() => evaluateProbe({ httpCode: 200, prevFails: -1, graceActive: false }, 1_000)).toThrow(BridgeError);
++    expect(() => evaluateProbe({ httpCode: 200, prevFails: 0, graceActive: false }, Number.NaN)).toThrow(BridgeError);
++  });
++});
++
++/* ───── R-sv3：install / uninstall / status ───── */
++
++describe("serviceInstallCommand（R-sv3 幂等安装）", () => {
++  it("首次安装：三个单元文件内容正确 + exec 序列 daemon-reload → enable --now（守护+timer，不含 watchdog.service）", async () => {
++    const cfg = cfgFor("install-first");
++    const unitDir = path.join(TEST_ROOT, "install-first", "units");
++    const { exec, calls } = makeSystemctlFake();
++    const deps: ServiceDeps = { exec, unitDir, bunPath: BUN, cliPath: CLI };
++    const rc = await serviceInstallCommand(cfg, deps);
++    expect(rc).toBe(0);
++
++    const p = unitPaths(unitDir);
++    const daemonUnit = await readFile(p.daemon, "utf8");
++    expect(daemonUnit).toContain(`Environment="CODEARTS_BRIDGE_STATE_DIR=${cfg.stateDir}"`);
++    expect(daemonUnit).toMatch(/^Restart=always$/m);
++    expect((await readFile(p.watchdogService, "utf8"))).toMatch(/^Type=oneshot$/m);
++    expect((await readFile(p.watchdogTimer, "utf8"))).toMatch(/^OnCalendar=minutely$/m);
++
++    expect(calls.length).toBe(2);
++    expect(calls[0]).toEqual(["systemctl", "--user", "daemon-reload"]);
++    expect(calls[1]).toEqual([
++      "systemctl",
++      "--user",
++      "enable",
++      "--now",
++      SERVICE_UNIT_NAMES.daemon,
++      SERVICE_UNIT_NAMES.watchdogTimer,
++    ]);
++  });
++
++  it("重复安装幂等：内容一致不重写（written 空 + mtime 不变），exec 仍执行 reload/enable", async () => {
++    const cfg = cfgFor("install-twice");
++    const unitDir = path.join(TEST_ROOT, "install-twice", "units");
++    const { exec, calls } = makeSystemctlFake();
++    const deps: ServiceDeps = { exec, unitDir, bunPath: BUN, cliPath: CLI };
++    await serviceInstallCommand(cfg, deps);
++    const p = unitPaths(unitDir);
++    const mtimeBefore = (await stat(p.daemon)).mtimeMs;
++
++    const cap = await captureConsole(() => serviceInstallCommand(cfg, deps));
++    expect(cap.result).toBe(0);
++    expect(cap.logs.join("\n")).toContain('"written":[]');
++    expect((await stat(p.daemon)).mtimeMs).toBe(mtimeBefore); // 未重写
++    expect(calls.length).toBe(4); // 每次 install 各 reload+enable
++  });
++
++  it("exec 失败 → rc 1 + stderr 结构化错误码（禁静默）", async () => {
++    const cfg = cfgFor("install-exec-fail");
++    const unitDir = path.join(TEST_ROOT, "install-exec-fail", "units");
++    const failing: Exec = {
++      async run(cmd) {
++        if (cmd.includes("daemon-reload")) {
++          return { code: 1, stdout: "", stderr: "reload failed" };
++        }
++        return { code: 0, stdout: "", stderr: "" };
++      },
++    };
++    const cap = await captureConsole(() =>
++      serviceInstallCommand(cfg, { exec: failing, unitDir, bunPath: BUN, cliPath: CLI }),
++    );
++    expect(cap.result).toBe(1);
++    expect(cap.errors.join("\n")).toContain("SERVICE_EXEC_FAILED");
++  });
++});
++
++describe("serviceUninstallCommand（R-sv3 只删自家单元）", () => {
++  it("卸载：删三个单元文件、保留他单元、exec 执行 disable --now 与 daemon-reload", async () => {
++    const cfg = cfgFor("uninstall");
++    const unitDir = path.join(TEST_ROOT, "uninstall", "units");
++    const { exec, calls } = makeSystemctlFake();
++    await serviceInstallCommand(cfg, { exec, unitDir, bunPath: BUN, cliPath: CLI });
++    const foreign = path.join(unitDir, "other.service");
++    await writeFile(foreign, "[Unit]\nDescription=别人的单元\n", "utf8");
++
++    const cap = await captureConsole(() =>
++      serviceUninstallCommand(cfg, { exec, unitDir, bunPath: BUN, cliPath: CLI }),
++    );
++    expect(cap.result).toBe(0);
++    const p = unitPaths(unitDir);
++    for (const f of [p.daemon, p.watchdogService, p.watchdogTimer]) {
++      await expect(readFile(f, "utf8")).rejects.toThrow();
++    }
++    expect(await readFile(foreign, "utf8")).toContain("别人的单元");
++    const kinds = calls.map((c) => c.slice(0, 4).join(" "));
++    expect(kinds.some((k) => k.startsWith("systemctl --user disable"))).toBe(true);
++    expect(kinds.some((k) => k === "systemctl --user daemon-reload" || k.startsWith("systemctl --user daemon"))).toBe(
++      true,
++    );
++  });
++
++  it("未安装时幂等 rc 0 且零 systemctl 调用", async () => {
++    const cfg = cfgFor("uninstall-missing");
++    const unitDir = path.join(TEST_ROOT, "uninstall-missing", "units");
++    const { exec, calls } = makeSystemctlFake();
++    const cap = await captureConsole(() =>
++      serviceUninstallCommand(cfg, { exec, unitDir, bunPath: BUN, cliPath: CLI }),
++    );
++    expect(cap.result).toBe(0);
++    expect(calls).toEqual([]);
++  });
++});
++
++describe("serviceStatusCommand", () => {
++  it("已安装：输出单元在场性与 is-active 状态 JSON，rc 0", async () => {
++    const cfg = cfgFor("status-ok");
++    const unitDir = path.join(TEST_ROOT, "status-ok", "units");
++    const { exec } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", SERVICE_UNIT_NAMES.daemon], code: 0, stdout: "active\n" },
++      { match: ["systemctl", "--user", "is-active", SERVICE_UNIT_NAMES.watchdogTimer], code: 3, stdout: "inactive\n" },
++    ]);
++    await serviceInstallCommand(cfg, { exec, unitDir, bunPath: BUN, cliPath: CLI });
++    const cap = await captureConsole(() =>
++      serviceStatusCommand(cfg, { exec, unitDir, bunPath: BUN, cliPath: CLI }),
++    );
++    expect(cap.result).toBe(0);
++    const payload = JSON.parse(cap.logs.join("\n")) as {
++      units: { daemon: boolean; watchdogService: boolean; watchdogTimer: boolean };
++      active: { daemon: boolean; watchdogTimer: boolean };
++    };
++    expect(payload.units.daemon).toBe(true);
++    expect(payload.units.watchdogTimer).toBe(true);
++    expect(payload.active.daemon).toBe(true);
++    expect(payload.active.watchdogTimer).toBe(false);
++  });
++
++  it("未安装：rc 1 + SERVICE_NOT_INSTALLED 结构化 stderr", async () => {
++    const cfg = cfgFor("status-missing");
++    const { exec } = makeSystemctlFake();
++    const cap = await captureConsole(() =>
++      serviceStatusCommand(cfg, { exec, unitDir: path.join(TEST_ROOT, "status-missing", "units"), bunPath: BUN, cliPath: CLI }),
++    );
++    expect(cap.result).toBe(1);
++    expect(cap.errors.join("\n")).toContain("SERVICE_NOT_INSTALLED");
++  });
++});
++
++/* ───── R-sv1/R-sv4：watchdog-probe 命令 ───── */
++
++/** 构造注入型 watchdog deps：fetch/时钟/单元目录全隔离。 */
++function probeDeps(opts: {
++  stateDir: string;
++  unitDir: string;
++  exec: Exec;
++  fetchImpl: FetchLike;
++  nowMs?: number;
++}): ServiceDeps {
++  return {
++    exec: opts.exec,
++    unitDir: opts.unitDir,
++    fetchImpl: opts.fetchImpl,
++    nowMs: () => opts.nowMs ?? 1_000_000_000_000,
++    bunPath: BUN,
++    cliPath: CLI,
++  };
++}
++
++/** 落一个 daemon.pid（watchdog 以其 mtime 作启动戳）。 */
++async function writePid(stateDir: string, ageMs: number): Promise<void> {
++  await mkdir(stateDir, { recursive: true });
++  const p = path.join(stateDir, "daemon.pid");
++  await writeFile(p, "12345\n", "utf8");
++  const t = new Date(1_000_000_000_000 - ageMs);
++  await utimes(p, t, t);
++}
++
++describe("watchdogProbeCommand（R-sv1/R-sv4）", () => {
++  it("服务非 active：清计数、零 fetch、rc 0（崩溃自愈归 systemd，探针不管）", async () => {
++    const cfg = cfgFor("probe-inactive");
++    const { exec, calls } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 3 },
++    ]);
++    const failsFile = path.join(cfg.stateDir, "watchdog-fails");
++    await mkdir(cfg.stateDir, { recursive: true });
++    await writeFile(failsFile, "1", "utf8");
++    let fetched = 0;
++    const cap = await captureConsole(() =>
++      watchdogProbeCommand(
++        cfg,
++        probeDeps({
++          stateDir: cfg.stateDir,
++          unitDir: path.join(TEST_ROOT, "probe-inactive", "units"),
++          exec,
++          fetchImpl: async () => {
++            fetched += 1;
++            return new Response(JSON.stringify({ ok: true }), { status: 200 });
++          },
++        }),
++      ),
++    );
++    expect(cap.result).toBe(0);
++    expect(fetched).toBe(0);
++    await expect(readFile(failsFile, "utf8")).rejects.toThrow(); // 计数已清
++    expect(calls.length).toBe(1); // 只发了 is-active，无 restart
++  });
++
++  it("宽限期（daemon.pid mtime 距今 <120s）：跳过探测零 fetch，计数不动", async () => {
++    const cfg = cfgFor("probe-grace");
++    const { exec } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 0 },
++    ]);
++    await writePid(cfg.stateDir, 1000); // 1s 前启动 → 宽限内
++    let fetched = 0;
++    const cap = await captureConsole(() =>
++      watchdogProbeCommand(
++        cfg,
++        probeDeps({
++          stateDir: cfg.stateDir,
++          unitDir: path.join(TEST_ROOT, "probe-grace", "units"),
++          exec,
++          fetchImpl: async () => {
++            fetched += 1;
++            throw new Error("宽限期内不得 fetch");
++          },
++        }),
++      ),
++    );
++    expect(cap.result).toBe(0);
++    expect(fetched).toBe(0);
++    expect(cap.errors.join("\n")).toContain(String(WATCHDOG_GRACE_SECONDS));
++  });
++
++  it("健康（200+ok:true）：计数清除 rc 0，stderr 留健康痕", async () => {
++    const cfg = cfgFor("probe-healthy");
++    const { exec, calls } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 0 },
++    ]);
++    await writePid(cfg.stateDir, WATCHDOG_GRACE_SECONDS * 1000 + 60_000); // 宽限外
++    const cap = await captureConsole(() =>
++      watchdogProbeCommand(
++        cfg,
++        probeDeps({
++          stateDir: cfg.stateDir,
++          unitDir: path.join(TEST_ROOT, "probe-healthy", "units"),
++          exec,
++          fetchImpl: async () => new Response(JSON.stringify({ ok: true, version: "dev", uptime: 1 }), { status: 200 }),
++        }),
++      ),
++    );
++    expect(cap.result).toBe(0);
++    expect(calls.length).toBe(1);
++    expect(cap.errors.join("\n")).toContain("healthy");
++  });
++
++  it("首次无响应（超时）：计数文件=1，不重启", async () => {
++    const cfg = cfgFor("probe-first-fail");
++    const { exec, calls } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 0 },
++    ]);
++    await writePid(cfg.stateDir, WATCHDOG_GRACE_SECONDS * 1000 + 60_000);
++    const cap = await captureConsole(() =>
++      watchdogProbeCommand(
++        cfg,
++        probeDeps({
++          stateDir: cfg.stateDir,
++          unitDir: path.join(TEST_ROOT, "probe-first-fail", "units"),
++          exec,
++          fetchImpl: async () => {
++            const e = new Error("The operation was aborted due to timeout");
++            (e as { name: string }).name = "TimeoutError";
++            throw e;
++          },
++        }),
++      ),
++    );
++    expect(cap.result).toBe(0);
++    expect(await readFile(path.join(cfg.stateDir, "watchdog-fails"), "utf8")).toBe("1");
++    expect(calls.length).toBe(1); // 无 restart
++    expect(cap.errors.join("\n")).toContain("timeout"); // R-sv4 分类留痕
++  });
++
++  it(`连续第 ${WATCHDOG_FAIL_THRESHOLD} 次无响应：exec 执行 systemctl --user restart + 计数清除`, async () => {
++    const cfg = cfgFor("probe-restart");
++    const { exec, calls } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 0 },
++    ]);
++    await writePid(cfg.stateDir, WATCHDOG_GRACE_SECONDS * 1000 + 60_000);
++    await mkdir(cfg.stateDir, { recursive: true });
++    await writeFile(path.join(cfg.stateDir, "watchdog-fails"), "1", "utf8"); // 上轮已败 1 次
++    const cap = await captureConsole(() =>
++      watchdogProbeCommand(
++        cfg,
++        probeDeps({
++          stateDir: cfg.stateDir,
++          unitDir: path.join(TEST_ROOT, "probe-restart", "units"),
++          exec,
++          fetchImpl: async () => {
++            throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" });
++          },
++        }),
++      ),
++    );
++    expect(cap.result).toBe(0);
++    expect(calls[1]).toEqual(["systemctl", "--user", "restart", SERVICE_UNIT_NAMES.daemon]);
++    await expect(readFile(path.join(cfg.stateDir, "watchdog-fails"), "utf8")).rejects.toThrow();
++    expect(cap.errors.join("\n")).toContain("restart");
++  });
++
++  it("响应但体异常（非 JSON / ok≠true）：事件循环存活判 ok 清零 + stderr 分类留痕（R-sv4）", async () => {
++    for (const [name, responder] of [
++      ["non-json", async () => new Response("not-json", { status: 200 })],
++      ["ok-mismatch", async () => new Response(JSON.stringify({ ok: false }), { status: 200 })],
++      ["http-500", async () => new Response(JSON.stringify({ error: { code: "INTERNAL" } }), { status: 500 })],
++    ] as const) {
++      const cfg = cfgFor(`probe-anomaly-${name}`);
++      const { exec } = makeSystemctlFake([
++        { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 0 },
++      ]);
++      await writePid(cfg.stateDir, WATCHDOG_GRACE_SECONDS * 1000 + 60_000);
++      const failsFile = path.join(cfg.stateDir, "watchdog-fails");
++      await mkdir(cfg.stateDir, { recursive: true });
++      await writeFile(failsFile, "1", "utf8"); // 既有计数应被清零
++      const cap = await captureConsole(() =>
++        watchdogProbeCommand(
++          cfg,
++          probeDeps({
++            stateDir: cfg.stateDir,
++            unitDir: path.join(TEST_ROOT, `probe-anomaly-${name}`, "units"),
++            exec,
++            fetchImpl: responder,
++          }),
++        ),
++      );
++      expect(cap.result).toBe(0);
++      await expect(readFile(failsFile, "utf8")).rejects.toThrow(); // 有应答=存活 → 清零
++      expect(cap.errors.join("\n")).toContain(name); // R-sv4：原因分类入 stderr
++    }
++  });
++
++  it("计数文件损坏：stderr 留痕按 0 处理（对齐 daemon.pid 陈旧清除先例，非静默）", async () => {
++    const cfg = cfgFor("probe-corrupt-count");
++    const { exec, calls } = makeSystemctlFake([
++      { match: ["systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT_NAMES.daemon], code: 0 },
++    ]);
++    await writePid(cfg.stateDir, WATCHDOG_GRACE_SECONDS * 1000 + 60_000);
++    await mkdir(cfg.stateDir, { recursive: true });
++    await writeFile(path.join(cfg.stateDir, "watchdog-fails"), "not-a-number", "utf8");
++    const cap = await captureConsole(() =>
++      watchdogProbeCommand(
++        cfg,
++        probeDeps({
++          stateDir: cfg.stateDir,
++          unitDir: path.join(TEST_ROOT, "probe-corrupt-count", "units"),
++          exec,
++          fetchImpl: async () => {
++            throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
++          },
++        }),
++      ),
++    );
++    expect(cap.result).toBe(0);
++    expect(cap.errors.join("\n")).toContain("watchdog-fails"); // 留痕含路径
++    expect(await readFile(path.join(cfg.stateDir, "watchdog-fails"), "utf8")).toBe("1"); // 按 0 起算 → 本轮 1
++    expect(calls.length).toBe(1); // 未重启
++  });
++});
++
++/* ───── T3-05/T3-06 登记项①：daemonCommand 生产装配挂载 GoalHost ───── */
++
++describe("daemonCommand 生产 GoalHost 装配（登记项①：/goals 不再 501）", () => {
++  it(
++    "真进程 daemon：GET /goals（带 token）→ 200 []（装配前为 501 GOAL_HOST_DISABLED）；/health 含 actives",
++    async () => {
++      const port = await freeTcpPort();
++      const stateDir = path.join(TEST_ROOT, "daemon-wiring");
++      const env = {
++        ...process.env,
++        CODEARTS_BRIDGE_STATE_DIR: stateDir,
++        CODEARTS_BRIDGE_DAEMON_URL: `http://127.0.0.1:${port}`,
++        // 显式 structured：装配路径走 selectTransport 显式分支，测试全程零外部进程
++        //（GoalHost 挂载本身只在目标 tick 时才用传输；本用例不建目标）。
++        CODEARTS_BRIDGE_TRANSPORT: "structured",
++      };
++      const proc = Bun.spawn({
++        cmd: [process.execPath, "src/cli.ts", "daemon"],
++        cwd: PLUGIN_ROOT,
++        env,
++        stdout: "pipe",
++        stderr: "pipe",
++      });
++      try {
++        const reader = proc.stdout.getReader();
++        const decoder = new TextDecoder();
++        let seen = "";
++        const deadline = Date.now() + 5000;
++        for (;;) {
++          if (Date.now() > deadline) throw new Error("daemon 前台启动超时（未见到监听行）");
++          const { done, value } = await reader.read();
++          if (done) break;
++          seen += decoder.decode(value, { stream: true });
++          if (seen.includes("监听")) break;
++        }
++        const token = (await readFile(path.join(stateDir, "daemon-token"), "utf8")).trim();
++
++        const health = await fetch(`http://127.0.0.1:${port}/health`);
++        expect(health.status).toBe(200);
++        const healthBody = (await health.json()) as Record<string, unknown>;
++        expect(healthBody["actives"]).toBe(0);
++
++        const goals = await fetch(`http://127.0.0.1:${port}/goals`, {
++          headers: { authorization: `Bearer ${token}` },
++        });
++        expect(goals.status).toBe(200); // 装配前：501 GOAL_HOST_DISABLED
++        expect(await goals.json()).toEqual([]);
++
++        proc.kill("SIGINT");
++        expect(await proc.exited).toBe(0);
++      } finally {
++        try {
++          proc.kill(9);
++        } catch {
++          // 进程已退出：清理为无操作
++        }
++      }
++    },
++    20000,
++  );
++});
++
++describe("CLI 分派（service 命令组）", () => {
++  it("main([\"service\"]) 无子命令 → rc 2 未知用法；既有未知命令行为不变", async () => {
++    expect(await main(["service"])).toBe(2);
++    expect(await main(["frobnicate"])).toBe(2);
++  });
++});

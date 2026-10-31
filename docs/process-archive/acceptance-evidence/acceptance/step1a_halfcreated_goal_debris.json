@@ -1,0 +1,15 @@
+{
+  "goalId": "gmvw7hkg5-e09351e1",
+  "objective": "在当前目录创建文件 hello-bridge.txt，内容为一行文字：codearts-bridge 真机验收 OK，然后结束",
+  "verify": [
+    "test -f hello-bridge.txt && grep -q \"真机验收 OK\" hello-bridge.txt"
+  ],
+  "phase": "active",
+  "rounds": 0,
+  "steps": [],
+  "strikes": 0,
+  "injected": [],
+  "lastProgressAt": 1793439357125,
+  "workdir": "/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/.tmp/acceptance/workdir",
+  "maxRounds": 8
+}

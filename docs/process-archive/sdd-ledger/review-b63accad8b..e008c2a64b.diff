@@ -1,0 +1,134 @@
+# Review package: b63accad8b..e008c2a64b
+
+## Commits
+e008c2a64b codearts-bridge(T1-03): 修复评审发现 — createNodeExec stderr 溢出与 stdout 同构（合并计数→EXEC_OUTPUT_OVERFLOW+补测试） — I1
+
+## Files changed
+ plugins/codearts-bridge/src/core/install.ts  | 32 +++++++++++++++++-----------
+ plugins/codearts-bridge/test/install.test.ts | 18 ++++++++++++++++
+ 2 files changed, 38 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/install.ts b/plugins/codearts-bridge/src/core/install.ts
+index f94f6abcec..a9948e840e 100644
+--- a/plugins/codearts-bridge/src/core/install.ts
++++ b/plugins/codearts-bridge/src/core/install.ts
+@@ -116,37 +116,45 @@ export function createNodeExec(opts: NodeExecOptions = {}): Exec {
+         };
+ 
+         timer = setTimeout(() => {
+           settleFail(
+             new BridgeError("EXEC_TIMEOUT", `命令超时（>${timeoutMs}ms）已强制终止：cmd=${cmd.join(" ")}`, {
+               remediation: "检查目标二进制是否挂起；若持续超时请上报审计日志",
+             }),
+           );
+         }, timeoutMs);
+ 
+-        const onChunk = (chunk: unknown) => {
++        // I1 修复（评审裁定）：两流同构——stdout 与 stderr 共用合并计数（头注契约
++        // "stdout+stderr 合并计数"），任一时刻超限 → settleFail(EXEC_OUTPUT_OVERFLOW)
++        // + SIGKILL，与 stdout 原路径完全一致（含单次 settle 守卫）。
++        // 此前 stderr 溢出仅静默截断、从不报错，属禁止的静默兜底。
++        const overflowFail = () =>
++          settleFail(
++            new BridgeError(
++              "EXEC_OUTPUT_OVERFLOW",
++              `命令输出超过上限（>${maxOutputBytes} 字节，stdout+stderr 合并计数）已强制终止：cmd=${cmd.join(" ")}`,
++            ),
++          );
++        /** 合并计数并判定超限；返回 false 表示已溢出（该 chunk 及后续 chunk 一律不拼接）。 */
++        const withinLimit = (chunk: unknown): boolean => {
+           bytes += (chunk as Buffer).length;
+           if (bytes > maxOutputBytes) {
+-            settleFail(
+-              new BridgeError(
+-                "EXEC_OUTPUT_OVERFLOW",
+-                `命令输出超过上限（>${maxOutputBytes} 字节）已强制终止：cmd=${cmd.join(" ")}`,
+-              ),
+-            );
+-            return;
++            overflowFail();
++            return false;
+           }
+-          stdout += (chunk as Buffer).toString("utf8");
++          return true;
+         };
+-        child.stdout?.on("data", onChunk);
++        child.stdout?.on("data", (chunk: unknown) => {
++          if (withinLimit(chunk)) stdout += (chunk as Buffer).toString("utf8");
++        });
+         child.stderr?.on("data", (chunk: unknown) => {
+-          bytes += (chunk as Buffer).length;
+-          if (bytes <= maxOutputBytes) stderr += (chunk as Buffer).toString("utf8");
++          if (withinLimit(chunk)) stderr += (chunk as Buffer).toString("utf8");
+         });
+         child.on("error", (e: Error) => {
+           if (settled) return;
+           settled = true;
+           if (timer !== undefined) clearTimeout(timer);
+           reject(e); // spawn 层失败原样上抛（调用方决定语义）
+         });
+         child.on("close", (code) => {
+           settleResolve({ code: code ?? -1, stdout, stderr }); // null=被信号杀死 → -1（非零即可判定失败）
+         });
+diff --git a/plugins/codearts-bridge/test/install.test.ts b/plugins/codearts-bridge/test/install.test.ts
+index 74878aec98..23ccd666bf 100644
+--- a/plugins/codearts-bridge/test/install.test.ts
++++ b/plugins/codearts-bridge/test/install.test.ts
+@@ -1,20 +1,21 @@
+ /**
+  * T1-03 安装状态探测测试（bun:test）。
+  *
+  * 纪律（主控裁定 R-a/R-c/R-d/R-e）：
+  * - 绝不真跑 codearts 二进制：exec 一律注入 fake（唯一例外用 /bin/sh 脚本测真实 exec 原语）；
+  * - 绝不触碰真实 HOME：cfg 经 loadConfig 注入 .tmp/install-test/ 下的绝对路径；
+  * - probeInstall 只读状态采集：业务态以字段如实表达（不抛业务错）；
+  *   FS 意外错误（非 ENOENT）与配置文件损坏 → 显式抛 BridgeError；
+  * - afterAll 清理临时目录（用后即删）。
+  */
++import { existsSync } from "node:fs";
+ import { afterAll, beforeEach, describe, expect, it } from "bun:test";
+ import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+ import * as path from "node:path";
+ import { loadConfig } from "../src/core/config";
+ import { BridgeError } from "../src/core/errors";
+ import { sha256File } from "../src/core/fsx";
+ import { createNodeExec, probeInstall } from "../src/core/install";
+ import type { BridgeConfig } from "../src/core/config";
+ import {
+   BIN_CONTENT,
+@@ -348,17 +349,34 @@ describe("createNodeExec（默认 exec 原语；真实进程仅用 /bin/sh，绝
+   it("输出超限（maxOutputBytes 可配）→ 抛 BridgeError(EXEC_OUTPUT_OVERFLOW)", async () => {
+     const exec = createNodeExec({ timeoutMs: 5000, maxOutputBytes: 8 });
+     const err: unknown = await exec.run(["sh", "-c", "printf '0123456789abcdef'"]).then(
+       () => null,
+       (e: unknown) => e,
+     );
+     expect(err).toBeInstanceOf(BridgeError);
+     expect((err as { code?: string }).code).toBe("EXEC_OUTPUT_OVERFLOW");
+   });
+ 
++  it("stderr 溢出（stderr 输出超过 maxOutputBytes）→ 抛 BridgeError(EXEC_OUTPUT_OVERFLOW) 且进程被强制终止", async () => {
++    const marker = path.join(TEST_ROOT, "stderr-overflow-marker");
++    const exec = createNodeExec({ timeoutMs: 5000, maxOutputBytes: 8 });
++    const err: unknown = await exec
++      .run(["sh", "-c", `printf '0123456789abcdef' >&2; sleep 0.5; touch '${marker}'`])
++      .then(
++        () => null,
++        (e: unknown) => e,
++      );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("EXEC_OUTPUT_OVERFLOW");
++    // 进程已被 SIGKILL：若未被终止，超限后的残留语句将在 ~0.5s 后写出标记文件；
++    // 等待超过该窗口后确认标记不存在（旧实现失败形态：stderr 溢出被静默吞掉、进程善终）
++    await new Promise((r) => setTimeout(r, 1200));
++    expect(existsSync(marker)).toBe(false);
++  });
++
+   it("正常捕获 stdout 与退出码", async () => {
+     const exec = createNodeExec({ timeoutMs: 5000 });
+     const result = await exec.run(["sh", "-c", "printf '26.10.9'; exit 3"]);
+     expect(result.code).toBe(3);
+     expect(result.stdout).toBe("26.10.9");
+   });
+ });

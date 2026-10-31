@@ -1,0 +1,668 @@
+# Review package: 53c10ed6..b73ae61ff0
+
+## Commits
+b73ae61ff0 codearts-bridge(T3-02): 完成协议移植 — 契约/步骤解析/回显守卫/ANSI 边界，对齐 22 用例语义
+
+## Files changed
+ plugins/codearts-bridge/src/core/goal/protocol.ts | 349 ++++++++++++++++++++++
+ plugins/codearts-bridge/test/protocol.test.ts     | 296 ++++++++++++++++++
+ 2 files changed, 645 insertions(+)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/goal/protocol.ts b/plugins/codearts-bridge/src/core/goal/protocol.ts
+new file mode 100644
+index 0000000000..06849e9f3f
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/goal/protocol.ts
+@@ -0,0 +1,349 @@
++/**
++ * /goal 完成协议——纯函数模块（T3-02，自 codeartsGUI 逐条移植）。
++ *
++ * 语义源（逐条搬运，分歧清单见 task-15-report.md）：
++ * - `codeartsGUI/src/goalprotocol.cpp`：stripAnsi 状态机、标记正则与校验、
++ *   contract/resume/continue 文案模板（逐字保留）；
++ * - `codeartsGUI/src/goalrunner.cpp`：stripInjectionEcho 逐行剔除、kEchoGuardMs=3000；
++ * - `codeartsGUI/CHANGELOG.md` v0.2.5/v0.2.6：注入回显误判修复、ESC[? 私有标记
++ *   消费修复、hasRealContent 逐字符 isLetterOrNumber + CJK 区间（抗心跳/静态重绘）。
++ *
++ * 裁定落点：
++ * - R-pg1（逐条搬运）：22 个 goalrunner 用例语义逐条对应 test/protocol.test.ts
++ *   （用例名以【源用例N】注明）；纯状态机/时序语义（看门狗计时、重试引擎、
++ *   验收编排）落 T3-03 runner，本模块只提供其协议面。
++ * - R-pg2（纯函数）：本模块不 import 传输/FS/时钟；时间相关语义（回显守卫 3s
++ *   窗口）以 ECHO_GUARD_MS 常量 + 调用方注入时刻表达，保持可测。
++ *
++ * 调用方顺序契约（对齐 C++ GoalRunner::feed，T3-03 必须遵守）：
++ *   1) `stripInjectionEcho(raw, recentInjections)` 剔除自身注入回显；
++ *   2) `parseProgress(已剥离文本)` 解析步骤/完成标记；
++ *   3) 若 `nowMs - injectedAtMs < ECHO_GUARD_MS`，作废解析结果中的 done
++ *      （注入回显里的 [GOAL-DONE] 是协议说明，非 AI 申报——v0.2.5 e2e 实证）。
++ */
++/* ───── 协议常量（与 GUI 逐字一致） ───── */
++
++/** 计划标记（C++ parse 的 `\[GOAL-PLAN\]` 字面）。 */
++export const GOAL_PLAN_MARK = "[GOAL-PLAN]";
++
++/** 完成标记（C++ parse 的 `\[GOAL-DONE\]` 字面）。 */
++export const GOAL_DONE_MARK = "[GOAL-DONE]";
++
++/**
++ * 轻量续跑指令（v0.2.6 续跑语义统一）：会话活着、上下文仍在时只发这一句，
++ * 不重发全文契约；只有会话进程真死（Recovering）才重发完整断点续跑契约。
++ */
++export const CONTINUE_PROMPT = "继续完成剩余任务";
++
++/**
++ * 注入后回显守卫窗口毫秒数（C++ GoalRunner::kEchoGuardMs=3000 移植）。
++ * 窗口判断本身不在本模块（时间由调用方注入）：`nowMs - injectedAtMs < ECHO_GUARD_MS`
++ * 即守卫活跃，其间作废 done 标记（真实场景回显瞬时、AI 响应有延迟，可干净区分）。
++ */
++export const ECHO_GUARD_MS = 3000;
++
++/* ───── stripAnsi（源：goalprotocol.cpp 状态机逐分支搬运） ───── */
++
++const ESC = 0x1b;
++const BEL = 0x07;
++
++/**
++ * 剥离 ANSI/VT 转义序列（按 UTF-16 码元逐个消费，与 QChar 遍历同粒度）：
++ * - CSI（`ESC [` + 参数/中间字节 0x20-0x3F + 终结字节 0x40-0x7E）：必须先吃参数/
++ *   中间字节（含私有标记 `?`、分号、数字）再吃一个终结字节——否则 `ESC[?2026h`
++ *   会残留 "2026h" 污染内容判定与遍历（v0.2.6 修复的抗心跳失效根因）；
++ * - OSC（`ESC ]` … BEL 或 `ESC \`）：标题/剪贴板等串；
++ * - DCS/APC/PM/SOS（`ESC P/^/_/X` … `ESC \`）；
++ * - 单字符 ESC 序列（如 `ESC =` / `ESC >`）与串尾孤立 ESC：直接丢弃。
++ */
++export function stripAnsi(text: string): string {
++  const out: string[] = [];
++  const n = text.length;
++  let i = 0;
++  while (i < n) {
++    if (text.charCodeAt(i) !== ESC) {
++      out.push(text[i] as string);
++      i += 1;
++      continue;
++    }
++    // ESC 已消费：判别后续序列类型
++    if (i + 1 >= n) break; // 串尾孤立 ESC：丢弃
++    const k = text.charCodeAt(i + 1);
++    if (k === 0x5b) {
++      // '['：CSI——先吃参数/中间字节，再吃一个终结字节；无终结字节则吃到串尾
++      i += 2;
++      while (i < n) {
++        const ch = text.charCodeAt(i);
++        if (ch >= 0x20 && ch <= 0x3f) {
++          i += 1; // 参数/中间字节（含 ?、;、数字）
++          continue;
++        }
++        if (ch >= 0x40 && ch <= 0x7e) {
++          i += 1; // 终结字节
++        }
++        break;
++      }
++    } else if (k === 0x5d) {
++      // ']'：OSC——至 BEL 或 ESC \（ST）
++      i += 2;
++      while (i < n) {
++        const ch = text.charCodeAt(i);
++        if (ch === BEL) {
++          i += 1;
++          break;
++        }
++        if (ch === ESC && i + 1 < n && text.charCodeAt(i + 1) === 0x5c) {
++          i += 2;
++          break;
++        }
++        i += 1;
++      }
++    } else if (k === 0x50 || k === 0x5e || k === 0x5f || k === 0x58) {
++      // P ^ _ X：DCS/APC/PM/SOS——至 ST
++      i += 2;
++      while (i < n) {
++        const ch = text.charCodeAt(i);
++        if (ch === ESC && i + 1 < n && text.charCodeAt(i + 1) === 0x5c) {
++          i += 2;
++          break;
++        }
++        i += 1;
++      }
++    } else {
++      // 单字符 ESC 序列：直接丢弃
++      i += 2;
++    }
++  }
++  return out.join("");
++}
++
++/* ───── hasRealContent（v0.2.6 教训：逐字符判定，空白/标点不算内容） ───── */
++
++/** CJK 表意文字区间（码点）：显式收录常用四段（与正则属性互为补充，口径见头注）。 */
++const CJK_RANGES: ReadonlyArray<readonly [number, number]> = [
++  [0x3400, 0x4dbf], // CJK 扩展 A
++  [0x4e00, 0x9fff], // CJK 统一表意文字
++  [0xf900, 0xfaff], // CJK 兼容表意文字
++  [0x20000, 0x2a6df], // CJK 扩展 B
++];
++
++/** 单字符判定：ASCII 字母/数字快路径 + CJK 区间 + Unicode 字母/数字属性（等价 QChar::isLetterOrNumber）。 */
++function isLetterOrNumberChar(ch: string): boolean {
++  const cp = ch.codePointAt(0);
++  if (cp === undefined) return false;
++  if ((cp >= 0x30 && cp <= 0x39) || (cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a)) {
++    return true;
++  }
++  for (const [lo, hi] of CJK_RANGES) {
++    if (cp >= lo && cp <= hi) return true;
++  }
++  return /\p{L}|\p{N}/u.test(ch);
++}
++
++/**
++ * 判断一段（可能混有转义序列的）终端输出是否含"真实内容"：
++ * 先 stripAnsi，再逐字符（按 Unicode 码点）检查是否出现字母或数字（含 CJK）。
++ * 纯控制序列、转轮帧（`-`/`|` 等标点）、退格、空白 → false；中文/字母/数字 → true。
++ * v0.2.6 教训：以"有文字输出"判活会被静态重绘与控制帧永久欺骗，必须逐字符判定。
++ */
++export function hasRealContent(text: string): boolean {
++  const clean = stripAnsi(text);
++  for (const ch of clean) {
++    if (isLetterOrNumberChar(ch)) return true;
++  }
++  return false;
++}
++
++/* ───── parseProgress（源：goalprotocol.cpp parse 正则逐条搬运） ───── */
++
++/** 步骤行解析结果的单个步骤（title 已剔除 "| 推荐方案: …" 尾巴并 trim）。 */
++export interface ParsedStep {
++  /** 步骤序号（1 基）。 */
++  n: number;
++  /** 步骤描述。 */
++  title: string;
++}
++
++/** parseProgress 结果：计划清单（可选）、步骤聚合、完成标记。 */
++export interface ParsedProgress {
++  /** [GOAL-PLAN] 后的编号步骤清单；无标记或未给出清单 → undefined。 */
++  plan?: string[];
++  /** 文中全部 [GOAL-STEP n/N] 行（按出现序聚合）。 */
++  steps: ParsedStep[];
++  /** 是否出现 [GOAL-DONE]（真伪由调用方剥离回显并施加守卫后裁定）。 */
++  done: boolean;
++}
++
++/**
++ * 步骤行正则（C++ 同源）：`[GOAL-STEP n/N] 标题 [| 推荐方案: 摘要]`。
++ * 容错：n/N 斜杠周围允许空白；推荐方案冒号全/半角皆可。推荐方案捕获组在 TS
++ * 接口中不外露（任务书固定 steps 形状，只取 n/title；title 语义与 C++ 一致）。
++ */
++const GOAL_STEP_RE =
++  /\[GOAL-STEP\s+(\d+)\s*\/\s*(\d+)\]\s*([^|\r\n]*?)(?:\s*\|\s*推荐方案[:：]\s*(.+))?\s*$/gm;
++
++/** 整行编号清单项（plan 提取的后续行形态：契约规定"每步一行 N. 描述"）。 */
++const PLAN_ITEM_LINE_RE = /^\s*(\d+)\s*[.、)．]\s*(.+?)\s*$/;
++
++/** 行内编号项起点（plan 提取的首行形态：如 "[GOAL-PLAN] 1.调研 2.实现 3.测试"）。 */
++const PLAN_ITEM_START_RE = /(?:^|(?<=\s))(\d+)\s*[.、)．]\s*/g;
++
++/**
++ * 提取 [GOAL-PLAN] 之后的编号步骤清单：
++ * - 首行（与标记同行余文）：按行内编号项切分（数字编号 + . 、 ) ．之一 + 空白）；
++ * - 后续行：整行编号项逐行收集，首个非编号行截止；
++ * - 提取结果为空 → 返回空数组（由调用方决定 plan 是否缺省）。
++ * 注：编号形似项（如"共 3.5 万"）可能被误认为编号项——plan 为提示性字段，
++ * 权威进度以 [GOAL-STEP] 标记为准（C++ 从不解析计划清单，此为 TS 侧扩展，
++ * 分歧已登记）。
++ */
++function extractPlanItems(rest: string): string[] {
++  const items: string[] = [];
++  const lines = rest.split("\n");
++
++  // 首行：行内编号项（记录每个编号项的标题起点与下一项起点，切片收集）
++  const first = lines[0];
++  if (first !== undefined) {
++    const titleStarts: number[] = [];
++    const matchStarts: number[] = [];
++    const re = new RegExp(PLAN_ITEM_START_RE.source, "g"); // 每次新建，防 lastIndex 串扰
++    let m: RegExpExecArray | null = re.exec(first);
++    while (m !== null) {
++      matchStarts.push(m.index);
++      titleStarts.push(m.index + m[0].length);
++      m = re.exec(first);
++    }
++    for (let idx = 0; idx < titleStarts.length; idx += 1) {
++      const end = idx + 1 < matchStarts.length ? matchStarts[idx + 1] as number : first.length;
++      const title = first.slice(titleStarts[idx] as number, end).trim();
++      if (title !== "") items.push(title);
++    }
++  }
++
++  // 后续行：整行编号项，首个非编号行截止
++  for (let li = 1; li < lines.length; li += 1) {
++    const lm = PLAN_ITEM_LINE_RE.exec(lines[li] as string);
++    if (lm === null) break;
++    const title = lm[2];
++    if (title !== undefined) {
++      const t = title.trim();
++      if (t !== "") items.push(t);
++    }
++  }
++  return items;
++}
++
++/**
++ * 解析一段终端文本中的 /goal 协议标记（对齐 C++ GoalProtocol::parse）：
++ * - 内部先 stripAnsi（容忍标记被转义序列打断；编码规范化是传输层职责，协议层不碰）；
++ * - done：文本含 [GOAL-DONE] 字面（**调用方必须先剥离注入回显**——契约/续跑文案
++ *   自身含该字样，v0.2.5 实证不剥离必误判）；
++ * - steps：全部合法步骤行（校验同 C++：tot > 0 且 1 ≤ n ≤ tot，非法行整体忽略）；
++ * - plan：[GOAL-PLAN] 后的编号清单（无标记或未给清单 → undefined）。
++ */
++export function parseProgress(text: string): ParsedProgress {
++  const clean = stripAnsi(text);
++  const done = clean.includes(GOAL_DONE_MARK);
++
++  const steps: ParsedStep[] = [];
++  for (const m of clean.matchAll(GOAL_STEP_RE)) {
++    const cur = Number.parseInt(m[1] as string, 10);
++    const tot = Number.parseInt(m[2] as string, 10);
++    if (!(tot > 0) || cur < 1 || cur > tot) continue; // 非法步骤行整体忽略（C++ 同语义）
++    const title = m[3];
++    if (title === undefined) continue; // 正则保证存在；防御 noUncheckedIndexedAccess
++    steps.push({ n: cur, title: title.trim() });
++  }
++
++  let plan: string[] | undefined;
++  const planIdx = clean.indexOf(GOAL_PLAN_MARK);
++  if (planIdx >= 0) {
++    const items = extractPlanItems(clean.slice(planIdx + GOAL_PLAN_MARK.length));
++    if (items.length > 0) plan = items;
++  }
++
++  return plan === undefined ? { steps, done } : { plan, steps, done };
++}
++
++/* ───── stripInjectionEcho（源：goalrunner.cpp 逐行剔除，逐条搬运） ───── */
++
++/**
++ * 把已注入的文本从原始输出里整段剔除，避免其回显被当作 AI 输出解析
++ * （C++ GoalRunner::stripInjectionEcho 同语义）：
++ * - 对每段注入文本按行拆分（跳过空行），行 trim 后长度 ≥6 的片段从输出中
++ *   全部移除（QString::remove 语义 = 移除所有出现）；<6 字符的短行不剔除
++ *   （防误伤正常文本）；
++ * - 注入可能多行且终端会重排，故逐行剔除以抗换行差异；跨行断词的局部回显
++ *   由 ECHO_GUARD_MS 守卫窗口兜住（两层防御，均与 GUI 一致）。
++ * `injected` 由调用方维护为"最近注入"（C++ 侧上限 6 条；窗口策略属 runner）。
++ */
++export function stripInjectionEcho(text: string, injected: string[]): string {
++  let out = text;
++  for (const inj of injected) {
++    if (inj === "") continue;
++    for (const line of inj.split("\n")) {
++      if (line === "") continue; // Qt::SkipEmptyParts 同语义
++      const key = line.trim();
++      if (key.length >= 6) out = out.split(key).join("");
++    }
++  }
++  return out;
++}
++
++/* ───── 契约文案构造（源：goalprotocol.cpp contract/resume 模板逐字搬运） ───── */
++
++/** 执行协议条款（C++ contractPrompt 逐字保留；FR-7 三标记 + FR-8 决策自主权）。 */
++const CONTRACT_PROTOCOL_BODY = `
++
++执行协议（严格遵守）：
++1. 先输出一行：[GOAL-PLAN] 然后列出编号步骤清单（每步一行 N. 描述）。
++2. 每开始一步输出：[GOAL-STEP n/N] 步骤描述 | 推荐方案: 你检索并整理出的最优方案摘要。
++3. 遇到方案选型/技术决策，先用 websearch/webfetch 检索，整理出最优解与理由，然后直接采用推荐方案继续执行，不要停下来询问我。
++4. 小步推进：每完成一步立即开始下一步，不要等待确认。
++5. 全部完成且验收命令通过后，最后一行输出：[GOAL-DONE]
++
++现在开始，先输出 [GOAL-PLAN]。
++`;
++
++/**
++ * 构造 /goal 目标契约（首条注入）：目标全文 + 验收命令 + 三标记协议 + 决策自主权条款。
++ * 对齐 C++ contractPrompt：验收命令为空（或全空白）时省略验收块；多条命令逐条
++ * 各占一行（C++ 单条 acceptance 的 TS 扩展，语义分歧已登记）。
++ *
++ * @param objective 目标全文
++ * @param verify    独立验收命令清单（每条必须独立执行并通过）
++ */
++export function buildContract(objective: string, verify: string[]): string {
++  let p = "【/goal 目标契约】\n";
++  p += `目标：${objective}\n`;
++  const cmds = verify.map((v) => v.trim()).filter((v) => v !== "");
++  for (const cmd of cmds) {
++    p += `最终验收命令（必须独立执行并通过）：${cmd}\n`;
++  }
++  p += CONTRACT_PROTOCOL_BODY;
++  return p;
++}
++
++/** buildResumeContract 的状态形状（任务书接口；lastStepTitle 未纳入，分歧已登记）。 */
++export interface ResumeState {
++  /** 目标全文（不变）。 */
++  objective: string;
++  /** 已完成步骤号清单（长度 = 已完成步数）。 */
++  doneSteps: number[];
++  /** 总步数；缺省时以已知最大完成步号近似（仅文案近似，权威进度在 runner 状态）。 */
++  totalSteps?: number;
++}
++
++/**
++ * 构造断点续跑契约（会话重建后注入）：目标 + 已完成进度 + 重列计划并从断点继续。
++ * 对齐 C++ resumePrompt 文案；doneSteps/totalSteps 缺省口径见 ResumeState 注释。
++ */
++export function buildResumeContract(state: ResumeState): string {
++  const doneCount = state.doneSteps.length;
++  const total = state.totalSteps ?? (doneCount > 0 ? Math.max(...state.doneSteps) : 0);
++  let p = "【/goal 断点续跑】此前对话中断，目标不变。\n";
++  p += `目标：${state.objective}\n`;
++  p += `进度：已完成 ${doneCount}/${total} 步`;
++  p += "\n请先重新输出 [GOAL-PLAN] 列出全部步骤，并把已完成步骤标注（完成），然后从中断处按协议继续执行（[GOAL-STEP n/N] … | 推荐方案: … → 完成后 [GOAL-DONE]）。\n";
++  return p;
++}
+diff --git a/plugins/codearts-bridge/test/protocol.test.ts b/plugins/codearts-bridge/test/protocol.test.ts
+new file mode 100644
+index 0000000000..1e8eca89fe
+--- /dev/null
++++ b/plugins/codearts-bridge/test/protocol.test.ts
+@@ -0,0 +1,296 @@
++/**
++ * T3-02 完成协议移植测试（bun:test）——语义源：codeartsGUI `tests/test_goalrunner.cpp`
++ * 的 22 用例逐条搬运。用例名以【源用例N】标注对应关系；纯状态机/时序语义（看门狗
++ * 计时、重试引擎、验收双过编排、断点落盘）落在 T3-03 runner，本文件只钉其协议面，
++ * 22 条完整映射表见 task-15-report.md。
++ *
++ * 语义对齐来源（逐条搬运依据）：
++ * - `src/goalprotocol.cpp`：stripAnsi 状态机（v0.2.6 修复：ESC[? 私有标记整体消费）、
++ *   parse 标记正则与合法性校验、contract/resume/continue 文案模板逐字保留；
++ * - `src/goalrunner.cpp`：stripInjectionEcho 逐行剔除（≥6 字符片段）、
++ *   kEchoGuardMs=3000（回显守卫窗口）；
++ * - CHANGELOG v0.2.5/v0.2.6：注入回显被误当 AI 完成、抗心跳内容判定、续跑语义统一。
++ *
++ * 本模块为纯函数测试：无传输/FS/时钟依赖（裁定 R-pg2）；时间相关语义以
++ * ECHO_GUARD_MS 常量 + 调用方注入时刻的方式表达（T3-03 runner 消费）。
++ */
++import { describe, expect, it } from "bun:test";
++import {
++  CONTINUE_PROMPT,
++  ECHO_GUARD_MS,
++  GOAL_DONE_MARK,
++  GOAL_PLAN_MARK,
++  buildContract,
++  buildResumeContract,
++  hasRealContent,
++  parseProgress,
++  stripAnsi,
++  stripInjectionEcho,
++} from "../src/core/goal/protocol";
++
++/* ───── 常量 ───── */
++
++describe("协议常量（与 GUI 逐字一致）", () => {
++  it("【源用例18/19/30 协议面】GOAL_PLAN_MARK/GOAL_DONE_MARK/CONTINUE_PROMPT 常量值", () => {
++    expect(GOAL_PLAN_MARK).toBe("[GOAL-PLAN]");
++    expect(GOAL_DONE_MARK).toBe("[GOAL-DONE]");
++    // 停续语义（源用例18）：轻量"继续完成剩余任务"，非重发全文契约
++    expect(CONTINUE_PROMPT).toBe("继续完成剩余任务");
++  });
++
++  it("【源用例19 协议面】ECHO_GUARD_MS=3000（C++ kEchoGuardMs 移植；窗口判断由调用方注入时刻表达）", () => {
++    expect(ECHO_GUARD_MS).toBe(3000);
++  });
++
++  it("【源用例18】CONTINUE_PROMPT 不含全文契约字样（非重启：无'目标契约'、不承载目标复述）", () => {
++    expect(CONTINUE_PROMPT.includes("目标契约")).toBe(false);
++    expect(CONTINUE_PROMPT.includes("最终验收命令")).toBe(false);
++  });
++});
++
++/* ───── 契约构造（C++ contractPrompt/resumePrompt 逐字搬运） ───── */
++
++describe("buildContract（源：GoalProtocol::contractPrompt）", () => {
++  it("【源用例1】契约含目标、验收命令、[GOAL-PLAN]/[GOAL-DONE] 说明与自主推进条款", () => {
++    const c = buildContract("实现登录页", ["pytest -q"]);
++    expect(c.includes("【/goal 目标契约】")).toBe(true);
++    expect(c.includes("目标：实现登录页")).toBe(true);
++    expect(c.includes("最终验收命令（必须独立执行并通过）：pytest -q")).toBe(true);
++    // FR-7 三标记协议说明（五条执行协议逐字保留）
++    expect(c.includes("1. 先输出一行：[GOAL-PLAN] 然后列出编号步骤清单（每步一行 N. 描述）。")).toBe(true);
++    expect(c.includes("[GOAL-STEP n/N] 步骤描述 | 推荐方案:")).toBe(true);
++    expect(c.includes("5. 全部完成且验收命令通过后，最后一行输出：[GOAL-DONE]")).toBe(true);
++    // FR-8：决策自主权条款（检索→自荐→直行，不停下来问）
++    expect(c.includes("不要停下来询问我")).toBe(true);
++    expect(c.includes("现在开始，先输出 [GOAL-PLAN]。")).toBe(true);
++  });
++
++  it("【源用例4 协议面】验收命令独立下发：多条命令逐条各占一行", () => {
++    const c = buildContract("目标", ["make test", "bun run typecheck"]);
++    expect(c.includes("最终验收命令（必须独立执行并通过）：make test\n")).toBe(true);
++    expect(c.includes("最终验收命令（必须独立执行并通过）：bun run typecheck\n")).toBe(true);
++  });
++
++  it("空验收清单省略验收块（对齐 C++ acceptance.trimmed().isEmpty() 语义）", () => {
++    const c = buildContract("目标", []);
++    expect(c.includes("最终验收命令")).toBe(false);
++    // 协议说明仍在
++    expect(c.includes(GOAL_PLAN_MARK)).toBe(true);
++  });
++
++  it("空白验收项跳过（逐项 trimmed 判空，同 C++ 口径）", () => {
++    const c = buildContract("目标", ["  ", "\t", "make test"]);
++    expect(c.includes("make test")).toBe(true);
++    expect(c.match(/最终验收命令/g)?.length).toBe(1);
++  });
++
++  it("【源用例22 前提】契约原文自身含 [GOAL-DONE] 字样——parseProgress 直接解析必置 done（回显守卫存在的原因，钉死）", () => {
++    const c = buildContract("目标Z", ["true"]);
++    expect(parseProgress(c).done).toBe(true);
++  });
++});
++
++describe("buildResumeContract（源：GoalProtocol::resumePrompt）", () => {
++  it("【源用例7/13 协议面】断点续跑契约：含目标、进度 x/y、重列 [GOAL-PLAN] 与 [GOAL-DONE] 指引", () => {
++    const r = buildResumeContract({ objective: "目标", doneSteps: [1, 2], totalSteps: 4 });
++    expect(r.includes("【/goal 断点续跑】此前对话中断，目标不变。")).toBe(true);
++    expect(r.includes("目标：目标")).toBe(true);
++    expect(r.includes("进度：已完成 2/4 步")).toBe(true);
++    expect(r.includes("请先重新输出 [GOAL-PLAN] 列出全部步骤，并把已完成步骤标注（完成）")).toBe(true);
++    expect(r.includes("完成后 [GOAL-DONE]")).toBe(true);
++  });
++
++  it("totalSteps 缺省 → 以已知最大完成步号近似总数（仅文案近似，权威进度在 T3-03 runner 状态）", () => {
++    expect(buildResumeContract({ objective: "g", doneSteps: [1, 2, 3] }).includes("进度：已完成 3/3 步")).toBe(true);
++    expect(buildResumeContract({ objective: "g", doneSteps: [] }).includes("进度：已完成 0/0 步")).toBe(true);
++  });
++});
++
++/* ───── parseProgress（源：GoalProtocol::parse） ───── */
++
++describe("parseProgress：步骤行与完成标记", () => {
++  it("【源用例2】步骤行 \"[GOAL-STEP 1/3] 调研 | 推荐方案: 检索最优解\" 解析出 n=1/title=调研；title 不含推荐方案", () => {
++    const p = parseProgress("[GOAL-STEP 1/3] 调研 | 推荐方案: 检索最优解");
++    expect(p.steps.length).toBe(1);
++    expect(p.steps[0]?.n).toBe(1);
++    expect(p.steps[0]?.title).toBe("调研");
++    expect(p.done).toBe(false);
++  });
++
++  it("【源用例2】plan 提取：\"[GOAL-PLAN] 1.调研 2.实现 3.测试\" 行内编号清单", () => {
++    const p = parseProgress("[GOAL-PLAN] 1.调研 2.实现 3.测试");
++    expect(p.plan).toEqual(["调研", "实现", "测试"]);
++  });
++
++  it("plan 提取：多行编号清单（契约规定的'每步一行 N. 描述'形态），非编号行截止", () => {
++    const p = parseProgress("[GOAL-PLAN]\n1. 调研需求\n2. 实现功能\n3. 测试验收\n以上请确认。");
++    expect(p.plan).toEqual(["调研需求", "实现功能", "测试验收"]);
++  });
++
++  it("无 [GOAL-PLAN] → plan 为 undefined（可选字段不产空数组）", () => {
++    expect(parseProgress("普通输出").plan).toBeUndefined();
++    expect(parseProgress("[GOAL-PLAN] 后面没写清单").plan).toBeUndefined();
++  });
++
++  it("【源用例3】[GOAL-DONE] 置 done=true；无标记文本 done=false", () => {
++    expect(parseProgress("[GOAL-DONE] 全部完成").done).toBe(true);
++    expect(parseProgress("工作中，尚未完成").done).toBe(false);
++  });
++
++  it("【源用例11 协议面】普通推进文字：有内容但无标记 → steps 空、done=false（是否推进由 runner 编排）", () => {
++    const p = parseProgress("filler output line without markers 0123");
++    expect(p.steps.length).toBe(0);
++    expect(p.done).toBe(false);
++  });
++
++  it("步骤行校验：n/tot 非法（cur<1、cur>tot、tot<=0）不产步骤（C++ tot>0 && 1<=cur<=tot 同语义）", () => {
++    expect(parseProgress("[GOAL-STEP 0/3] 零号").steps.length).toBe(0);
++    expect(parseProgress("[GOAL-STEP 4/3] 越界").steps.length).toBe(0);
++    expect(parseProgress("[GOAL-STEP 1/0] 零总步").steps.length).toBe(0);
++  });
++
++  it("【源用例12】含 timeout 字样的进度标记不误判：标记照常解析（进度优先语义的协议面）", () => {
++    const p = parseProgress("[GOAL-STEP 1/2] 配置请求 timeout 参数 | 推荐方案: x");
++    expect(p.steps.length).toBe(1);
++    expect(p.steps[0]?.title).toBe("配置请求 timeout 参数");
++    expect(p.done).toBe(false);
++  });
++
++  it("多步骤行聚合：全部 [GOAL-STEP] 按出现序收集（C++ 有状态只取首个，TS 无状态聚合——分歧见报告）", () => {
++    const p = parseProgress("[GOAL-STEP 1/2] 调研 | 推荐方案: A\n[GOAL-STEP 2/2] 实现 | 推荐方案: B");
++    expect(p.steps.length).toBe(2);
++    expect(p.steps[0]?.n).toBe(1);
++    expect(p.steps[1]?.n).toBe(2);
++    expect(p.steps[1]?.title).toBe("实现");
++  });
++
++  it("容错与 C++ 正则一致：全角冒号'推荐方案：'、斜杠周围空格 '[GOAL-STEP 2/ 3]'", () => {
++    const p1 = parseProgress("[GOAL-STEP 2/3] 实现 | 推荐方案：直接编码");
++    expect(p1.steps[0]?.title).toBe("实现");
++    const p2 = parseProgress("[GOAL-STEP 2/ 3] 实现");
++    expect(p2.steps[0]?.n).toBe(2);
++    expect(p2.steps[0]?.title).toBe("实现");
++  });
++
++  it("ANSI 打断标记不破坏解析（C++ parse 内部先 stripAnsi 同语义）", () => {
++    expect(parseProgress("[GOAL-DO\x1b[2KNE] 完成").done).toBe(true);
++    expect(parseProgress("[GOAL-STEP 1\x1b[?25h/2] 实现").steps.length).toBe(1);
++  });
++});
++
++/* ───── stripAnsi（源：GoalProtocol::stripAnsi 状态机逐分支搬运） ───── */
++
++describe("stripAnsi：ANSI/VT 转义剥离", () => {
++  it("【源用例14/17·v0.2.6 回归】ESC[?25h / ESC[?2026h 私有标记整体消费，无 '2026h'/'25h' 残留", () => {
++    expect(stripAnsi("\x1b[?25h")).toBe("");
++    expect(stripAnsi("\x1b[?2026h")).toBe("");
++    expect(stripAnsi("a\x1b[?2026hb")).toBe("ab");
++    expect(stripAnsi("\x1b[0;3H\x1b[?25h\x1b[0m")).toBe("");
++  });
++
++  it("CSI 完整语法：参数/中间字节先吃、终结字节收尾；无终结字节消费至串尾（禁残留污染）", () => {
++    expect(stripAnsi("\x1b[1;31mred\x1b[0m")).toBe("red");
++    expect(stripAnsi("\x1b[2J\x1b[Hcleared")).toBe("cleared");
++    expect(stripAnsi("x\x1b[12")).toBe("x"); // 截断的 CSI：参数被吞至串尾
++  });
++
++  it("OSC：BEL(0x07) 终结与 ST(ESC\\) 终结；未终结消费至串尾", () => {
++    expect(stripAnsi("\x1b]0;window title\x07ok")).toBe("ok");
++    expect(stripAnsi("\x1b]2;title\x1b\\ok")).toBe("ok");
++    expect(stripAnsi("\x1b]0;未终结尾部")).toBe("");
++  });
++
++  it("DCS/APC/PM/SOS 至 ST 终结；单字符 ESC 序列丢弃；串尾孤立 ESC 丢弃", () => {
++    expect(stripAnsi("\x1bP1;2qdata\x1b\\ok")).toBe("ok"); // DCS
++    expect(stripAnsi("\x1b^privacy\x1b\\ok")).toBe("ok"); // PM
++    expect(stripAnsi("a\x1b=b")).toBe("ab"); // 单字符 ESC =
++    expect(stripAnsi("abc\x1b")).toBe("abc"); // 串尾孤立 ESC
++  });
++
++  it("普通文本原样保留（含中文/数字/换行/标点）", () => {
++    expect(stripAnsi("中文 123\nnext | line")).toBe("中文 123\nnext | line");
++  });
++});
++
++/* ───── hasRealContent（v0.2.6 教训：逐字符 isLetterOrNumber + CJK 区间） ───── */
++
++describe("hasRealContent：内容判定", () => {
++  it("【源用例14】抗心跳：纯 CSI/私有标记串（转轮+心跳控制帧）→ false", () => {
++    expect(hasRealContent("\x1b[?2026h\x1b[0;3H\x1b[?25h\x1b[0m")).toBe(false);
++  });
++
++  it("【源用例17/20/21】转轮帧剥离后为标点/符号 → false（逐字符判定的教训所在）", () => {
++    expect(hasRealContent("\x1b[2K\r-")).toBe(false);
++    expect(hasRealContent("\x1b[2K\r|")).toBe(false);
++    expect(hasRealContent("\x1b[3;6H\x1b[?25h")).toBe(false);
++  });
++
++  it("纯退格符/空白/标点 → false", () => {
++    expect(hasRealContent("\b")).toBe(false);
++    expect(hasRealContent("  \t\n")).toBe(false);
++    expect(hasRealContent("···")).toBe(false);
++    expect(hasRealContent("——……")).toBe(false);
++  });
++
++  it("【源用例20】CJK 与字母数字 → true（中文必须算真实内容）", () => {
++    expect(hasRealContent("会话已停止 · interrupted")).toBe(true);
++    expect(hasRealContent("调研")).toBe(true);
++    expect(hasRealContent("step 1")).toBe(true);
++    expect(hasRealContent("42")).toBe(true);
++    expect(hasRealContent("ＡＢ全角")).toBe(true);
++  });
++
++  it("【源用例15/16 协议面】真实推进文字 → true（是否'有新步进'由 runner 据此判活）", () => {
++    expect(hasRealContent("running ... step progress text 5")).toBe(true);
++    expect(hasRealContent("filler output line without markers 0123")).toBe(true);
++  });
++});
++
++/* ───── stripInjectionEcho（源：GoalRunner::stripInjectionEcho 逐行剔除） ───── */
++
++describe("stripInjectionEcho：注入回显剥离", () => {
++  it("【源用例22·e2e 回归】注入契约回显（含 [GOAL-DONE] 字样）剥离后 parseProgress 不产生 done", () => {
++    const contract = buildContract("目标Z", ["true"]);
++    const echoed = contract; // 终端把注入文本原样回显
++    // 不剥离必误判（v0.2.5 修复前的一启动即 Verifying 缺陷，钉死病灶）
++    expect(parseProgress(echoed).done).toBe(true);
++    // 剥离后干净
++    const cleaned = stripInjectionEcho(echoed, [contract]);
++    const p = parseProgress(cleaned);
++    expect(p.done).toBe(false);
++    expect(p.steps.length).toBe(0);
++    expect(p.plan).toBeUndefined();
++  });
++
++  it("【源用例5 协议面】验收失败重发文案回显（含'完成后再次输出 [GOAL-DONE]'）剥离后 done=false", () => {
++    const refeed =
++      "验收未通过：1 个断言失败\n请分析失败原因，修正后继续执行，完成后再次输出 [GOAL-DONE]。";
++    const cleaned = stripInjectionEcho(`噪声前缀\n${refeed}\n噪声后缀`, [refeed]);
++    expect(parseProgress(cleaned).done).toBe(false);
++  });
++
++  it("逐行剔除抗换行重排：注入文本每行(≥6 字符)片段全移除；<6 字符行不动（C++ key.size()>=6 同语义）", () => {
++    const injected = "第一行注入内容较长\n短行\n第二行注入内容也长";
++    const cleaned = stripInjectionEcho(
++      "前缀 第一行注入内容较长 中缀 短行 保留 后缀 第二行注入内容也长",
++      [injected],
++    );
++    expect(cleaned.includes("第一行注入内容较长")).toBe(false);
++    expect(cleaned.includes("第二行注入内容也长")).toBe(false);
++    expect(cleaned.includes("短行")).toBe(true);
++  });
++
++  it("空注入清单/空注入串原样返回（C++ isEmpty skip 同语义）", () => {
++    expect(stripInjectionEcho("abc", [])).toBe("abc");
++    expect(stripInjectionEcho("abc", [""])).toBe("abc");
++  });
++
++  it("【源用例19 组合语义】注入回显剥离后，真实 AI 输出的步骤与完成标记完好（feed 顺序契约：先剥离再解析）", () => {
++    const contract = buildContract("完成任务", ["true"]);
++    const real = "[GOAL-STEP 1/2] 步骤一 | 推荐方案: A\n[GOAL-DONE] 全部完成";
++    const p = parseProgress(stripInjectionEcho(`${contract}\n${real}`, [contract]));
++    expect(p.steps.length).toBe(1);
++    expect(p.steps[0]?.title).toBe("步骤一");
++    expect(p.done).toBe(true);
++  });
++});

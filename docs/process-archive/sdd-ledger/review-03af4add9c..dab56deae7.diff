@@ -1,0 +1,144 @@
+# Review package: 03af4add9c..dab56deae7
+
+## Commits
+dab56deae7 codearts-bridge(T1-07): 修复评审发现 — WAL busy 分支两连接回归测试 + 失败审计 schema 对齐 + 删除恒真断言 — I1/M27/M28
+
+## Files changed
+ plugins/codearts-bridge/src/core/health.ts   |  1 +
+ plugins/codearts-bridge/test/hygiene.test.ts | 48 ++++++++++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/health.ts b/plugins/codearts-bridge/src/core/health.ts
+index ddc9302ca0..ce703e997f 100644
+--- a/plugins/codearts-bridge/src/core/health.ts
++++ b/plugins/codearts-bridge/src/core/health.ts
+@@ -836,20 +836,21 @@ export async function applyHygiene(
+       }
+     }
+   } catch (e) {
+     // 失败审计尽力而为：审计写失败不得掩盖主错误（同 fsx.cleanupTmp 纪律）
+     await appendInstallAudit(cfg, {
+       ...auditBase,
+       result: "failed",
+       error: e instanceof BridgeError ? `${e.code}: ${e.message}` : String(e),
+       purged,
+       rotated,
++      rotatedCount: rotated.length,
+       walCheckpoint: walResult,
+     }).catch(() => undefined);
+     throw e;
+   }
+ 
+   await appendInstallAudit(cfg, {
+     ...auditBase,
+     result: "ok",
+     purged,
+     rotated,
+diff --git a/plugins/codearts-bridge/test/hygiene.test.ts b/plugins/codearts-bridge/test/hygiene.test.ts
+index 8e8cd12954..6458ac769c 100644
+--- a/plugins/codearts-bridge/test/hygiene.test.ts
++++ b/plugins/codearts-bridge/test/hygiene.test.ts
+@@ -12,21 +12,21 @@
+  * - 审计：apply 写 hygiene.apply（删除清单/checkpoint 结果/轮转数）；plan 纯只读不写审计
+  *   （R-hy4）；
+  * - 边界守卫：候选须位于 <kernelDataDir>/log 内（realpath + 前缀双重校验），越界/
+  *   符号链接外逃/名单不符/目标失踪一律显式报错且不删除；WAL 目标缺失不静默建库
+  *   （R-hy3 + 禁静默兜底）。
+  *
+  * 隔离纪律（主控裁定）：绝不触碰真实 HOME；FS 落点全在 .tmp/hygiene-test/，清理见钩子。
+  */
+ import { afterAll, beforeEach, describe, expect, it } from "bun:test";
+ import { Database } from "bun:sqlite";
+-import { mkdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
++import { mkdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+ import * as path from "node:path";
+ import { loadConfig } from "../src/core/config";
+ import type { BridgeConfig } from "../src/core/config";
+ import { BridgeError } from "../src/core/errors";
+ import {
+   HYGIENE_DEFAULT_LOGS_KEEP,
+   HYGIENE_DEFAULT_OLDER_THAN_DAYS,
+   applyHygiene,
+   planHygiene,
+ } from "../src/core/health";
+@@ -228,20 +228,65 @@ describe("applyHygiene wal-checkpoint", () => {
+ 
+     // 审计记录 checkpoint 结果
+     const lines = await readAuditLines(cfg.stateDir);
+     const entry = lines.find((l) => l["kind"] === "hygiene.apply");
+     const wal = entry?.["walCheckpoint"] as Record<string, unknown> | undefined;
+     expect(wal).toBeDefined();
+     expect(wal?.["busy"]).toBe(0);
+     expect(wal?.["dbPath"]).toBe(dbPath);
+   });
+ 
++  it("两连接并发：A 持未提交读事务 → WAL_CHECKPOINT_BUSY 且 WAL 不变；A COMMIT 后重跑 → 成功且 WAL 趋零", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "wal-busy", "cli-data");
++    await mkdir(kernelDataDir, { recursive: true });
++    const dbPath = path.join(kernelDataDir, "opencode.db");
++    const walPath = `${dbPath}-wal`;
++
++    // 连接 A：WAL 模式写入数据并保持打开；随后 BEGIN+未提交 SELECT 持读事务
++    const dbA = new Database(dbPath);
++    dbA.run("PRAGMA journal_mode=WAL");
++    dbA.run("PRAGMA wal_autocheckpoint=0");
++    dbA.run("CREATE TABLE t(x TEXT)");
++    dbA.run("INSERT INTO t VALUES ('busy-case')");
++    const walBefore = (await stat(walPath)).size;
++    expect(walBefore).toBeGreaterThan(0);
++    dbA.run("BEGIN");
++    dbA.query("SELECT x FROM t").all(); // 读事务开启且不提交 → 阻塞 TRUNCATE checkpoint
++
++    // ① busy 分支回归：apply 显式抛 WAL_CHECKPOINT_BUSY，且 WAL 字节不变（未误报成功）
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "wal-checkpoint" }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("WAL_CHECKPOINT_BUSY");
++    }
++    expect((await stat(walPath)).size).toBe(walBefore);
++
++    // ② A 提交后重跑：checkpoint 成功，WAL 趋零，数据完整
++    dbA.run("COMMIT");
++    const cfg = cfgOf();
++    const res = await applyHygiene(cfg, [{ kind: "wal-checkpoint" }], { kernelDataDir });
++    expect(res.applied).toContain("wal-checkpoint");
++    expect((await stat(walPath)).size).toBe(0);
++    expect(dbA.query("SELECT x FROM t").get()).toEqual({ x: "busy-case" });
++    dbA.close();
++
++    // 审计：第一次失败留痕（含错误码）+ 第二次成功，各恰一条
++    const lines = await readAuditLines(cfg.stateDir);
++    const entries = lines.filter((l) => l["kind"] === "hygiene.apply");
++    expect(entries.length).toBe(2);
++    expect(entries[0]?.["result"]).toBe("failed");
++    expect(String(entries[0]?.["error"])).toContain("WAL_CHECKPOINT_BUSY");
++    expect(entries[1]?.["result"]).toBe("ok");
++  });
++
+   it("db 缺失 → WAL_DB_MISSING 显式抛出，且不得静默创建空库文件", async () => {
+     const kernelDataDir = path.join(TEST_ROOT, "wal-missing", "cli-data");
+     await mkdir(kernelDataDir, { recursive: true });
+     // 手工放一个 WAL 但没有 db（异常态）：apply 必须显式报错而非打开时静默建库
+     await writeFile(path.join(kernelDataDir, "opencode.db-wal"), "orphan-wal", "utf8");
+     const dbPath = path.join(kernelDataDir, "opencode.db");
+     try {
+       await applyHygiene(cfgOf(), [{ kind: "wal-checkpoint" }], { kernelDataDir });
+       expect.unreachable();
+     } catch (e) {
+@@ -437,13 +482,12 @@ describe("参数校验", () => {
+   });
+ });
+ 
+ /* ───── realpath 基础设施自检（测试自身可靠性） ───── */
+ 
+ describe("测试基础设施", () => {
+   it("makeDumpFixture 的时间戳生效（老转储确超 30 天）", async () => {
+     const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "fixture-selfcheck"));
+     const st = await stat(path.join(kernelDataDir, "log", "dump-old.heapsnapshot"));
+     expect(Date.now() - st.mtimeMs).toBeGreaterThan(30 * DAY_MS);
+-    expect(await realpath(kernelDataDir)).toBe(await realpath(kernelDataDir));
+   });
+ });

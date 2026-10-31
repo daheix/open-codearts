@@ -1,0 +1,1101 @@
+# Review package: 48c7db34c0..ce8a360bf2
+
+## Commits
+ce8a360bf2 codearts-bridge(T3-04): 持久化与对账 — 原子状态/审计留痕/幂等恢复 — createDaemon 增启动对账缝
+
+## Files changed
+ plugins/codearts-bridge/src/core/goal/state.ts | 502 +++++++++++++++++++++++++
+ plugins/codearts-bridge/src/daemon.ts          |  28 +-
+ plugins/codearts-bridge/test/state.test.ts     | 447 ++++++++++++++++++++++
+ 3 files changed, 975 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/goal/state.ts b/plugins/codearts-bridge/src/core/goal/state.ts
+new file mode 100644
+index 0000000000..5b5b348314
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/goal/state.ts
+@@ -0,0 +1,502 @@
++/**
++ * 目标状态持久化与对账（T3-04）——守护崩溃/重启后的恢复真相源。
++ *
++ * 主控裁定落点（progress.md Task 17 派发记录，2026-10-31）：
++ * - R-st1（持久化）：saveGoal 经 atomicWriteFile（同目录 tmp+rename，T1-04 原语）
++ *   原子落盘；loadGoals 容错——损坏 JSON（解析失败或结构校验失败）→ 该目标就地
++ *   标记 blocked 落盘 + 审计（fatal），**不崩守护**；加载器返回"有效目标 + blocked
++ *   诊断列表"。任务书的简化签名 `Promise<GoalState[]>` 按裁定改为 `LoadedGoals`
++ *   （报告登记；主控裁定原话："加载器返回有效目标+blocked 诊断列表"）。
++ * - R-st2（审计）：appendAudit 追加写 `<stateDir>/audit/<goalId>.jsonl`，单文件
++ *   串行锁（per-file Promise 链互斥，同 GoalRunner.enqueue 模式）防并发交错；
++ *   auditId 形如 `<goalId>-<seq>`，seq 以"锁内读现有行数 +1"推导，严格单调无空洞。
++ * - R-st3（对账幂等，Review-Focus-4）：reconcile 只驱动 active 目标——
++ *     · 会话活：injected 空 → 重锚注入契约（R-st4）；指纹在场 → 不重发；
++ *     · 会话死：重建会话（transport.start 复用旧 ref）+ 断点契约注入；
++ *     · 连续两次 reconcile 同目标 → 第二次不注入（injected 指纹去重 +
++ *       per-stateDir 互斥序列化，并发调用同样只注入一次）；
++ *     · 重建失败 → 该目标 blocked + fatal 审计。
++ * - R-st4（对账重锚分支，T3-03 报告登记项的复用）：会话在场但 injected 空 →
++ *   重发契约；有 injected 指纹 → 不重发。契约选择判据与 runner.tickLocked 第 5 步
++ *   同源：有进度（steps>0）发 buildResumeContract，否则发 buildContract。
++ *
++ * 与 runner 的分工边界（T3-03 携带指针的落实）：
++ * - reconcile 不构造 GoalRunner、不做 tick 决策（本模块无时钟/阈值依赖）——只把
++ *   持久化状态修复到"可被 T3-05 宿主 tick 驱动"的形态，必要时直接注入契约；
++ *   对账期注入不设回显守卫（deafUntil 是 runner 运行态，回显剥离靠持久化的
++ *   injected 指纹，协议层已保证）。
++ * - sawStepMarker/pendingVerify/pendingRetry 不持久化（task-16-report 登记）：
++ *   对账"有进度"判据退化为 steps.length>0。
++ * - 重建全新会话时重置 injected 为本次契约（runner bootstrapLocked 注释登记的
++ *   期待："对账若重建了全新会话，由对账层清空 injected 以触发重锚"）——新会话
++ *   无旧回显上下文，旧指纹不再适用；同时 rounds+1（注入计一轮）、strikes+1
++ *   （与 runner.restartLocked 同口径：重启计入循环保护；阈值告警属 runner 域，
++ *   对账层只计数不告警）。
++ * - 无会话的 active 目标跳过：首 tick 的 bootstrapLocked 自举即可，无需对账动作。
++ * - paused/blocked 目标跳过：人工管辖态，恢复驱动只能经 runner.resume()
++ *   （对账若自动复活 paused 目标即违背"人工暂停"语义）。
++ *
++ * 显式决策登记（非兜底，均有依据）：
++ * - loadGoals 对缺失的 goals/ 目录返回空态（ENOENT=首启无目标，"缺失属正常态"
++ *   的判官在本层——与 readAksk 同风格）；其他读错误显式上抛。
++ * - 容错面 = 单个目标文件的内容损坏（解析/结构失败）；FS 级故障（标记 blocked
++ *   时写失败等）显式上抛——盘都写不进时"带病继续"只会掩盖故障。
++ * - 损坏标记采用"审计先行 → 覆写为 blocked 最小状态"：原损坏内容不保留（审计
++ *   事件携带 reason 与截断 preview 供根因定位），复载幂等稳定（不再重复报损坏）。
++ * - blocked 最小状态的 objective 为空串：不可从损坏文件伪造目标文本（禁编造）；
++ *   驱动面由 GoalRunner 构造校验（objective 非空）天然拦截，持久层只保证结构。
++ * - 结构校验容忍未知多余字段（前向兼容：新版本守护写的字段旧版本可读）；必需
++ *   字段缺失/错型一律判损坏——静默丢字段才是兜底。
++ * - goalId 白名单 `^[A-Za-z0-9][A-Za-z0-9._-]*$` 且 ≤128 字符：goalId 直接参与
++ *   文件路径构造，白名单是路径穿越的显式拒绝面（非法 id 永不落盘/审计）。
++ * - 重建路径 transport.start 透传 deps.cfg（可为 undefined）：与 RunnerDeps.cfg
++ *   同款已裁定接口缺口（"缺省透传 undefined，由具体传输自行显式校验报错"），
++ *   此处禁止伪造配置。
++ */
++
++import { chmod, mkdir, open as fsOpen, readFile, readdir } from "node:fs/promises";
++import type { FileHandle } from "node:fs/promises";
++import * as path from "node:path";
++import type { BridgeConfig } from "../config";
++import { BridgeError } from "../errors";
++import { atomicWriteFile, errnoOf } from "../fsx";
++import type { CodeartsTransport, SessionRef } from "../transport/types";
++import { buildContract, buildResumeContract } from "./protocol";
++import type { GoalPhase, GoalState } from "./runner";
++
++/* ───── 常量与校验 ───── */
++
++/** goalId 白名单（路径安全 + 语义约束；头注"显式决策"条目）。 */
++const GOAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
++/** goalId 长度上限（文件名卫生；合法 id 均为生成器产物，远短于此）。 */
++const GOAL_ID_MAX = 128;
++/** 损坏内容进审计证据的截断长度（防超大垃圾文件撑爆审计流）。 */
++const CORRUPT_PREVIEW_CHARS = 200;
++
++/** 校验 goalId（路径安全白名单）；非法抛 GOAL_ID_INVALID。 */
++function requireValidGoalId(goalId: string): string {
++  if (typeof goalId !== "string" || goalId.length === 0 || goalId.length > GOAL_ID_MAX || !GOAL_ID_RE.test(goalId)) {
++    throw new BridgeError(
++      "GOAL_ID_INVALID",
++      `goalId 非法（须匹配 ${GOAL_ID_RE.source} 且 ≤${GOAL_ID_MAX} 字符）：${JSON.stringify(goalId)}`,
++      { remediation: "goalId 由 /goal 创建方生成（<时间戳>-<随机串> 形态）；禁止含路径分隔符等字符。" },
++    );
++  }
++  return goalId;
++}
++
++/** 合法阶段集合（与 runner.GoalPhase 同源；此处独立列出防 import 循环依赖值面）。 */
++const PHASES: readonly GoalPhase[] = ["active", "paused", "blocked", "complete", "stopped"];
++
++/** 结构校验失败统一出口（load 判损坏 / save 拒写入共用同一判据）。 */
++function invalidState(detail: string): BridgeError {
++  return new BridgeError("GOAL_STATE_INVALID", `目标状态结构非法：${detail}`, {
++    remediation: "状态文件可能损坏或被外部改写；删除对应 goals/<goalId>.json 即放弃该目标进度。",
++  });
++}
++
++function isPlainObject(v: unknown): v is Record<string, unknown> {
++  return typeof v === "object" && v !== null && !Array.isArray(v);
++}
++
++function isStringArray(v: unknown): v is string[] {
++  return Array.isArray(v) && v.every((x) => typeof x === "string");
++}
++
++function isStepArray(v: unknown): v is number[] {
++  return Array.isArray(v) && v.every((x) => typeof x === "number" && Number.isInteger(x) && x >= 1);
++}
++
++function isNonNegInt(v: unknown): v is number {
++  return typeof v === "number" && Number.isInteger(v) && v >= 0;
++}
++
++/**
++ * 结构校验（写入与读入同构；只查形状不查语义——objective 非空等驱动语义由
++ * GoalRunner 构造校验把关，blocked 标记态允许空 objective，见头注）。
++ * 未知多余字段容忍（前向兼容，头注登记）。失败抛 GOAL_STATE_INVALID。
++ */
++function validateGoalState(v: unknown, expectedGoalId: string): GoalState {
++  if (!isPlainObject(v)) throw invalidState("须为对象");
++  const g = v as Record<string, unknown>;
++  if (typeof g.goalId !== "string") throw invalidState(`goalId 须为字符串：${JSON.stringify(g.goalId)}`);
++  requireValidGoalId(g.goalId);
++  if (g.goalId !== expectedGoalId) {
++    throw invalidState(`goalId 与文件名不一致：content=${JSON.stringify(g.goalId)} file=${JSON.stringify(expectedGoalId)}`);
++  }
++  if (typeof g.objective !== "string") throw invalidState("objective 须为字符串");
++  if (!isStringArray(g.verify)) throw invalidState("verify 须为字符串数组");
++  if (typeof g.phase !== "string" || !(PHASES as readonly string[]).includes(g.phase)) {
++    throw invalidState(`phase 须为 ${PHASES.join("/")} 之一：${JSON.stringify(g.phase)}`);
++  }
++  if (!isNonNegInt(g.rounds)) throw invalidState("rounds 须为非负整数");
++  if (!isStepArray(g.steps)) throw invalidState("steps 须为正整数数组");
++  if (!isNonNegInt(g.strikes)) throw invalidState("strikes 须为非负整数");
++  if (!isStringArray(g.injected)) throw invalidState("injected 须为字符串数组");
++  if (typeof g.lastProgressAt !== "number" || !Number.isFinite(g.lastProgressAt)) {
++    throw invalidState("lastProgressAt 须为有限数字");
++  }
++  if (g.session !== undefined) {
++    if (!isPlainObject(g.session)) throw invalidState("session 须为对象");
++    const s = g.session as Record<string, unknown>;
++    if (s.kind !== "structured" && s.kind !== "pty") throw invalidState(`session.kind 须为 structured/pty：${JSON.stringify(s.kind)}`);
++    if (typeof s.id !== "string" || s.id.length === 0) throw invalidState("session.id 须为非空字符串");
++  }
++  if (g.auditId !== undefined && typeof g.auditId !== "string") throw invalidState("auditId 须为字符串");
++  return v as unknown as GoalState;
++}
++
++/* ───── 路径布局（<stateDir>/goals、<stateDir>/audit） ───── */
++
++function goalsDirOf(stateDir: string): string {
++  return path.join(stateDir, "goals");
++}
++
++function auditDirOf(stateDir: string): string {
++  return path.join(stateDir, "audit");
++}
++
++function goalFileOf(stateDir: string, goalId: string): string {
++  return path.join(goalsDirOf(stateDir), `${requireValidGoalId(goalId)}.json`);
++}
++
++function auditFileOf(stateDir: string, goalId: string): string {
++  return path.join(auditDirOf(stateDir), `${requireValidGoalId(goalId)}.jsonl`);
++}
++
++/** 确保子目录存在且 mode 0700（mkdir 的 mode 被 umask 掩蔽，故创建后显式 chmod；同 config.ensureStateDirs 纪律）。 */
++async function ensureDir(dir: string): Promise<void> {
++  await mkdir(dir, { recursive: true, mode: 0o700 });
++  await chmod(dir, 0o700);
++}
++
++/* ───── saveGoal / loadGoals（R-st1） ───── */
++
++/**
++ * 原子持久化单个目标状态（R-st1）：同构结构校验 → atomicWriteFile（同目录
++ * tmp+rename，崩溃/失败时旧文件原位，绝无半写）。并发写同一目标：最后一次
++ * rename 获胜（随机临时件名互不冲突，无交错损坏面）。
++ */
++export async function saveGoal(stateDir: string, s: GoalState): Promise<void> {
++  validateGoalState(s, s.goalId); // 写侧同构校验：拒绝持久化非法形状（禁静默截断/补缺）
++  await ensureDir(goalsDirOf(stateDir));
++  await atomicWriteFile(goalFileOf(stateDir, s.goalId), `${JSON.stringify(s, null, 2)}\n`);
++}
++
++/** 损坏目标诊断（loadGoals 返回的 blocked 列表元素）。 */
++export interface CorruptedGoal {
++  /** goalId（从文件名提取；文件名非法时为原始名，仅作诊断展示）。 */
++  goalId: string;
++  /** 状态文件绝对路径。 */
++  file: string;
++  /** 损坏原因（解析错误消息 / 结构校验详情 / 读错误 errno）。 */
++  reason: string;
++  /** 已落审计流的事件号；goalId 非法（无法安全构造路径）时缺省。 */
++  auditId?: string;
++}
++
++/** loadGoals 返回：有效目标 + blocked 诊断列表（R-st1 裁定形状）。 */
++export interface LoadedGoals {
++  goals: GoalState[];
++  corrupted: CorruptedGoal[];
++}
++
++/**
++ * 载入全部目标状态（R-st1 容错）：逐文件 读→解析→结构校验；内容损坏者就地
++ * 标记 blocked（审计先行 → 覆写落盘，头注"显式决策"条目），不中断其余目标、
++ * 不崩守护。文件名非法者仅出诊断（无法安全落盘/审计）。复载幂等：blocked
++ * 标记态本身合法，再次加载不再报损坏。
++ */
++export async function loadGoals(stateDir: string): Promise<LoadedGoals> {
++  const dir = goalsDirOf(stateDir);
++  let names: string[];
++  try {
++    names = await readdir(dir);
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return { goals: [], corrupted: [] }; // 首启无目标：正常空态
++    throw new BridgeError(
++      "FS_READ_FAILED",
++      `读取目标目录失败：path=${dir} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++      { cause: e },
++    );
++  }
++  const goals: GoalState[] = [];
++  const corrupted: CorruptedGoal[] = [];
++  for (const name of names.sort()) {
++    if (!name.endsWith(".json")) continue; // 非本层管辖文件（留痕/临时件等）视而不见
++    const file = path.join(dir, name);
++    const stem = name.slice(0, -".json".length);
++    try {
++      const raw = await readFile(file, "utf8");
++      goals.push(validateGoalState(JSON.parse(raw), stem));
++    } catch (e) {
++      corrupted.push(await markCorrupt(stateDir, file, stem, e));
++    }
++  }
++  return { goals, corrupted };
++}
++
++/** 单文件损坏处置：审计（可审计时）→ 覆写为 blocked 最小态；返回诊断。 */
++async function markCorrupt(stateDir: string, file: string, stem: string, e: unknown): Promise<CorruptedGoal> {
++  // 原因自定位：携带路径（存在性信息）+ 原错误消息，审计事件可独立溯源。
++  const reason = `path=${file} ${e instanceof Error ? e.message : String(e)}`;
++  if (!GOAL_ID_RE.test(stem) || stem.length > GOAL_ID_MAX) {
++    // 非法 goalId：不能构造安全路径，禁止落盘/审计——仅诊断（头注显式决策）。
++    return { goalId: stem, file, reason };
++  }
++  const preview =
++    e instanceof SyntaxError || e instanceof BridgeError
++      ? (await readFile(file, "utf8").catch(() => undefined))?.slice(0, CORRUPT_PREVIEW_CHARS)
++      : undefined; // 读错误（EACCES 等）无内容可预览
++  const auditId = await appendAudit(stateDir, stem, {
++    type: "goal.error",
++    goalId: stem,
++    at: Date.now(),
++    kind: "state-corrupt",
++    fatal: true,
++    reason,
++    ...(preview !== undefined ? { preview } : {}),
++  });
++  await saveGoal(stateDir, {
++    goalId: stem,
++    objective: "", // 不可从损坏文件伪造目标文本（禁编造；驱动面由 runner 构造校验拦截）
++    verify: [],
++    phase: "blocked",
++    rounds: 0,
++    steps: [],
++    strikes: 0,
++    injected: [],
++    lastProgressAt: Date.now(),
++    auditId,
++  });
++  return { goalId: stem, file, reason, auditId };
++}
++
++/* ───── appendAudit（R-st2） ───── */
++
++/**
++ * 串行锁表（per 审计文件绝对路径 → Promise 链尾）：并发 append 同一文件在链上
++ * 排队，消除"读行数→追加"的交错窗口。键数以目标数为上界（守护进程生命周期
++ * 内单调但有限）；链尾 Promise 恒 resolve，单次失败不断链。
++ */
++const auditLocks = new Map<string, Promise<unknown>>();
++
++/**
++ * 追加一条审计事件（R-st2）：写入 `<stateDir>/audit/<goalId>.jsonl`，行内附
++ * auditId（`<goalId>-<seq>`，seq=锁内现有行数+1，1 基）。事件对象浅展开合并，
++ * 生成的 auditId 为权威（同名键以本函数产出为准）。写后 fh.sync() 落盘——
++ * 审计是事后取证的唯一凭据，耐崩溃性与 fsx 原子写同纪律。
++ *
++ * @returns auditId（如 "g1-3"）
++ */
++export async function appendAudit(stateDir: string, goalId: string, e: object): Promise<string> {
++  requireValidGoalId(goalId);
++  if (!isPlainObject(e)) {
++    throw new BridgeError(
++      "AUDIT_EVENT_INVALID",
++      `审计事件须为普通对象（实际 ${e === null ? "null" : Array.isArray(e) ? "数组" : typeof e}）：goalId=${goalId}`,
++    );
++  }
++  const file = auditFileOf(stateDir, goalId);
++  const key = path.resolve(file);
++  const run = (auditLocks.get(key) ?? Promise.resolve()).then(
++    () => appendAuditLocked(file, goalId, e),
++    () => appendAuditLocked(file, goalId, e), // 前驱失败不连坐：本链只求互斥
++  );
++  auditLocks.set(
++    key,
++    run.then(
++      () => undefined,
++      () => undefined,
++    ),
++  );
++  return run;
++}
++
++/** 锁内临界区：读现有行数 → 定 seq → 单次写入整行 → fsync。 */
++async function appendAuditLocked(file: string, goalId: string, e: Record<string, unknown>): Promise<string> {
++  await ensureDir(path.dirname(file));
++  let lineCount = 0;
++  try {
++    const content = await readFile(file, "utf8");
++    // 行数 = 已占用的 seq 数：换行数即完整行数；无换行结尾的残行（外部改写/
++    // 极端撕裂残留）也占一号——本层写入恒带尾换行，此处只计数不解释其内容。
++    const nl = (content.match(/\n/g) ?? []).length;
++    lineCount = content.endsWith("\n") ? nl : nl + 1;
++  } catch (e) {
++    if (errnoOf(e) !== "ENOENT") {
++      throw new BridgeError(
++        "AUDIT_APPEND_FAILED",
++        `读取审计文件失败：path=${file} reason=${errnoOf(e) ?? "UNKNOWN"}`,
++        { cause: e },
++      );
++    }
++  }
++  const auditId = `${goalId}-${lineCount + 1}`;
++  const line = `${JSON.stringify({ ...e, auditId })}\n`;
++  let fh: FileHandle | undefined;
++  try {
++    fh = await fsOpen(file, "a");
++    await fh.writeFile(line, "utf8");
++    await fh.sync();
++  } catch (err) {
++    throw new BridgeError(
++      "AUDIT_APPEND_FAILED",
++      `追加审计失败：path=${file} reason=${errnoOf(err) ?? "UNKNOWN"}`,
++      { cause: err },
++    );
++  } finally {
++    await fh?.close().catch(() => undefined); // 关闭失败不掩盖主错误（仅资源回收）
++  }
++  return auditId;
++}
++
++/* ───── reconcile（R-st3 幂等 / R-st4 重锚） ───── */
++
++/** reconcile 依赖注入（任务书接口 + 已裁定 cfg 缺口，见头注）。 */
++export interface ReconcileDeps {
++  /** 目标会话传输。 */
++  transport: CodeartsTransport;
++  /** 传输配置（重建 transport.start 透传；缺省 undefined 由具体传输显式校验）。 */
++  cfg?: BridgeConfig;
++}
++
++/** reconcile 结果（R-st3：供守护/测试断言）。resumed=已恢复可驱动；blocked=等人工。 */
++export interface ReconcileResult {
++  resumed: string[];
++  blocked: string[];
++}
++
++/**
++ * 对账互斥锁（per stateDir 绝对路径 → Promise 链尾）：并发/重入 reconcile
++ * 序列化，与 injected 指纹去重共同保证"同目标不双注入"（Review-Focus-4）。
++ */
++const reconcileLocks = new Map<string, Promise<unknown>>();
++
++/**
++ * 对账恢复（守护启动时调用，T3-05 接线）：把持久化目标修复到可 tick 驱动的
++ * 形态。只处理 active 目标（终态完成、paused/blocked 人工管辖态不触碰）；
++ * 损坏目标经 loadGoals 已标 blocked，直接进 blocked 列表。
++ *
++ * 判定流（R-st3/R-st4）：
++ * - 会话活 + injected 空 → 重锚：注入契约（有进度 resume / 无进度 contract），
++ *   落盘指纹并审计 goal.inject(kind=reconcile-reanchor)；
++ * - 会话活 + 指纹在场 → 不重发（本会话已收到过注入）；
++ * - 会话死 → 重建会话（start 复用旧 ref）→ 注入断点契约 → 成功后审计
++ *   goal.restart + goal.inject(kind=reconcile-rebuild)，injected 重置为该契约
++ *   （新会话清旧指纹）、rounds+1、strikes+1；
++ * - 重建失败 → 审计 goal.error(kind=reconcile-rebuild-failed, fatal) → blocked。
++ *
++ * 错误纪律：仅"重建失败"按裁定降级为 blocked；alive 分支注入失败 / 状态层
++ * FS 故障一律显式上抛（守护启动失败可见，禁带病服务——watchdog 重启后下一轮
++ * 对账会走重建路径自愈）。
++ */
++export function reconcile(stateDir: string, deps: ReconcileDeps): Promise<ReconcileResult> {
++  const key = path.resolve(stateDir);
++  const run = (reconcileLocks.get(key) ?? Promise.resolve()).then(
++    () => reconcileLocked(stateDir, deps),
++    () => reconcileLocked(stateDir, deps),
++  );
++  reconcileLocks.set(
++    key,
++    run.then(
++      () => undefined,
++      () => undefined,
++    ),
++  );
++  return run;
++}
++
++/** 锁内主体：逐目标判定与恢复。 */
++async function reconcileLocked(stateDir: string, deps: ReconcileDeps): Promise<ReconcileResult> {
++  const { goals, corrupted } = await loadGoals(stateDir);
++  const resumed: string[] = [];
++  const blocked = corrupted.map((c) => c.goalId);
++  for (const g of goals) {
++    if (g.phase !== "active") continue; // 终态/paused/blocked：不触碰（头注分工边界）
++    if (g.session === undefined) continue; // 从未引导：首 tick bootstrap 自举，无需对账
++    const alive = await deps.transport.alive(g.session);
++    if (alive) {
++      if (g.injected.length === 0) {
++        // R-st4 重锚分支：会话在场但从未注入 → 重发契约（判据同 runner.tick 第 5 步）
++        const text = progressContractOf(g);
++        await deps.transport.inject(g.session, text);
++        g.injected = [text];
++        g.rounds += 1;
++        g.lastProgressAt = Date.now(); // 注入刷新进度时刻（runner.injectPrompt 同语义；对账层时刻源=墙钟）
++        g.auditId = await appendAudit(stateDir, g.goalId, {
++          type: "goal.inject",
++          goalId: g.goalId,
++          at: Date.now(),
++          kind: "reconcile-reanchor",
++          rounds: g.rounds,
++        });
++        await saveGoal(stateDir, g);
++      }
++      // 指纹在场 → 不重发（R-st4 后半；连续两次 reconcile 的第二次走此路径）
++      resumed.push(g.goalId);
++      continue;
++    }
++    // 会话死：重建 + 断点契约（R-st3）。仅"传输阶段失败"按裁定降级 blocked；
++    // 状态层 FS 故障（审计/落盘写失败）显式上抛——禁把 FS 故障伪装成目标 blocked。
++    // 审计只记已完成动作：start+inject 成功后才落 restart/inject 两条事件；
++    // 中途失败走 catch，仅落 rebuild-failed 一条（不预写"已重启"的假事实）。
++    let ref: SessionRef;
++    let text: string;
++    try {
++      ref = await deps.transport.start(deps.cfg as BridgeConfig, g.session);
++      text = progressContractOf(g);
++      await deps.transport.inject(ref, text);
++    } catch (e) {
++      const reason = e instanceof Error ? e.message : String(e);
++      g.phase = "blocked";
++      g.auditId = await appendAudit(stateDir, g.goalId, {
++        type: "goal.error",
++        goalId: g.goalId,
++        at: Date.now(),
++        kind: "reconcile-rebuild-failed",
++        fatal: true,
++        reason,
++      });
++      await saveGoal(stateDir, g);
++      blocked.push(g.goalId);
++      continue;
++    }
++    g.session = ref;
++    g.injected = [text]; // 重建全新会话：旧指纹清空，仅留本次契约（runner 重锚期待）
++    g.rounds += 1;
++    g.strikes += 1; // 与 runner.restartLocked 同口径：重启计入循环保护
++    g.lastProgressAt = Date.now();
++    await appendAudit(stateDir, g.goalId, {
++      type: "goal.restart",
++      goalId: g.goalId,
++      at: Date.now(),
++      reason: "reconcile-session-died",
++    });
++    g.auditId = await appendAudit(stateDir, g.goalId, {
++      type: "goal.inject",
++      goalId: g.goalId,
++      at: Date.now(),
++      kind: "reconcile-rebuild",
++      rounds: g.rounds,
++    });
++    await saveGoal(stateDir, g);
++    resumed.push(g.goalId);
++  }
++  return { resumed, blocked };
++}
++
++/**
++ * 对账契约选择（R-st3/R-st4）：有进度（持久化 steps 非空）→ 断点续跑契约；
++ * 无进度 → 全文契约。与 runner.tickLocked 第 5 步 / restartLocked 同判据同文案
++ * （sawStepMarker 为会话期瞬时态不持久化，task-16-report 登记口径）。
++ */
++function progressContractOf(g: GoalState): string {
++  const hasProgress = g.steps.length > 0;
++  return hasProgress
++    ? buildResumeContract({
++        objective: g.objective,
++        doneSteps: [...new Set(g.steps)].sort((a, b) => a - b),
++      })
++    : buildContract(g.objective, g.verify);
++}
+diff --git a/plugins/codearts-bridge/src/daemon.ts b/plugins/codearts-bridge/src/daemon.ts
+index 9b0ba1b76a..0ed7769d5f 100644
+--- a/plugins/codearts-bridge/src/daemon.ts
++++ b/plugins/codearts-bridge/src/daemon.ts
+@@ -21,53 +21,68 @@
+  *   探测不得要求凭据——systemd watchdog/监控脚本若须先读 token 才能探活，token
+  *   文件一旦损坏即探活死锁（watchdog 杀守护的判据失灵），探活通道必须零依赖；
+  *   端点只回静态摘要（版本+运行秒数），无凭据外泄面。未知路由 → 404 结构化
+  *   {error:{code:"NOT_FOUND"}}；其余一切请求（含非 GET 打 /health）一律先过鉴权
+  *   再路由——未鉴权者无从探测路由存在性，也拿不到 404 信息面。
+  * - R-d4（生命周期）：start 幂等——进行中/已完成的 start 复用同一次 listen（监督
+  *   循环与 CLI 可能重复触发 start，"拒绝"语义制造竞态脆弱点，"复用"与幂等恢复
+  *   语义一致，此处为显式选择而非兜底）；stop 关闭监听并先斩断全部 keep-alive
+  *   连接（否则活动连接令 close 回调悬挂，bun test 进程不退出）；stop 对未启动态
+  *   幂等空操作，stop 后可再次 start（token 重启复用语义的重启路径）。
++ * - R-d6（T3-04 启动对账缝）：createDaemon 可选注入 reconcileOnStart 钩子，在
++ *   token 就绪后、listen 之前以 cfg.stateDir 调用恰一次——对账失败显式拒绝
++ *   start（状态层坏即不带病服务）；钩子缺省不注入（T3-05 接线真实传输前显式
++ *   无操作——守护自身无传输可构造，伪造默认传输即兜底，禁止）。
+  *
+  * 错误纪律（仓库铁律：出错即显式报错，禁静默兜底）：
+  * - FS/listen 失败统一 BridgeError 显式上抛（DAEMON_LISTEN_FAILED /
+  *   DAEMON_TOKEN_INVALID / FS_READ_FAILED），消息含路径与原因码；
+  * - token 文件存在但为空 → DAEMON_TOKEN_INVALID（拒绝空令牌，绝不静默重新生成——
+  *   重新生成会使其他已缓存令牌的客户端静默失联，属掩盖问题的兜底行为）；
+  * - 所有 HTTP 响应（含错误）均为 application/json 结构化，无文本态响应。
+  */
+ import { randomBytes, timingSafeEqual } from "node:crypto";
+ import { chmod, readFile } from "node:fs/promises";
+ import * as http from "node:http";
+ import * as path from "node:path";
+ import type { BridgeConfig } from "./core/config";
+ import { PLUGIN_VERSION, ensureStateDirs } from "./core/config";
+ import { BridgeError } from "./core/errors";
+ import { atomicWriteFile, errnoOf } from "./core/fsx";
++import type { ReconcileResult } from "./core/goal/state";
+ 
+ /** token 文件名（位于状态根，与裁定 <stateDir>/daemon-token 一致；mode 0600）。 */
+ const TOKEN_FILE_NAME = "daemon-token";
+ 
+ /** daemonUrl 未写端口段时的默认端口（与 loadConfig 的 DEFAULT_DAEMON_URL 口径一致）。 */
+ const DEFAULT_DAEMON_PORT = 4577;
+ 
+ /** 守护句柄（任务书接口：createDaemon(cfg) 返回形态）。 */
+ export interface DaemonHandle {
+   /** 底层 HTTP server（createDaemon 时创建、未监听；测试/上层可断言其形态）。 */
+   server: http.Server;
+   /** 启动监听；幂等复用；返回实际端口（port 0 → 内核分配值）。 */
+   start(): Promise<{ port: number }>;
+   /** 停止监听并斩断全部 keep-alive 连接；未启动时空操作；之后可再次 start。 */
+   stop(): Promise<void>;
+ }
+ 
++/** 守护可选钩子（T3-04）：启动对账缝（T3-05 注入真实传输接线）。 */
++export interface DaemonHooks {
++  /**
++   * 启动对账：token 就绪后、listen 之前以 cfg.stateDir 调用恰一次；抛错即
++   * start 显式失败（R-d6：状态层坏不带病服务）。典型实现：reconcile(stateDir,
++   * { transport }) —— 传输由 T3-05 按配置选型后闭包注入。
++   */
++  reconcileOnStart?(stateDir: string): Promise<ReconcileResult>;
++}
++
+ /* ───── 配置派生（R-d1） ───── */
+ 
+ /**
+  * 从 daemonUrl 提取监听端口：端口段缺省（含协议默认端口被 URL 归一为空串）→ 4577；
+  * "0" 保留（随机端口）；其余须为 0~65535 整数，非法显式抛错。
+  * daemonUrl 的合法性与协议校验由 loadConfig 负责（唯一校验点），此处只做端口派生。
+  */
+ export function daemonPortOf(daemonUrl: string): number {
+   const url = new URL(daemonUrl); // loadConfig 已校验；形态非法属编程错误，任其抛 TypeError
+   if (url.port === "") return DEFAULT_DAEMON_PORT;
+@@ -150,22 +165,22 @@ function sendJson(res: http.ServerResponse, status: number, payload: unknown): v
+   const body = JSON.stringify(payload);
+   res.writeHead(status, {
+     "Content-Type": "application/json; charset=utf-8",
+     "Content-Length": Buffer.byteLength(body),
+   });
+   res.end(body);
+ }
+ 
+ /* ───── createDaemon（R-d1~R-d4） ───── */
+ 
+-/** 组装守护进程句柄：HTTP 路由、token 鉴权、幂等 start/stop。 */
+-export function createDaemon(cfg: BridgeConfig): DaemonHandle {
++/** 组装守护进程句柄：HTTP 路由、token 鉴权、幂等 start/stop（T3-04 增对账钩子）。 */
++export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks): DaemonHandle {
+   const port = daemonPortOf(cfg.daemonUrl); // R-d1：端口唯一来源 = daemonUrl 端口段
+   let token: string | undefined; // start() 载入；请求处理闭包读取
+   let startedAtMs: number | undefined; // uptime 基准（start 时置位）
+   let listening = false; // stop 幂等判据（listen 成功才置 true）
+   let startPromise: Promise<{ port: number }> | undefined; // start 幂等复用句柄
+ 
+   const server = http.createServer((req, res) => {
+     try {
+       const url = new URL(req.url ?? "/", "http://127.0.0.1");
+       // R-d3：仅 "GET + /health" 免鉴权（探活零依赖）；其余一律先鉴权再路由
+@@ -196,20 +211,29 @@ export function createDaemon(cfg: BridgeConfig): DaemonHandle {
+       sendJson(res, 500, { error: { code: "INTERNAL", message: String(e) } });
+     }
+   });
+ 
+   function start(): Promise<{ port: number }> {
+     // R-d4 幂等：进行中/已完成的 start 复用同一 Promise（不重复 listen）
+     if (startPromise !== undefined) return startPromise;
+     startPromise = (async () => {
+       await ensureStateDirs(cfg); // 状态根先行（token 落点；T1-02 幂等原语）
+       token = await loadOrCreateToken(cfg);
++      // R-d6：启动对账（监听建立前）：失败显式拒绝 start，不带病服务
++      if (hooks?.reconcileOnStart !== undefined) {
++        const r = await hooks.reconcileOnStart(cfg.stateDir);
++        // 守护暂无日志器（spdlog 接线属后续任务）：启动摘要走 stderr，与既有
++        // server 错误输出同通道（可见性优先）。
++        console.error(
++          `[codearts-bridge] 启动对账完成：resumed=${r.resumed.length} blocked=${r.blocked.length}`,
++        );
++      }
+       startedAtMs = Date.now();
+       await listenOnce(server, port, "127.0.0.1"); // R-d1：绑定地址恒 127.0.0.1
+       listening = true;
+       // 监听建立后的偶发 socket 错误：显式落 stderr（可见），保持守护存活
+       // （探活宿主进程崩溃会连锁打断被监督目标的续跑，属"保持运行"的显式语义而非吞错）
+       server.on("error", (e: Error) => {
+         console.error(`[codearts-bridge] 守护 server 错误（保持运行）：${e.message}`);
+       });
+       const addr = server.address();
+       if (addr === null || typeof addr === "string") {
+diff --git a/plugins/codearts-bridge/test/state.test.ts b/plugins/codearts-bridge/test/state.test.ts
+new file mode 100644
+index 0000000000..e760ca05c1
+--- /dev/null
++++ b/plugins/codearts-bridge/test/state.test.ts
+@@ -0,0 +1,447 @@
++/**
++ * T3-04 持久化与对账测试（bun:test）。
++ *
++ * 裁定依据（progress.md Task 17 派发记录）：
++ * - R-st1 持久化：saveGoal 原子写（atomicWriteFile）；loadGoals 容错——损坏
++ *   JSON → 该目标标记 blocked 落盘 + 审计（不崩守护），加载器返回有效目标 +
++ *   blocked 诊断列表（任务书简化签名按裁定改为 LoadedGoals）。
++ * - R-st2 审计：appendAudit 追加写 audit/<goalId>.jsonl，单文件串行锁防交错；
++ *   auditId 形如 <goalId>-<seq>。
++ * - R-st3 对账幂等（Review-Focus-4）：连续两次 reconcile 同目标 → 第二次不
++ *   注入（injected 指纹去重）；会话死 → 重建+断点契约；重建失败 → blocked+fatal。
++ * - R-st4 对账重锚：会话在场但 injected 空 → 重发契约；有指纹 → 不重发。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig, type BridgeConfig } from "../src/core/config";
++import { createDaemon } from "../src/daemon";
++import { BridgeError } from "../src/core/errors";
++import { buildContract, buildResumeContract } from "../src/core/goal/protocol";
++import type { GoalState } from "../src/core/goal/runner";
++import {
++  appendAudit,
++  loadGoals,
++  reconcile,
++  saveGoal,
++} from "../src/core/goal/state";
++import { FakeTransport } from "../src/core/transport/fake";
++import type { CodeartsTransport, SessionRef } from "../src/core/transport/types";
++
++/* ───── 测试台架：插件 .tmp 专属目录 + FakeTransport ───── */
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "state-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 每用例独立状态根（互不串扰）。 */
++function freshDir(name: string): string {
++  return path.join(TEST_ROOT, name);
++}
++
++const EMPTY_CFG = {} as BridgeConfig;
++
++/** 构造一个可落盘的合法 active 目标状态。 */
++function makeState(goalId: string, over: Partial<GoalState> = {}): GoalState {
++  return {
++    goalId,
++    objective: `目标 ${goalId}`,
++    verify: [],
++    phase: "active",
++    rounds: 0,
++    steps: [],
++    strikes: 0,
++    injected: [],
++    lastProgressAt: 1_000,
++    ...over,
++  };
++}
++
++/** goals/ 目录路径（被测实现的布局契约：<stateDir>/goals/<goalId>.json）。 */
++function goalsDir(stateDir: string): string {
++  return path.join(stateDir, "goals");
++}
++
++/** audit/ 目录路径（<stateDir>/audit/<goalId>.jsonl）。 */
++function auditPath(stateDir: string, goalId: string): string {
++  return path.join(stateDir, "audit", `${goalId}.jsonl`);
++}
++
++/** 读审计文件为逐行 JSON 数组（空/缺失 → []）。 */
++async function readAudit(stateDir: string, goalId: string): Promise<Record<string, unknown>[]> {
++  const raw = await readFile(auditPath(stateDir, goalId), "utf8").catch(() => "");
++  if (raw === "") return [];
++  return raw
++    .split("\n")
++    .filter((l) => l !== "")
++    .map((l) => JSON.parse(l) as Record<string, unknown>);
++}
++
++/** start 抛错的传输替身（重建失败路径专用；其余方法显式报错不被测试依赖）。 */
++class FailingStartTransport implements CodeartsTransport {
++  readonly kind = "pty" as const;
++  async start(): Promise<SessionRef> {
++    throw new BridgeError("SESSION_START_FAILED", "模拟重建失败");
++  }
++  async alive(): Promise<boolean> {
++    return false;
++  }
++  async inject(): Promise<void> {
++    throw new BridgeError("SESSION_NOT_ALIVE", "未预期调用");
++  }
++  observe(): AsyncIterable<never> {
++    throw new BridgeError("SESSION_UNKNOWN", "未预期调用");
++  }
++  async stop(): Promise<void> {
++    return;
++  }
++  async snapshot(): Promise<{ raw: string; meta: Record<string, unknown> }> {
++    throw new BridgeError("SESSION_UNKNOWN", "未预期调用");
++  }
++}
++
++/* ───── saveGoal / loadGoals：原子持久化（R-st1） ───── */
++
++describe("saveGoal/loadGoals 原子持久化", () => {
++  it("往返一致：多目标含可选字段（session/auditId/injected）逐字段还原", async () => {
++    const dir = freshDir("roundtrip");
++    const ref: SessionRef = { kind: "pty", id: "fake-1" };
++    const a = makeState("g-a", { session: ref, auditId: "g-a-3", injected: ["契约文本"], steps: [1, 2], rounds: 3 });
++    const b = makeState("g-b", { phase: "complete", steps: [1] });
++    await saveGoal(dir, a);
++    await saveGoal(dir, b);
++    const loaded = await loadGoals(dir);
++    expect(loaded.corrupted).toEqual([]);
++    expect(loaded.goals.length).toBe(2);
++    const la = loaded.goals.find((g) => g.goalId === "g-a");
++    const lb = loaded.goals.find((g) => g.goalId === "g-b");
++    expect(la).toEqual(a);
++    expect(lb).toEqual(b);
++  });
++
++  it("goals 目录缺失（首启）→ 空态 {goals:[],corrupted:[]}，不报错", async () => {
++    const dir = freshDir("fresh-install");
++    const loaded = await loadGoals(dir);
++    expect(loaded.goals).toEqual([]);
++    expect(loaded.corrupted).toEqual([]);
++  });
++
++  it("损坏 JSON → 该目标标 blocked 落盘 + fatal 审计 + corrupted 诊断；有效目标不受累；复载不再报损坏", async () => {
++    const dir = freshDir("corrupt-json");
++    await saveGoal(dir, makeState("g-ok"));
++    await mkdir(goalsDir(dir), { recursive: true });
++    await writeFile(path.join(goalsDir(dir), "g-bad.json"), "{oops 不是 JSON", "utf8");
++
++    const first = await loadGoals(dir);
++    // 有效目标完好
++    expect(first.goals.map((g) => g.goalId)).toEqual(["g-ok"]);
++    // 诊断列表含损坏目标（goalId 从文件名提取）
++    expect(first.corrupted.length).toBe(1);
++    const diag = first.corrupted[0]!;
++    expect(diag.goalId).toBe("g-bad");
++    expect(diag.reason.length).toBeGreaterThan(0);
++    expect(diag.auditId).toBe("g-bad-1");
++    // 该目标已就地标记 blocked 落盘（复载稳定，不重复报损坏）
++    const reread = await loadGoals(dir);
++    expect(reread.corrupted).toEqual([]);
++    const blockedState = reread.goals.find((g) => g.goalId === "g-bad");
++    expect(blockedState?.phase).toBe("blocked");
++    expect(blockedState?.auditId).toBe("g-bad-1");
++    // 审计留痕：fatal 错误事件含原因
++    const audit = await readAudit(dir, "g-bad");
++    expect(audit.length).toBe(1);
++    expect(audit[0]!.type).toBe("goal.error");
++    expect(audit[0]!.kind).toBe("state-corrupt");
++    expect(audit[0]!.fatal).toBe(true);
++    expect(String(audit[0]!.reason)).toContain("g-bad");
++  });
++
++  it("JSON 合法但结构非法（字段缺失/错型）→ 同损坏路径处理（blocked+审计+诊断）", async () => {
++    const dir = freshDir("corrupt-shape");
++    await mkdir(goalsDir(dir), { recursive: true });
++    await writeFile(path.join(goalsDir(dir), "g-shape.json"), JSON.stringify({ goalId: "g-shape" }), "utf8");
++    const loaded = await loadGoals(dir);
++    expect(loaded.goals).toEqual([]);
++    expect(loaded.corrupted.map((c) => c.goalId)).toEqual(["g-shape"]);
++    const reread = await loadGoals(dir);
++    expect(reread.corrupted).toEqual([]);
++    expect(reread.goals.find((g) => g.goalId === "g-shape")?.phase).toBe("blocked");
++    const audit = await readAudit(dir, "g-shape");
++    expect(audit[0]!.kind).toBe("state-corrupt");
++  });
++
++  it("文件名派生 goalId 非法（路径不安全字符）→ 仅诊断不落盘不审计，不崩守护", async () => {
++    const dir = freshDir("corrupt-name");
++    await mkdir(goalsDir(dir), { recursive: true });
++    await writeFile(path.join(goalsDir(dir), "bad id.json"), "垃圾内容", "utf8");
++    const loaded = await loadGoals(dir);
++    expect(loaded.goals).toEqual([]);
++    expect(loaded.corrupted.length).toBe(1);
++    expect(loaded.corrupted[0]!.goalId).toBe("bad id");
++    expect(loaded.corrupted[0]!.auditId).toBeUndefined(); // 非法 id 无法安全审计
++    // 未写入任何状态文件（id 非法禁止构造路径）
++    await expect(loadGoals(dir)).resolves.toBeTruthy();
++  });
++
++  it("saveGoal 拒绝非法 goalId（路径穿越）与非法状态形状（GOAL_STATE_INVALID）", async () => {
++    const dir = freshDir("save-invalid");
++    const evil = makeState("../evil");
++    const err1: unknown = await saveGoal(dir, evil).then(
++      () => null,
++      (e) => e,
++    );
++    expect(err1).toBeInstanceOf(BridgeError);
++    expect((err1 as BridgeError).code).toBe("GOAL_ID_INVALID");
++
++    const malformed = { goalId: "g-x", objective: 123 } as unknown as GoalState;
++    const err2: unknown = await saveGoal(dir, malformed).then(
++      () => null,
++      (e) => e,
++    );
++    expect(err2).toBeInstanceOf(BridgeError);
++    expect((err2 as BridgeError).code).toBe("GOAL_STATE_INVALID");
++  });
++});
++
++/* ───── appendAudit：审计留痕（R-st2） ───── */
++
++describe("appendAudit 追加审计", () => {
++  it("auditId 顺序分配（<goalId>-1、-2…）；多目标文件相互隔离", async () => {
++    const dir = freshDir("audit-basic");
++    expect(await appendAudit(dir, "g1", { type: "goal.start" })).toBe("g1-1");
++    expect(await appendAudit(dir, "g1", { type: "goal.inject" })).toBe("g1-2");
++    expect(await appendAudit(dir, "g2", { type: "goal.start" })).toBe("g2-1");
++    const g1 = await readAudit(dir, "g1");
++    const g2 = await readAudit(dir, "g2");
++    expect(g1.map((e) => e.auditId)).toEqual(["g1-1", "g1-2"]);
++    expect(g1.map((e) => e.type)).toEqual(["goal.start", "goal.inject"]);
++    expect(g2.map((e) => e.auditId)).toEqual(["g2-1"]);
++  });
++
++  it("并发追加不交错（单文件串行锁）：30 并发全成功、逐行合法 JSON、seq 无重复无空洞", async () => {
++    const dir = freshDir("audit-concurrent");
++    const results = await Promise.all(
++      Array.from({ length: 30 }, (_, i) => appendAudit(dir, "g1", { type: "goal.inject", i })),
++    );
++    expect(results.length).toBe(30);
++    expect(new Set(results).size).toBe(30); // auditId 全局唯一
++    const sorted = results.map((id) => Number(id.split("-")[1])).sort((a, b) => a - b);
++    expect(sorted).toEqual(Array.from({ length: 30 }, (_, i) => i + 1)); // seq 1..30 无空洞
++    // 文件逐行合法 JSON（无交错撕裂）
++    const lines = await readAudit(dir, "g1");
++    expect(lines.length).toBe(30);
++    expect(lines.every((l) => l.type === "goal.inject")).toBe(true);
++  });
++
++  it("拒绝非法事件（null/数组）与非法 goalId（显式报错，禁静默）", async () => {
++    const dir = freshDir("audit-invalid");
++    const err1: unknown = await appendAudit(dir, "g1", null as unknown as object).then(
++      () => null,
++      (e) => e,
++    );
++    expect(err1).toBeInstanceOf(BridgeError);
++    const err2: unknown = await appendAudit(dir, "g1", [1] as unknown as object).then(
++      () => null,
++      (e) => e,
++    );
++    expect(err2).toBeInstanceOf(BridgeError);
++    const err3: unknown = await appendAudit(dir, "../evil", { type: "x" }).then(
++      () => null,
++      (e) => e,
++    );
++    expect(err3).toBeInstanceOf(BridgeError);
++    expect((err3 as BridgeError).code).toBe("GOAL_ID_INVALID");
++  });
++});
++
++/* ───── reconcile：对账恢复（R-st3 幂等 / R-st4 重锚） ───── */
++
++describe("reconcile 对账恢复", () => {
++  it("Review-Focus-4：会话活 + injected 空 → 重锚注入契约恰一次；连续第二次 reconcile 不注入（指纹去重）", async () => {
++    const dir = freshDir("reconcile-idempotent");
++    const transport = new FakeTransport();
++    const ref = await transport.start(EMPTY_CFG);
++    await saveGoal(dir, makeState("g1", { session: ref }));
++
++    const r1 = await reconcile(dir, { transport });
++    expect(r1.resumed).toEqual(["g1"]);
++    expect(r1.blocked).toEqual([]);
++    expect(transport.injections.length).toBe(1);
++    expect(transport.injections[0]!.text).toBe(buildContract("目标 g1", []));
++    // 注入事实落盘：injected 指纹 + rounds 计一轮
++    const after1 = (await loadGoals(dir)).goals.find((g) => g.goalId === "g1");
++    expect(after1?.injected).toEqual([buildContract("目标 g1", [])]);
++    expect(after1?.rounds).toBe(1);
++
++    const r2 = await reconcile(dir, { transport });
++    expect(r2.resumed).toEqual(["g1"]);
++    expect(transport.injections.length).toBe(1); // 第二次不注入
++  });
++
++  it("并发两次 reconcile（互斥序列化）→ 仍只注入一次", async () => {
++    const dir = freshDir("reconcile-concurrent");
++    const transport = new FakeTransport();
++    const ref = await transport.start(EMPTY_CFG);
++    await saveGoal(dir, makeState("g1", { session: ref }));
++    const [r1, r2] = await Promise.all([reconcile(dir, { transport }), reconcile(dir, { transport })]);
++    expect(r1.resumed).toEqual(["g1"]);
++    expect(r2.resumed).toEqual(["g1"]);
++    expect(transport.injections.length).toBe(1);
++  });
++
++  it("会话活 + injected 指纹在场 → 不重发（R-st4 后半）", async () => {
++    const dir = freshDir("reconcile-fingerprint");
++    const transport = new FakeTransport();
++    const ref = await transport.start(EMPTY_CFG);
++    await saveGoal(dir, makeState("g1", { session: ref, injected: ["此前已有注入"], rounds: 1 }));
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual(["g1"]);
++    expect(transport.injections.length).toBe(0);
++  });
++
++  it("会话死（有进度）→ 重建会话（复用旧 ref）+ 断点续跑契约 + injected 重置为该契约", async () => {
++    const dir = freshDir("reconcile-dead-progress");
++    const transport = new FakeTransport();
++    const ref = await transport.start(EMPTY_CFG);
++    await saveGoal(dir, makeState("g1", { session: ref, steps: [1, 2] }));
++    await transport.stop(ref); // 会话死
++
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual(["g1"]);
++    expect(r.blocked).toEqual([]);
++    // 重建注入断点续跑契约（与 buildResumeContract 逐字一致）
++    const resumeText = buildResumeContract({ objective: "目标 g1", doneSteps: [1, 2] });
++    expect(transport.injections.length).toBe(1);
++    expect(transport.injections[0]!.text).toBe(resumeText);
++    expect(transport.injections[0]!.ref.id).toBe(ref.id); // 复用旧 ref（传输恢复语义）
++    // 状态落盘：session 更新、injected 重置（重建全新会话清旧指纹）、rounds+1、strikes+1（重启计入循环保护）
++    const after = (await loadGoals(dir)).goals.find((g) => g.goalId === "g1")!;
++    expect(after.session?.id).toBe(ref.id);
++    expect(after.injected).toEqual([resumeText]);
++    expect(after.rounds).toBe(1);
++    expect(after.strikes).toBe(1);
++    expect(after.phase).toBe("active");
++    // 审计留痕：restart + inject 两事件
++    const audit = await readAudit(dir, "g1");
++    expect(audit.map((e) => e.type)).toEqual(["goal.restart", "goal.inject"]);
++    expect(audit[0]!.reason).toBe("reconcile-session-died");
++  });
++
++  it("会话死（无进度）→ 重建 + 全文契约（与 runner.restartLocked 同判据）", async () => {
++    const dir = freshDir("reconcile-dead-fresh");
++    const transport = new FakeTransport();
++    const ref = await transport.start(EMPTY_CFG);
++    await saveGoal(dir, makeState("g1", { session: ref }));
++    await transport.stop(ref);
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual(["g1"]);
++    expect(transport.injections[0]!.text).toBe(buildContract("目标 g1", []));
++  });
++
++  it("重建失败 → phase=blocked 落盘 + fatal 审计 + blocked 列表", async () => {
++    const dir = freshDir("reconcile-rebuild-fail");
++    const transport = new FailingStartTransport();
++    const ref: SessionRef = { kind: "pty", id: "dead-1" };
++    await saveGoal(dir, makeState("g1", { session: ref }));
++
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual([]);
++    expect(r.blocked).toEqual(["g1"]);
++    const after = (await loadGoals(dir)).goals.find((g) => g.goalId === "g1")!;
++    expect(after.phase).toBe("blocked");
++    expect(after.auditId).toBe("g1-1");
++    const audit = await readAudit(dir, "g1");
++    expect(audit.length).toBe(1);
++    expect(audit[0]!.type).toBe("goal.error");
++    expect(audit[0]!.kind).toBe("reconcile-rebuild-failed");
++    expect(audit[0]!.fatal).toBe(true);
++  });
++
++  it("终态与人工态（complete/stopped/paused/blocked）目标不触碰、不入返回列表", async () => {
++    const dir = freshDir("reconcile-skip");
++    const transport = new FakeTransport();
++    const ref = await transport.start(EMPTY_CFG);
++    await saveGoal(dir, makeState("g-done", { phase: "complete", session: ref }));
++    await saveGoal(dir, makeState("g-stopped", { phase: "stopped", session: ref }));
++    await saveGoal(dir, makeState("g-paused", { phase: "paused", session: ref }));
++    await saveGoal(dir, makeState("g-blocked", { phase: "blocked", session: ref }));
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual([]);
++    expect(r.blocked).toEqual([]);
++    expect(transport.injections.length).toBe(0);
++  });
++
++  it("损坏目标经 loadGoals 标 blocked → 出现在 reconcile blocked 列表", async () => {
++    const dir = freshDir("reconcile-corrupt");
++    const transport = new FakeTransport();
++    await mkdir(goalsDir(dir), { recursive: true });
++    await writeFile(path.join(goalsDir(dir), "g-bad.json"), "坏数据", "utf8");
++    const r = await reconcile(dir, { transport });
++    expect(r.blocked).toEqual(["g-bad"]);
++    expect(r.resumed).toEqual([]);
++  });
++
++  it("无会话的 active 目标跳过（首 tick 自举，不入列表）", async () => {
++    const dir = freshDir("reconcile-no-session");
++    const transport = new FakeTransport();
++    await saveGoal(dir, makeState("g1"));
++    const r = await reconcile(dir, { transport });
++    expect(r.resumed).toEqual([]);
++    expect(r.blocked).toEqual([]);
++    expect(transport.injections.length).toBe(0);
++  });
++});
++
++/* ───── daemon 启动对账钩子（T3-04 守护接入缝，T3-05 注入真实传输） ───── */
++
++describe("daemon 启动对账钩子", () => {
++  it("start 时以 cfg.stateDir 调用 reconcileOnStart 恰一次（监听建立前）", async () => {
++    const stateDir = freshDir("daemon-hook");
++    const cfg = loadConfig({ stateDir, daemonUrl: "http://127.0.0.1:0" }, {});
++    const calls: string[] = [];
++    const d = createDaemon(cfg, {
++      reconcileOnStart: async (sd) => {
++        calls.push(sd);
++        return { resumed: ["g1"], blocked: [] };
++      },
++    });
++    await d.start();
++    expect(calls).toEqual([stateDir]);
++    await d.stop();
++  });
++
++  it("钩子抛错 → start 显式拒绝（禁静默带病服务）", async () => {
++    const stateDir = freshDir("daemon-hook-fail");
++    const cfg = loadConfig({ stateDir, daemonUrl: "http://127.0.0.1:0" }, {});
++    const d = createDaemon(cfg, {
++      reconcileOnStart: async () => {
++        throw new BridgeError("RECONCILE_FAILED", "对账爆炸");
++      },
++    });
++    const err: unknown = await d.start().then(
++      () => null,
++      (e) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as BridgeError).message).toContain("对账爆炸");
++    await d.stop(); // 未监听态 stop 幂等
++  });
++
++  it("未注入钩子 → 启动不做对账（T3-05 前的缺省缝，显式无操作）", async () => {
++    const stateDir = freshDir("daemon-no-hook");
++    const cfg = loadConfig({ stateDir, daemonUrl: "http://127.0.0.1:0" }, {});
++    const d = createDaemon(cfg);
++    const { port } = await d.start();
++    expect(port).toBeGreaterThan(0);
++    await d.stop();
++  });
++});
++

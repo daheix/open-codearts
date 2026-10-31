@@ -1,0 +1,912 @@
+# Review package: d99f27ff8a..700a241e46
+
+## Commits
+700a241e46 codearts-bridge(T2-05): 修复评审发现 — PTY 经官方 wrapper 启动（修真机授权门根因）、预 abort 短路、error 审计对齐 — 主控裁定/I-M48/49/50
+
+## Files changed
+ plugins/codearts-bridge/src/core/run.ts            | 83 +++++++++++-------
+ .../src/core/transport/pty-script.ts               | 23 ++++-
+ .../codearts-bridge/src/core/transport/pty-tmux.ts | 26 +++++-
+ .../src/core/transport/structured.ts               |  7 +-
+ plugins/codearts-bridge/test/run-tool.test.ts      | 50 +++++++++++
+ .../codearts-bridge/test/transport-script.test.ts  | 62 +++++++++++---
+ .../codearts-bridge/test/transport-tmux.test.ts    | 98 +++++++++++++++-------
+ 7 files changed, 273 insertions(+), 76 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/run.ts b/plugins/codearts-bridge/src/core/run.ts
+index edbb3a7bba..d6f83aab03 100644
+--- a/plugins/codearts-bridge/src/core/run.ts
++++ b/plugins/codearts-bridge/src/core/run.ts
+@@ -19,20 +19,26 @@
+  * - R-cr4（审计）：run.start / run.exit 成对写 audit/install.jsonl（经
+  *   appendInstallAudit），含 mode/reason/session/prompt 摘要/结果摘要；prompt
+  *   全文不入审计——只记长度与前 80 字符。run.start 审计失败 → 停止会话并显式
+  *   报错（禁止无审计的运行）；run.exit 审计失败不掩盖运行结果（R-t1 同纪律，
+  *   run.start 已留痕，部署级写故障由 health/审计监控暴露）。
+  * - 错误路径（任务书 Step1）：error 信号经 classifyError 分级，任一 retryable
+  *   → 结果 retryable=true 并附摘要；**不静默重试**——重试属目标引擎（T3 监督
+  *   状态机）职责。transport 抛出的 BridgeError 原样上抛（工具层 R-t1 转
+  *   结构化 content），run.exit 审计以 status="error" 留痕。
+  *
++ * 修复环第 1 轮（2026-10-31，主控裁定/I-M48/I-M50）：
++ * - M48 预 abort 短路：start/审计完成后 ctrl.signal 已 aborted → inject 零调用
++ *   （已取消的 prompt 不写入目标会话），照常 stop + cancelled 结果。
++ * - M50 error 路径审计对齐：run.exit(status="error") 补 outputBytes/summary/
++ *   retryable，与成功路径 schema 一致（审计消费方单一 schema）。
++ *
+  * 终态语义（status 四值，均为结构化结果非错误）：
+  * - "completed"：观察到 done 信号（PTY 宿主进程退出 / structured 回合 exit=0）；
+  * - "timeout"：timeoutMs 到（R-cr2，已 stop）；
+  * - "cancelled"：宿主 signal abort（R-cr3，已 stop）；
+  * - "ended"：事件流结束但无 done、无超时、无取消（如 structured 回合失败退出
+  *   ——R-s4 错误回合不宣告会话死亡，会话保活可续接；错误事实在 errors/summary）。
+  * 优先级：completed > timeout > cancelled > ended（done 是最强完成事实）。
+  * 超时/取消/错误路径必 stop；completed/ended 不 stop（structured 会话保活供
+  * 续接；PTY 宿主 done 即进程已退，stop 幂等无意义）。
+  */
+@@ -309,103 +315,118 @@ export async function runOnce(input: RunOnceInput): Promise<RunResult> {
+   const textParts: string[] = [];
+   let outputBytes = 0;
+   let signalsCount = 0;
+   let errorsCount = 0;
+   let retryable = false;
+   let sawDone = false;
+   let progressFailures = 0;
+   let lastProgressAt = Number.NEGATIVE_INFINITY;
+   let runError: BridgeError | undefined;
+ 
++  // 捕获摘要（M50：error 路径 run.exit 审计与成功路径 schema 对齐——提前计算）
++  const fullText = () => textParts.join("");
++  const summarize = (): string => {
++    const t = fullText();
++    return t.length > RUN_SUMMARY_MAX_CHARS ? `…${t.slice(-RUN_SUMMARY_MAX_CHARS)}` : t;
++  };
++
+   // 进度通道失败不中断运行；计数入结果（显式留痕，非静默）
+   const reportProgress = async (status: string): Promise<void> => {
+     if (input.progress === undefined) return;
+     try {
+       await input.progress({ status });
+     } catch {
+       progressFailures++;
+     }
+   };
+ 
+   try {
+-    await transport.inject(ref, input.prompt);
+-    lastProgressAt = clock.now();
+-    await reportProgress(`prompt 已提交（mode=${sel.mode}），等待目标响应`);
+-    const observeOpts: ObserveOptions = {
+-      signal: ctrl.signal,
+-      ...(input.kernelDataDir !== undefined ? { kernelDataDir: input.kernelDataDir } : {}),
+-    };
+-    for await (const sig of transport.observe(ref, observeOpts)) {
+-      signalsCount++;
+-      if (sig.t === "error" && sig.text !== undefined) {
+-        errorsCount++;
+-        // 错误分级（R-s5 classifyError）：retryable → 显式标记；不静默重试
+-        if (classifyError(sig.text) === "retryable") retryable = true;
+-      }
+-      if ((sig.t === "output" || sig.t === "error") && sig.text !== undefined) {
+-        textParts.push(sig.text);
+-        outputBytes += Buffer.byteLength(sig.text, "utf8");
+-      }
+-      if (sig.t === "done") {
+-        sawDone = true;
+-        break;
+-      }
+-      // R-cr3：信号批次 + 2s 节流
+-      const now = clock.now();
+-      if (now - lastProgressAt >= RUN_PROGRESS_THROTTLE_MS) {
+-        lastProgressAt = now;
+-        await reportProgress(`运行中：信号 ${signalsCount} 个（错误 ${errorsCount}）`);
++    // M48（修复环裁定）：预 abort 短路——start/审计完成后信号已取消的 prompt
++    // 不再写入目标会话（inject 零调用）；取消语义照常经 finally stop + 结构化
++    // cancelled 结果返回（非静默：status 如实标记取消事实）。
++    if (!ctrl.signal.aborted) {
++      await transport.inject(ref, input.prompt);
++      lastProgressAt = clock.now();
++      await reportProgress(`prompt 已提交（mode=${sel.mode}），等待目标响应`);
++      const observeOpts: ObserveOptions = {
++        signal: ctrl.signal,
++        ...(input.kernelDataDir !== undefined ? { kernelDataDir: input.kernelDataDir } : {}),
++      };
++      for await (const sig of transport.observe(ref, observeOpts)) {
++        signalsCount++;
++        if (sig.t === "error" && sig.text !== undefined) {
++          errorsCount++;
++          // 错误分级（R-s5 classifyError）：retryable → 显式标记；不静默重试
++          if (classifyError(sig.text) === "retryable") retryable = true;
++        }
++        if ((sig.t === "output" || sig.t === "error") && sig.text !== undefined) {
++          textParts.push(sig.text);
++          outputBytes += Buffer.byteLength(sig.text, "utf8");
++        }
++        if (sig.t === "done") {
++          sawDone = true;
++          break;
++        }
++        // R-cr3：信号批次 + 2s 节流
++        const now = clock.now();
++        if (now - lastProgressAt >= RUN_PROGRESS_THROTTLE_MS) {
++          lastProgressAt = now;
++          await reportProgress(`运行中：信号 ${signalsCount} 个（错误 ${errorsCount}）`);
++        }
+       }
+     }
+   } catch (e) {
+     runError = e instanceof BridgeError ? e : new BridgeError("INTERNAL", String(e), { cause: e });
+   } finally {
+     timerCancelled = true;
+     timer.cancel();
+     external?.removeEventListener("abort", onExternalAbort);
+     // R-cr2/R-cr3/错误路径：超时、取消、异常必 stop（显式清理）；
+     // completed/ended 不 stop（structured 会话保活供续接；PTY done 即进程已退）
+     if (timeoutFired || (external?.aborted ?? false) || runError !== undefined) {
+       try {
+         await transport.stop(ref);
+       } catch {
+         // 停止失败不掩盖主结果（会话残留由 snapshot/下次运行对账；stop 均幂等）
+       }
+     }
+   }
+ 
+   if (runError !== undefined) {
+-    // R-cr4：异常路径 run.exit 以 status="error" 留痕（尽力而为，不掩盖上抛错误）
++    // R-cr4：异常路径 run.exit 以 status="error" 留痕（尽力而为，不掩盖上抛错误）。
++    // M50（修复环裁定）：补 outputBytes/summary——与成功路径 schema 对齐，
++    // error 留痕同样承载已捕获输出的事实（审计消费方单一 schema）。
+     try {
+       await appendInstallAudit(cfg, {
+         ts: new Date().toISOString(),
+         kind: "run.exit",
+         auditId,
+         mode: sel.mode,
+         session: ref.id,
+         sessionKind: ref.kind,
+         status: "error",
+         errorCode: runError.code,
+         errorMessage: runError.message,
+         signals: signalsCount,
+         errors: errorsCount,
++        retryable,
+         durationMs: clock.now() - startedAt,
++        outputBytes,
++        summary: summarize(),
+       });
+     } catch {
+       // run.start 已留痕；写失败属部署故障（R-t1 同纪律，不掩盖上抛的业务错误）
+     }
+     throw runError;
+   }
+ 
+-  const fullText = textParts.join("");
+-  const summary =
+-    fullText.length > RUN_SUMMARY_MAX_CHARS ? `…${fullText.slice(-RUN_SUMMARY_MAX_CHARS)}` : fullText;
++  const summary = summarize();
+   const status: RunResult["status"] = sawDone
+     ? "completed"
+     : timeoutFired
+       ? "timeout"
+       : (external?.aborted ?? false)
+         ? "cancelled"
+         : "ended";
+ 
+   const result: RunResult = {
+     status,
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-script.ts b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+index 132c46a90c..b5df752187 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-script.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+@@ -26,20 +26,28 @@
+  *   子树（目标 TUI 及其后代）的终止依赖 script 死亡后 PTY master 关闭触发的
+  *   SIGHUP 级联（探针实测 <300ms 全灭）；③ 残余风险：目标若忽略/捕获 SIGHUP
+  *   可能残留（script 宿主固有拓扑）；④ 缓解路径：T2-03 tmux 宿主
+  *   （kill-session 原生整树终止）、T2-05 结构化传输（无 PTY 树），后代
+  *   /proc 清扫登记为候选项（本轮不实现）。ESRCH 视为终止目标已达成
+  *   （stop 幂等语义），其余错误显式抛 PTY_STOP_FAILED。
+  * - R-p5 PtyChild 注入：exec.spawnPty(args, env) 注入 seam；生产缺省实现
+  *   nodeScriptSpawnPty = `script -qefc <cmd> /dev/null`，参数一律 argv 数组
+  *   传递（本实现不做 shell 字符串拼接；script -c 本身为 sh 语义，故对
+  *   配置路径做 shQuote 转义——数据源仅限配置路径，非用户文本）。
++ * - 修复环裁定①（2026-10-31 修复轮）：PTY 宿主改经官方 wrapper
++ *   `<installDir>/codearts` 启动（原 `<installDir>/bin/codearts` bin 直启）。
++ *   依据：真机冒烟实证 bin 直启裸传父环境（无 SCENARIO/KERNEL_DATA_DIR 等内核
++ *   env）→ TUI 停在交互式授权门（"Waiting for authorization..."）；官方
++ *   wrapper 设置全量内核 env，是单一环境真相源（与 TUI 桌面快捷方式语义一致）。
++ *   wrapper 缺失 → WRAPPER_MISSING（remediation=检查 installers 完整性/重装），
++ *   禁静默回退 bin 直启。structured 通道维持 bin 直启（无头 run 子命令 +
++ *   AK/SK 前置，无 TUI 授权门，见 structured.ts 同名注释）。
+  * - R-p6 UTF-8：PTY 流按 chunk 到达，stdout/stderr 各持独立 StringDecoder，
+  *   多字节序列跨 chunk 完整还原（两流独立解码器，交错不破坏字节边界）。
+  *
+  * 语义裁决（显式报错，禁静默兜底；与 FakeTransport 对齐项注明）：
+  * - 未知 ref：全部方法抛 SESSION_UNKNOWN（与 Fake 同）；
+  * - 对非存活会话 inject：抛 SESSION_NOT_ALIVE（与 Fake 同）；等待 120ms 提交
+  *   窗口期间会话死亡：同样显式抛出，不向死进程写字节；
+  * - 同一 ref 并发第二个 observe：抛 OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
+  * - start 带 ref 复用：存活会话幂等返回同 ref；已结束会话抛 SESSION_NOT_ALIVE
+  *   （真实 PTY 不可复活，禁静默重建）；
+@@ -50,20 +58,21 @@
+  *   meta.log = { available, file, serviceLines }：available = 观察进行中且正在
+  *   tail 某 kernel-*.log；file = 当前 tail 的文件名（basename）；serviceLines =
+  *   日志源产出的信号累计数（跨观察累计，留痕不丢）。
+  * - R-tm5 共享提取（T2-03 起）：日志 tailer/shQuote/lookPath/时钟类型已提取至
+  *   shared.ts（唯一真相源），本文件 import 复用并 re-export shQuote/PtyClock
+  *   保持既有导入面不变；行为与测试零改动。观察循环骨架（本文件与 pty-tmux
+  *   各自实现）因生产/探测机制差异不做提取（见 shared.ts 头注）。
+  */
+ 
+ import { spawn } from "node:child_process";
++import { existsSync } from "node:fs";
+ import * as path from "node:path";
+ import { StringDecoder } from "node:string_decoder";
+ import { armLogTailer, lookPath, shQuote, type PtyClock } from "./shared";
+ import type { BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+ import type {
+   CodeartsTransport,
+   ObserveOptions,
+   SessionRef,
+   Signal,
+@@ -276,21 +285,33 @@ export function createScriptTransport(
+     kind,
+ 
+     async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
+       if (ref !== undefined) {
+         const s = requireSession(ref);
+         assertInjectable(s, ref);
+         return { ...s.ref }; // 复用语义：存活会话幂等返回（真实 PTY 无恢复概念）
+       }
+       const id = `script-${++idNext}`;
+       const created: SessionRef = { kind, id };
+-      const cmd = shQuote(path.join(cfg.installDir, "bin", "codearts"));
++      // 修复环裁定①（2026-10-31）：PTY 宿主一律经官方 wrapper <installDir>/codearts
++      // 启动——wrapper 设置全量内核 env（SCENARIO/KERNEL_DATA_DIR/OPENCODE_* 等，
++      // 单一环境真相源，与 TUI 桌面快捷方式语义一致）；bin 直启裸传父环境会使
++      // TUI 停在交互式授权门（真机冒烟实证）。wrapper 缺失显式报错，禁静默回退
++      // bin 直启（回退即掩盖部署缺陷，与全局"禁静默兜底"约束同源）。
++      const wrapper = path.join(cfg.installDir, "codearts");
++      if (!existsSync(wrapper)) {
++        throw new BridgeError("WRAPPER_MISSING", `官方启动 wrapper 缺失：${wrapper}`, {
++          remediation:
++            "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
++        });
++      }
++      const cmd = shQuote(wrapper);
+       // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
+       const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
+       const s: PtySession = {
+         ref: created,
+         child,
+         raw: "",
+         queue: [],
+         waiters: [],
+         observer: null,
+         closed: false,
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+index 54fc35d2b3..70f71c8352 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+@@ -3,24 +3,31 @@
+  *
+  * 职责：CodeartsTransport 的第二个真实传输——经 tmux 客户端命令托管目标 TUI
+  * （PTY 首选形态：可 attach 观看、跨守护重启存活；零依赖宿主见 T2-02 script）。
+  * 契约唯一真相源为 types.ts；日志信号源共享件见 shared.ts（R-tm5 提取）。
+  *
+  * 主控裁定对照（2026-10-31，逐条落实）：
+  * - R-tm1 探测与错误：每次 start 均执行 `tmux -V` 探测（**非缓存**）；失败 →
+  *   BridgeError(PTY_HOST_UNAVAILABLE)，remediation = 安装 tmux 或配置
+  *   ptyHost=script；**禁静默切换**到 script。
+  * - R-tm2 start 幂等：先 `has-session -t codearts-<slug>`；命中 → 重连（不
+- *   重建）；未命中 → `new-session -d -s <target> <installDir>/bin/codearts`
++ *   重建）；未命中 → `new-session -d -s <target> <installDir>/codearts`
+  *   （argv 数组传参，禁 shell 字符串拼接用户数据；命令参数经 shQuote——tmux
+  *   将命令参数交 sh 解析，空格路径会被拆词，转义对象仅为配置路径，与 T2-02
+  *   R-p5 同源依据）。
++ * - 修复环裁定①（2026-10-31 修复轮）：PTY 宿主改经官方 wrapper
++ *   `<installDir>/codearts` 启动（原 `<installDir>/bin/codearts` bin 直启）。
++ *   依据：真机冒烟实证 bin 直启裸传父环境（无 SCENARIO/KERNEL_DATA_DIR 等内核
++ *   env）→ TUI 停在交互式授权门；官方 wrapper 设置全量内核 env，是单一环境
++ *   真相源。wrapper 缺失 → WRAPPER_MISSING（仅在需 new-session 时检查；存活
++ *   会话重连不消费 wrapper），禁静默回退 bin 直启。structured 维持 bin 直启
++ *   （无头 run 子命令 + AK/SK 前置，见 structured.ts 同名注释）。
+  * - R-tm3 inject 两段式：`send-keys -t <target> <text>` 与
+  *   `send-keys -t <target> Enter` 为两次独立调用且保序；文本段加 `-l`
+  *   （字面文本——否则 "C-c"/"F1" 等会被 tmux 解释为键名，Enter 段刻意不加
+  *   -l 以发送键）；多行文本显式拒绝（与 T2-02 同码 INJECT_TEXT_MULTILINE）。
+  *   不设 120ms 时延窗口：send-keys 为 tmux 服务器侧原子操作，两次独立调用
+  *   的次序由服务器保证（v0.2.6 教训针对的是单块写入被粘贴识别吞回车）。
+  * - R-tm4 stop/alive/snapshot：stop=`kill-session -t <target>`（不存在→幂等，
+  *   复查 has-session 证实后标记 closed，非字符串匹配 stderr）；alive=
+  *   `has-session` 退出码；snapshot=`capture-pane -p -t <target>`（含 meta）。
+  * - R-tm5 共享提取：日志 tailer/lookPath/shQuote/时钟类型提取至 shared.ts
+@@ -67,20 +74,21 @@
+  * - 未知 ref（未注册/非法 kind/空 id）：SESSION_UNKNOWN（与 Fake 同）；
+  * - 对非存活会话 inject：SESSION_NOT_ALIVE（与 Fake 同）；send-keys 失败时
+  *   复查存活——亡 → SESSION_NOT_ALIVE，活 → PTY_INJECT_FAILED（带 stderr）；
+  * - 同一 ref 并发第二个 observe：OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
+  * - kill-session 失败且会话仍在：PTY_STOP_FAILED；capture-pane 失败且会话在：
+  *   PTY_CAPTURE_FAILED；new-session 失败：PTY_START_FAILED——均显式抛出。
+  */
+ 
+ import { spawn } from "node:child_process";
+ import { createHash } from "node:crypto";
++import { existsSync } from "node:fs";
+ import * as path from "node:path";
+ import { StringDecoder } from "node:string_decoder";
+ import type { BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+ import { armLogTailer, lookPath, shQuote, type PtyClock } from "./shared";
+ import type {
+   CodeartsTransport,
+   ObserveOptions,
+   SessionRef,
+   Signal,
+@@ -332,33 +340,45 @@ export function createTmuxTransport(
+       if (ref !== undefined && (ref.kind !== kind || ref.id === "")) {
+         throw new BridgeError("SESSION_UNKNOWN", `非法会话引用：kind=${ref.kind} id=${ref.id}`, {
+           remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
+         });
+       }
+       await probeTmux(); // R-tm1：非缓存，每次 start 均探测
+       // start(ref) 不要求注册过（跨守护重启：ref 来自 state，tmux 服务器验证其存在性）
+       const target = ref !== undefined ? ref.id : sessionNameFor(cfg.installDir);
+       const exists = await hasSessionName(target);
+       if (!exists) {
++        // 修复环裁定①（2026-10-31）：与 pty-script 同源——PTY 宿主一律经官方
++        // wrapper <installDir>/codearts 启动（全量内核 env 单一真相源）；bin 直启
++        // 使 TUI 停在交互式授权门（真机冒烟实证）。缺失显式报错，禁静默回退
++        // bin 直启。仅在需 new-session（新建/同名重建）时检查——存活会话重连
++        // 不消费 wrapper，不受部署目录事后残缺影响。
++        const wrapper = path.join(cfg.installDir, "codearts");
++        if (!existsSync(wrapper)) {
++          throw new BridgeError("WRAPPER_MISSING", `官方启动 wrapper 缺失：${wrapper}`, {
++            remediation:
++              "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
++          });
++        }
+         // R-tm2：new-session argv 数组传参；命令参数经 shQuote（tmux 交 sh 解析）
+         const r = await exec.run([
+           "new-session",
+           "-d",
+           "-s",
+           target,
+-          shQuote(path.join(cfg.installDir, "bin", "codearts")),
++          shQuote(wrapper),
+         ]);
+         if (r.exitCode !== 0) {
+           throw new BridgeError(
+             "PTY_START_FAILED",
+             `new-session 失败（退出码 ${r.exitCode}）：${r.stderr.trim()}`,
+-            { remediation: "检查 installDir/bin/codearts 存在且可执行，以及 tmux 服务器状态。" },
++            { remediation: "检查 installDir/codearts（官方 wrapper）存在且可执行，以及 tmux 服务器状态。" },
+           );
+         }
+         const prev = sessions.get(target);
+         if (prev === undefined) {
+           sessions.set(target, freshSession(target));
+         } else {
+           // 同名重建：pane 已更换——队列/捕获基线显式清空（旧输出不属新生命期，
+           // 非静默：文档与测试钉死）；日志计数保留（本传输账目）。
+           // I1（评审修复）：重建前先终止旧对象上的活跃观察者——置旧状态对象
+           // closed 并唤醒，旧观察循环见 closed 即按 stop 语义静默结束（不产
+diff --git a/plugins/codearts-bridge/src/core/transport/structured.ts b/plugins/codearts-bridge/src/core/transport/structured.ts
+index be8d41a82f..fe2ac34481 100644
+--- a/plugins/codearts-bridge/src/core/transport/structured.ts
++++ b/plugins/codearts-bridge/src/core/transport/structured.ts
+@@ -429,21 +429,26 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+       if (s.round !== null && !s.round.exitSeen) {
+         throw new BridgeError("ROUND_ACTIVE", `会话已有活跃回合（并发=1）：id=${ref.id}`, {
+           remediation: "等待当前回合结束（done/error 信号）或 stop 终止后再发起新回合。",
+         });
+       }
+       if (text.length === 0) {
+         throw new BridgeError("INJECT_TEXT_EMPTY", "注入文本为空（prompt 不得为空串）", {
+           remediation: "提供非空 prompt；空回合必为调用方缺陷，本传输显式拒绝。",
+         });
+       }
+-      // R-s1：argv 数组传参（禁 shell 拼接）；--session 续接已捕获会话
++      // R-s1：argv 数组传参（禁 shell 拼接）；--session 续接已捕获会话。
++      // 修复环裁定①（2026-10-31）：structured 维持 bin 直启（不经
++      // <installDir>/codearts 官方 wrapper）——`run` 子命令为无头 JSONL 通道，
++      // 无 TUI 交互授权门，凭据由 R-s2 AK/SK 前置保障；wrapper 的 TUI env
++      // 装配（OPENCODE_MODE=tui 等）对无头通道无意义，且会引入对 wrapper 文件
++      // 的额外部署依赖。此为显式设计决策，非"PTY 走 wrapper"的回退对照面。
+       const argv = [path.join(s.cfg.installDir, "bin", "codearts"), "run", text];
+       if (s.codeartsSessionId !== null) argv.push("--session", s.codeartsSessionId);
+       argv.push("--format", "json", "--print-logs");
+       // R-s3：父进程全量环境 + CODEARTS_CLI_AK/SK 注入；OPENCODE_MODE 不注入
+       const env: NodeJS.ProcessEnv = {
+         ...process.env,
+         CODEARTS_CLI_AK: s.aksk.AK,
+         CODEARTS_CLI_SK: s.aksk.SK,
+       };
+       const child = exec.spawnProc(argv, env); // spawn 失败（bin 缺失等）同步抛出，回合不登记
+diff --git a/plugins/codearts-bridge/test/run-tool.test.ts b/plugins/codearts-bridge/test/run-tool.test.ts
+index e5f633fac5..25a450fa2b 100644
+--- a/plugins/codearts-bridge/test/run-tool.test.ts
++++ b/plugins/codearts-bridge/test/run-tool.test.ts
+@@ -344,20 +344,22 @@ describe("runOnce（R-cr1/R-cr2/R-cr3/R-cr4）", () => {
+     external.abort(); // 运行前已取消
+     const result = await runOnce({
+       cfg,
+       prompt: "hi",
+       buildTransport: spy.build,
+       clock: new FakeClock(),
+       signal: external.signal,
+     });
+     expect(result.status).toBe("cancelled");
+     expect(await tr.alive(result.session)).toBe(false);
++    // M48（修复环裁定）：已取消的 prompt 不再写入目标会话——inject 零调用
++    expect(tr.injections).toHaveLength(0);
+   });
+ 
+   it("超时（R-cr2）：timeoutMs 到 → stop + 结构化超时结果（含已捕获输出）", async () => {
+     root = mkdtempSync(path.join(TMP_ROOT, "timeout-"));
+     const cfg = makeCfg({ transport: "pty", ptyHost: "script" });
+     const spy = makeBuildTransportSpy();
+     const tr = spy.transport as FakeTransport;
+     const clock = new FakeClock();
+     const runPromise = runOnce({
+       cfg,
+@@ -453,20 +455,68 @@ describe("runOnce（R-cr1/R-cr2/R-cr3/R-cr4）", () => {
+     expect(start.promptLength).toBe(longPrompt.length);
+     expect(start.promptPreview).toBe(longPrompt.slice(0, RUN_PROMPT_PREVIEW_CHARS));
+     // 全文不入审计：80 字符之后的尾部标记不得出现
+     expect(JSON.stringify(lines)).not.toContain("结尾标记XYZ");
+     expect(exit.status).toBe("completed");
+     expect(exit.signals).toBe(1);
+     expect(exit.mode).toBe("pty-script");
+     expect(exit.session).toBe(result.session.id);
+   });
+ 
++  it("error 路径 run.exit 审计补 outputBytes/summary（M50：schema 与成功路径对齐）", async () => {
++    root = mkdtempSync(path.join(TMP_ROOT, "audit-err-"));
++    const cfg = makeCfg({ transport: "pty", ptyHost: "script" });
++    const tr = new FakeTransport();
++    const boom = new BridgeError("PTY_INJECT_FAILED", "观察中断（测试注入）");
++    // 观察首个信号交付后传输层故障的包装传输（委托 FakeTransport，方法显式转发——
++    // 类实例方法在原型上，spread 不复制）
++    const throwing: CodeartsTransport = {
++      kind: tr.kind,
++      start: (c, r) => tr.start(c, r),
++      inject: (r, t) => tr.inject(r, t),
++      observe(r, o) {
++        const src = tr.observe(r, o);
++        return (async function* () {
++          for await (const sig of src) {
++            yield sig;
++            throw boom; // 首信号后故障 → runOnce error 路径
++          }
++        })();
++      },
++      alive: (r) => tr.alive(r),
++      stop: (r) => tr.stop(r),
++      snapshot: (r) => tr.snapshot(r),
++    };
++    const runPromise = runOnce({ cfg, prompt: "hi", buildTransport: () => throwing, clock: new FakeClock() });
++    const ref = await injectedRef(tr);
++    tr.emit(ref, "output", "部分输出后传输故障");
++    let caught: unknown;
++    try {
++      await runPromise;
++    } catch (e) {
++      caught = e;
++    }
++    expect(caught).toBeInstanceOf(BridgeError);
++    expect((caught as BridgeError).code).toBe("PTY_INJECT_FAILED");
++    const lines = readFileSync(path.join(cfg.stateDir, "audit", "install.jsonl"), "utf8")
++      .trim()
++      .split("\n")
++      .map((l) => JSON.parse(l) as Record<string, unknown>);
++    const exit = lines.find((l) => l.kind === "run.exit") as Record<string, unknown>;
++    expect(exit).toBeDefined();
++    expect(exit.status).toBe("error");
++    expect(exit.errorCode).toBe("PTY_INJECT_FAILED");
++    expect(typeof exit.outputBytes).toBe("number"); // M50：字段存在且与成功路径 schema 对齐
++    expect(exit.outputBytes).toBeGreaterThan(0);
++    expect(String(exit.summary)).toContain("部分输出后传输故障");
++  });
++
+   it("空 prompt / timeoutMs=0 → 显式 TOOL_INPUT_INVALID（禁静默截断/钳位）", async () => {
+     root = mkdtempSync(path.join(TMP_ROOT, "invalid-"));
+     const cfg = makeCfg();
+     const badCases: Array<{ prompt: string; timeoutMs?: number }> = [{ prompt: "" }, { prompt: "hi", timeoutMs: 0 }];
+     for (const bad of badCases) {
+       let caught: unknown;
+       try {
+         await runOnce({
+           cfg,
+           prompt: bad.prompt,
+diff --git a/plugins/codearts-bridge/test/transport-script.test.ts b/plugins/codearts-bridge/test/transport-script.test.ts
+index f6f9cb4eb2..c5eaffa1b8 100644
+--- a/plugins/codearts-bridge/test/transport-script.test.ts
++++ b/plugins/codearts-bridge/test/transport-script.test.ts
+@@ -8,55 +8,84 @@
+  *   service= 行转 output 信号；日志源缺失/轮转不报错，可用性在 snapshot.meta
+  *   如实标注（测试：追加 service 行产信号 / 缺失标不可用 / 基线前内容不产信号）。
+  * - R-p3 abort 对齐（T9 基准）：observe 尊重 opts.signal——挂起等待中 abort
+  *   迭代正常落定、残存信号不交付当前消费者但保留给下一次 observe（与
+  *   FakeTransport 同态）、不抛错。
+  * - R-p4 进程组终止：stop 连底层子进程树一并终止（detached + 组杀）；
+  *   测试用 family 场景的标记孙进程经 /proc 扫描核对全树无残留。
+  * - R-p5 PtyChild 注入：生产缺省实现 = `script -qefc <cmd> /dev/null`（argv
+  *   数组传递）；测试注入 fake child 或对 bash fixture 真实 spawn（离线本地）。
+  * - R-p6 UTF-8：StringDecoder 处理多字节跨 chunk（utf8 场景拆字节写入）。
++ * - 修复环裁定①（2026-10-31）：PTY 双宿主经官方 wrapper `<installDir>/codearts`
++ *   启动（全量内核 env 单一真相源，修真机 TUI 停在授权门的根因）；wrapper
++ *   缺失 → WRAPPER_MISSING（禁静默回退 bin 直启；新增专测）。
+  *
+  * 错误路径（禁静默兜底，显式 BridgeError）：SESSION_UNKNOWN / SESSION_NOT_ALIVE /
+- * OBSERVER_ACTIVE / INJECT_TEXT_MULTILINE / PTY_HOST_UNAVAILABLE。
++ * OBSERVER_ACTIVE / INJECT_TEXT_MULTILINE / PTY_HOST_UNAVAILABLE / WRAPPER_MISSING。
+  */
+ import { afterEach, describe, expect, it } from "bun:test";
+ import { mkdtempSync, mkdirSync, appendFileSync, rmSync, writeFileSync } from "node:fs";
+-import { accessSync, constants, readdirSync, readFileSync } from "node:fs";
++import { accessSync, chmodSync, constants, readdirSync, readFileSync } from "node:fs";
+ import * as path from "node:path";
+ import { loadConfig } from "../src/core/config";
+ import { BridgeError } from "../src/core/errors";
+ import {
+   createScriptTransport,
+   nodeScriptSpawnPty,
+   shQuote,
+   type PtyChild,
+ } from "../src/core/transport/pty-script";
+ import type { SessionRef, Signal } from "../src/core/transport/types";
+ 
+-/** 与真实环境完全隔离的配置（测试不触碰真实 HOME/安装目录）。 */
+-const CFG = loadConfig(
+-  { stateDir: "/nonexistent/codearts-bridge-script-test", installDir: "/nonexistent/installers" },
+-  {},
+-);
+-
++/** fake-tui fixture（wrapper 转发目标）。 */
+ const FIXTURE = path.join(import.meta.dir, "fixtures", "fake-codearts", "fake-tui.sh");
+ 
+ /** 测试用临时根（工作目录内 .tmp/，用后即删，禁系统临时目录）。 */
+ const TMP_ROOT = path.join(import.meta.dir, ".tmp", "t10");
+ 
++/**
++ * 官方 wrapper fixture 安装目录（修复环裁定① 2026-10-31：PTY 双宿主一律经
++ * `<installDir>/codearts` 官方 wrapper 启动，禁 bin 直启）。wrapper 文件实为
++ * fake-tui.sh 的转发脚本：fake-child 用例只验存在性与 argv 形态；真实 PTY 用例
++ * 的 exec seam 自构造 script 命令（R-p5），均不真正执行该 wrapper。
++ */
++const WRAPPER_INSTALL = path.join(TMP_ROOT, "install-fixture");
++mkdirSync(WRAPPER_INSTALL, { recursive: true });
++writeFileSync(
++  path.join(WRAPPER_INSTALL, "codearts"),
++  `#!/usr/bin/env bash\nexec bash ${JSON.stringify(FIXTURE)} "$@"\n`,
++  "utf8",
++);
++chmodSync(path.join(WRAPPER_INSTALL, "codearts"), 0o755);
++
++/** 与真实环境完全隔离的配置（测试不触碰真实 HOME/安装目录）。 */
++const CFG = loadConfig(
++  { stateDir: "/nonexistent/codearts-bridge-script-test", installDir: WRAPPER_INSTALL },
++  {},
++);
++
+ /** 建立每用例独立的内核数据根（自动建父目录）。 */
+ function makeKernelDir(prefix: string): string {
+   mkdirSync(TMP_ROOT, { recursive: true });
+   return mkdtempSync(path.join(TMP_ROOT, prefix));
+ }
+ 
++/** 建一个带官方 wrapper 的临时 installDir（可自定义目录名前缀；用例自行清理）。 */
++function makeWrapperInstall(prefix: string): string {
++  mkdirSync(TMP_ROOT, { recursive: true });
++  const dir = mkdtempSync(path.join(TMP_ROOT, prefix));
++  const wrapper = path.join(dir, "codearts");
++  writeFileSync(wrapper, "#!/bin/sh\nexit 0\n", "utf8");
++  chmodSync(wrapper, 0o755);
++  return dir;
++}
++
+ /* ───── 测试替身：可记录的 Fake PtyChild 与 exec ───── */
+ 
+ interface FakeChild extends PtyChild {
+   writes: string[];
+   killCalls: number;
+   isAlive: boolean;
+   /** 模拟 PTY 输出 chunk 到达（StringDecoder 之前的数据已按字符串给出）。 */
+   emit(chunk: string): void;
+   /** 模拟底层进程死亡。 */
+   die(): void;
+@@ -222,35 +251,46 @@ describe("createScriptTransport.start / R-p5 argv 形态", () => {
+     const child = makeFakeChild();
+     const { calls, exec } = recordingExec(child);
+     const t = makeTransport(exec);
+     const ref = await t.start(CFG);
+     expect(ref.kind).toBe("pty");
+     expect(ref.id).toMatch(/^script-/);
+     expect(calls).toHaveLength(1);
+     expect(calls[0]!.args).toEqual([
+       "script",
+       "-qefc",
+-      shQuote(`${CFG.installDir}/bin/codearts`),
++      shQuote(`${CFG.installDir}/codearts`),
+       "/dev/null",
+     ]);
+     expect(calls[0]!.env).toBe(process.env);
+   });
+ 
++  it("官方 wrapper 缺失 → WRAPPER_MISSING（禁静默回退 bin 直启；spawnPty 零调用）", async () => {
++    mkdirSync(TMP_ROOT, { recursive: true });
++    const empty = mkdtempSync(path.join(TMP_ROOT, "no-wrapper-"));
++    const cfgBad = loadConfig({ stateDir: "/nonexistent/s", installDir: empty }, {});
++    const { calls, exec } = recordingExec(makeFakeChild());
++    const t = makeTransport(exec);
++    await expect(t.start(cfgBad)).rejects.toMatchObject({ code: "WRAPPER_MISSING" });
++    expect(calls).toHaveLength(0); // 未发生任何 spawn：不回退 <installDir>/bin/codearts 直启
++  });
++
+   it("installDir 含空格时命令串经 shQuote 转义（script -c 为 sh 语义）", async () => {
++    const spaced = makeWrapperInstall("dir with space-");
+     const cfg2 = loadConfig(
+-      { stateDir: "/nonexistent/s", installDir: "/opt/dir with space" },
++      { stateDir: "/nonexistent/s", installDir: spaced },
+       {},
+     );
+     const { calls, exec } = recordingExec(makeFakeChild());
+     const t = makeTransport(exec);
+     await t.start(cfg2);
+-    expect(calls[0]!.args![2]).toBe("'/opt/dir with space/bin/codearts'");
++    expect(calls[0]!.args![2]).toBe(shQuote(path.join(spaced, "codearts")));
+   });
+ 
+   it("start 复用：存活会话幂等返回同 ref；已死会话显式 SESSION_NOT_ALIVE；未知 ref 显式 SESSION_UNKNOWN", async () => {
+     const child = makeFakeChild();
+     const t = makeTransport(recordingExec(child).exec);
+     const ref = await t.start(CFG);
+     const again = await t.start(CFG, ref);
+     expect(again).toEqual(ref);
+ 
+     child.die();
+diff --git a/plugins/codearts-bridge/test/transport-tmux.test.ts b/plugins/codearts-bridge/test/transport-tmux.test.ts
+index 6e0077dd1e..ade0a0f1f4 100644
+--- a/plugins/codearts-bridge/test/transport-tmux.test.ts
++++ b/plugins/codearts-bridge/test/transport-tmux.test.ts
+@@ -1,22 +1,25 @@
+ /**
+  * T2-03 tmux PTY 宿主测试（bun:test）。
+  *
+  * 主控裁定对照（2026-10-31）：
+  * - R-tm1 探测与错误：每次 start 执行 `tmux -V` 探测（非缓存）；失败 →
+  *   BridgeError(PTY_HOST_UNAVAILABLE)，remediation 提示安装 tmux 或
+  *   ptyHost=script；禁静默切换到 script（用例：探测失败且无 new-session 调用；
+  *   二次 start 重新探测）。
+  * - R-tm2 start 幂等：先 has-session -t codearts-<slug>；命中 → 重连不重建；
+- *   未命中 → new-session -d -s <target> <installDir>/bin/codearts（argv 数组，
++ *   未命中 → new-session -d -s <target> <installDir>/codearts（argv 数组，
+  *   禁 shell 字符串拼接）。start(ref) 对已亡会话 = 同名重建（spec 宿主重启
+  *   对账语义："存活重连/否则重启会话"）。
++ * - 修复环裁定①（2026-10-31）：PTY 双宿主经官方 wrapper `<installDir>/codearts`
++ *   启动（全量内核 env 单一真相源）；wrapper 缺失 → WRAPPER_MISSING（禁静默
++ *   回退 bin 直启；新增专测）。
+  * - R-tm3 inject 两段式：send-keys（文本）与 send-keys（Enter）两次独立调用
+  *   且保序；多行文本显式 INJECT_TEXT_MULTILINE（与 T2-02 同码）。
+  * - R-tm4 stop/alive/snapshot：stop=kill-session（不存在→幂等）；
+  *   alive=has-session 退出码；snapshot=capture-pane -p（含 meta）。
+  * - R-tm6 语义对齐：abort=立即放弃（T9 基准，残存保留给下一次 observe）；
+  *   stop 后 observe 终止（不产 done）；日志信号源与 T2-02 同语义
+  *   （kernelDataDir tail service= 行，meta 如实标注可用性）。
+  * - I1 评审修复（2026-10-31）：同名重建时活跃观察者按 stop 语义终止（不产
+  *   done、立即结束），新对象 observer 干净起步——再次 observe 可用（不再
+  *   OBSERVER_ACTIVE）；snapshot log meta 不分叉（旧 tailer 关闭如实转不可用、
+@@ -33,28 +36,52 @@ import { loadConfig } from "../src/core/config";
+ import { BridgeError } from "../src/core/errors";
+ import {
+   createTmuxTransport,
+   nodeTmuxExec,
+   type TmuxExec,
+   type TmuxRunResult,
+ } from "../src/core/transport/pty-tmux";
+ import { shQuote } from "../src/core/transport/shared";
+ import type { SessionRef, Signal } from "../src/core/transport/types";
+ 
++/** 测试用临时根（工作目录内 .tmp/，用后即删，禁系统临时目录）。 */
++const TMP_ROOT = path.join(import.meta.dir, ".tmp", "t11");
++
++/**
++ * 官方 wrapper fixture 安装目录（修复环裁定① 2026-10-31：PTY 双宿主一律经
++ * `<installDir>/codearts` 官方 wrapper 启动，禁 bin 直启）。fake tmux 用例只验
++ * 存在性与 new-session argv 形态，wrapper 不被真正执行；真机用例另行自建
++ * fake-tui.sh 转发 wrapper（makeRealInstall）。
++ */
++const WRAPPER_INSTALL = path.join(TMP_ROOT, "install-fixture");
++mkdirSync(WRAPPER_INSTALL, { recursive: true });
++writeFileSync(path.join(WRAPPER_INSTALL, "codearts"), "#!/bin/sh\nexit 0\n", "utf8");
++chmodSync(path.join(WRAPPER_INSTALL, "codearts"), 0o755);
++
+ /** 与真实环境完全隔离的配置（测试不触碰真实 HOME/安装目录）。 */
+ const CFG = loadConfig(
+-  { stateDir: "/nonexistent/codearts-bridge-tmux-test", installDir: "/nonexistent/installers" },
++  { stateDir: "/nonexistent/codearts-bridge-tmux-test", installDir: WRAPPER_INSTALL },
+   {},
+ );
+ 
+-/** 测试用临时根（工作目录内 .tmp/，用后即删，禁系统临时目录）。 */
+-const TMP_ROOT = path.join(import.meta.dir, ".tmp", "t11");
++/** 建一个带官方 wrapper 的临时 installDir（固定目录名：slug 断言的确定性前提；
++ *  beforeEach 场景下 rmSync 先清场，afterEach 经 cleanups 清理）。 */
++function makeWrapperInstall(relName: string): string {
++  const dir = path.join(TMP_ROOT, relName);
++  rmSync(dir, { recursive: true, force: true });
++  mkdirSync(dir, { recursive: true });
++  const wrapper = path.join(dir, "codearts");
++  writeFileSync(wrapper, "#!/bin/sh\nexit 0\n", "utf8");
++  chmodSync(wrapper, 0o755);
++  cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
++  return dir;
++}
+ 
+ /** 本机是否安装 tmux（真机用例开关；本机未安装 → skip）。 */
+ const HAS_TMUX = Bun.which("tmux") !== null;
+ 
+ /* ───── 测试替身：有状态 tmux 命令执行器 fake ───── */
+ 
+ interface FakeTmux {
+   exec: TmuxExec;
+   /** 已执行（成功路径）的命令调用记录（args 不含 "tmux" 本体）。 */
+   calls: Array<{ args: string[] }>;
+@@ -226,89 +253,102 @@ describe("R-tm1 探测与显式错误", () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     await t.start(CFG);
+     expect(fake.calls[0]!.args).toEqual(["-V"]);
+     fake.failProbe();
+     await expect(t.start(CFG)).rejects.toMatchObject({ code: "PTY_HOST_UNAVAILABLE" });
+   });
+ });
+ 
+ describe("R-tm2 start 幂等与会话命名", () => {
+-  it("新会话：has-session 未命中 → new-session -d -s codearts-<slug> <installDir>/bin/codearts（argv 数组、路径 shQuote）", async () => {
++  it("新会话：has-session 未命中 → new-session -d -s codearts-<slug> <installDir>/codearts 官方 wrapper（argv 数组、路径 shQuote）", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     expect(ref.kind).toBe("pty");
+-    expect(ref.id).toMatch(/^codearts-installers-[0-9a-f]{8}$/);
++    expect(ref.id).toMatch(/^codearts-install-fixture-[0-9a-f]{8}$/);
+     expect(fake.calls.map((c) => c.args)).toEqual([
+       ["-V"],
+       ["has-session", "-t", ref.id],
+-      ["new-session", "-d", "-s", ref.id, shQuote(`${CFG.installDir}/bin/codearts`)],
++      ["new-session", "-d", "-s", ref.id, shQuote(`${CFG.installDir}/codearts`)],
+     ]);
+   });
+ 
+   it("start 幂等重连：会话已存在（跨守护重启场景）→ has-session 命中 → 不重建，返回同名 ref", async () => {
+     const fake = makeFakeTmux({ exists: true });
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     expect(ref.id).toMatch(/^codearts-/);
+     expect(fake.calls.filter((c) => c.args[0] === "new-session")).toHaveLength(0);
+     const again = await t.start(CFG);
+     expect(again).toEqual(ref);
+     expect(fake.calls.filter((c) => c.args[0] === "new-session")).toHaveLength(0);
+   });
+ 
+-  it("会话名确定性：同 cfg 跨传输实例同名（重连锚点）；不同 installDir 不同名", async () => {
+-    const t1 = createTmuxTransport(makeFakeTmux().exec);
+-    const t2 = createTmuxTransport(makeFakeTmux().exec);
+-    const ref1 = await t1.start(CFG);
+-    const ref2 = await t2.start(CFG);
+-    expect(ref1.id).toBe(ref2.id);
+-    const cfg2 = loadConfig(
+-      { stateDir: "/nonexistent/s", installDir: "/opt/other-install" },
+-      {},
+-    );
+-    const ref3 = await t1.start(cfg2);
+-    expect(ref3.id).toMatch(/^codearts-other-install-[0-9a-f]{8}$/);
+-    expect(ref3.id).not.toBe(ref1.id);
+-  });
+-
+   it("start(ref)：tmux 存活 → 重连同 ref（无 new-session）；已亡 → 同名重建（对账语义：重启会话）", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(CFG);
+     const before = fake.calls.filter((c) => c.args[0] === "new-session").length;
+     const again = await t.start(CFG, ref);
+     expect(again).toEqual(ref);
+     expect(fake.calls.filter((c) => c.args[0] === "new-session")).toHaveLength(before);
+ 
+     fake.setExists(false); // 外部消亡
+     const rebuilt = await t.start(CFG, ref);
+     expect(rebuilt).toEqual(ref); // 同名（state 中引用保持有效）
+     const news = fake.calls.filter((c) => c.args[0] === "new-session");
+     expect(news).toHaveLength(before + 1);
+-    expect(news[0]!.args).toEqual(["new-session", "-d", "-s", ref.id, shQuote(`${CFG.installDir}/bin/codearts`)]);
++    expect(news[0]!.args).toEqual(["new-session", "-d", "-s", ref.id, shQuote(`${CFG.installDir}/codearts`)]);
+   });
+ 
+   it("installDir 含空格：new-session 命令参数经 shQuote（tmux 将命令参数交 sh 解析）", async () => {
++    const spaced = makeWrapperInstall("dir with space");
+     const cfg2 = loadConfig(
+-      { stateDir: "/nonexistent/s", installDir: "/opt/dir with space" },
++      { stateDir: "/nonexistent/s", installDir: spaced },
+       {},
+     );
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     const ref = await t.start(cfg2);
+     const news = fake.calls.filter((c) => c.args[0] === "new-session");
+-    expect(news[0]!.args[4]).toBe("'/opt/dir with space/bin/codearts'");
++    expect(news[0]!.args[4]).toBe(shQuote(path.join(spaced, "codearts")));
+     expect(ref.id).toMatch(/^codearts-dir-with-space-[0-9a-f]{8}$/);
+   });
+ 
++  it("官方 wrapper 缺失 → WRAPPER_MISSING（需 new-session 时；禁静默回退 bin 直启）", async () => {
++    mkdirSync(TMP_ROOT, { recursive: true });
++    const empty = mkdtempSync(path.join(TMP_ROOT, "no-wrapper-"));
++    cleanups.push(async () => rmSync(empty, { recursive: true, force: true }));
++    const cfgBad = loadConfig({ stateDir: "/nonexistent/s", installDir: empty }, {});
++    const fake = makeFakeTmux();
++    const t = createTmuxTransport(fake.exec);
++    await expect(t.start(cfgBad)).rejects.toMatchObject({ code: "WRAPPER_MISSING" });
++    expect(fake.calls.filter((c) => c.args[0] === "new-session")).toHaveLength(0);
++    // 存活会话重连不消费 wrapper：未注册路径不触发检查（重连语义不受影响）
++  });
++
++  it("会话名确定性：同 cfg 跨传输实例同名（重连锚点）；不同 installDir 不同名", async () => {
++    const t1 = createTmuxTransport(makeFakeTmux().exec);
++    const t2 = createTmuxTransport(makeFakeTmux().exec);
++    const ref1 = await t1.start(CFG);
++    const ref2 = await t2.start(CFG);
++    expect(ref1.id).toBe(ref2.id);
++    const cfg2 = loadConfig(
++      { stateDir: "/nonexistent/s", installDir: makeWrapperInstall("other-install") },
++      {},
++    );
++    const ref3 = await t1.start(cfg2);
++    expect(ref3.id).toMatch(/^codearts-other-install-[0-9a-f]{8}$/);
++    expect(ref3.id).not.toBe(ref1.id);
++  });
++
+   it("非法 ref（kind 不符 / 空 id）→ SESSION_UNKNOWN，不产生任何 tmux 调用", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec);
+     await expect(t.start(CFG, { kind: "structured", id: "codearts-x" })).rejects.toMatchObject({
+       code: "SESSION_UNKNOWN",
+     });
+     await expect(t.start(CFG, { kind: "pty", id: "" })).rejects.toMatchObject({
+       code: "SESSION_UNKNOWN",
+     });
+     expect(fake.calls).toHaveLength(0);
+@@ -661,27 +701,27 @@ describe("R-tm6 日志信号源（与 T2-02 同语义）", () => {
+ describe("nodeTmuxExec 生产缺省实现", () => {
+   it("PATH 上无 tmux → run 同步抛 PTY_HOST_UNAVAILABLE（先探测后 spawn，无竞态）", async () => {
+     const exec = nodeTmuxExec({ PATH: "" });
+     await expect(exec.run(["-V"])).rejects.toMatchObject({ code: "PTY_HOST_UNAVAILABLE" });
+   });
+ });
+ 
+ /* ───── 真机用例（本机未装 tmux → skip；attach 语义不测） ───── */
+ 
+ describe.skipIf(!HAS_TMUX)("真机 tmux 用例（需本机安装 tmux）", () => {
+-  /** 真机 fixture：临时 installDir，bin/codearts 为 fake-tui.sh 包装（读行回显）。 */
++  /** 真机 fixture：临时 installDir，官方 wrapper <installDir>/codearts 为 fake-tui.sh
++   *  包装（读行回显；修复环裁定①：PTY 经官方 wrapper 启动）。 */
+   function makeRealInstall(): { installDir: string } {
+     mkdirSync(TMP_ROOT, { recursive: true });
+     const installDir = mkdtempSync(path.join(TMP_ROOT, "real-install-"));
+-    const binDir = path.join(installDir, "bin");
+-    mkdirSync(binDir, { recursive: true });
+-    const wrapper = path.join(binDir, "codearts");
++    mkdirSync(path.join(installDir, "bin"), { recursive: true });
++    const wrapper = path.join(installDir, "codearts");
+     const fixture = path.join(import.meta.dir, "fixtures", "fake-codearts", "fake-tui.sh");
+     writeFileSync(wrapper, `#!/usr/bin/env bash\nexec bash ${JSON.stringify(fixture)} --scenario stall\n`);
+     chmodSync(wrapper, 0o755);
+     cleanups.push(async () => rmSync(installDir, { recursive: true, force: true }));
+     return { installDir };
+   }
+ 
+   /** 真机 exec：独立 TMUX_TMP_DIR 套接字目录隔离，退出时 kill-server 清场。 */
+   function realExec(): TmuxExec {
+     mkdirSync(TMP_ROOT, { recursive: true });

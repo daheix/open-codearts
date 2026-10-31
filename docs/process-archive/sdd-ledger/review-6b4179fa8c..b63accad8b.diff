@@ -1,0 +1,1118 @@
+# Review package: 6b4179fa8c..b63accad8b
+
+## Commits
+b63accad8b codearts-bridge(T1-03): 安装状态探测 — 五类 fixture、钉版/哈希/备份/autoupdate 全量状态
+
+## Files changed
+ plugins/codearts-bridge/src/core/errors.ts         |  31 ++
+ plugins/codearts-bridge/src/core/fsx.ts            |  51 +++
+ plugins/codearts-bridge/src/core/install.ts        | 410 +++++++++++++++++++++
+ .../test/fixtures/install-fixtures.ts              | 146 ++++++++
+ plugins/codearts-bridge/test/fsx.test.ts           |  65 ++++
+ plugins/codearts-bridge/test/install.test.ts       | 364 ++++++++++++++++++
+ 6 files changed, 1067 insertions(+)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/errors.ts b/plugins/codearts-bridge/src/core/errors.ts
+new file mode 100644
+index 0000000000..9be207544e
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/errors.ts
+@@ -0,0 +1,31 @@
++/**
++ * codearts-bridge 结构化错误（T1-03）。
++ *
++ * 设计（任务书接口 + 全局约束"禁静默兜底"）：
++ * - 一切需要向调用方报告的失败，统一抛 `BridgeError`：
++ *   `code` 为 UPPER_SNAKE 稳定错误码（调用方/工具层据此分支），`remediation`
++ *   为中文修复指引（用户可见），`cause` 保留底层错误便于根因定位。
++ * - `code` 保持开放 string（不做封闭联合）：后续任务（T1-04 repair /
++ *   T1-05 upgrade / T3-* 目标引擎）按同一约定增列错误码，避免频繁改动本类型。
++ * - 错误消息只含路径/原因码/字段名等存在性信息，禁止回显凭据值（与 config.ts 同纪律）。
++ */
++
++/** codearts-bridge 统一结构化错误。 */
++export class BridgeError extends Error {
++  /** 稳定错误码（UPPER_SNAKE，如 BIN_MISSING_NO_BACKUP）；调用方据此编程化分支。 */
++  readonly code: string;
++
++  /** 中文修复指引（可选；用户可见文案，面向 codearts_* 工具输出）。 */
++  readonly remediation?: string;
++
++  constructor(
++    code: string,
++    message: string,
++    options?: { remediation?: string; cause?: unknown },
++  ) {
++    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
++    this.name = "BridgeError";
++    this.code = code;
++    this.remediation = options?.remediation;
++  }
++}
+diff --git a/plugins/codearts-bridge/src/core/fsx.ts b/plugins/codearts-bridge/src/core/fsx.ts
+new file mode 100644
+index 0000000000..8b6b951959
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/fsx.ts
+@@ -0,0 +1,51 @@
++/**
++ * codearts-bridge 文件原语（T1-03 起；R-b 主控裁定：fsx 提前）。
++ *
++ * 本任务仅实现 `sha256File`（node:crypto 流式哈希）；T1-04 将在同一文件扩展
++ * sameDevice / copyDeploy / atomicWriteFile。全仓库只允许这一处文件哈希实现，
++ * 禁止任何调用方自带第二份哈希逻辑（裁定 R-b：禁止哈希两处重复实现）。
++ *
++ * 错误纪律（禁静默兜底）：任何读取失败（含 ENOENT）都显式抛
++ * BridgeError("FS_READ_FAILED")，消息含路径与原因码，原始错误挂 cause。
++ * ENOENT 的"缺失属正常态"语义由调用方（如 probeInstall 的 stat 预检）负责，
++ * 本原语不代判——哈希目标理应存在，读不到就是异常。
++ */
++import { createHash } from "node:crypto";
++import { createReadStream } from "node:fs";
++import { BridgeError } from "./errors";
++
++/** 从错误对象提取 errno 形态的 code（如 ENOENT/EACCES）；无则 undefined。 */
++export function errnoOf(e: unknown): string | undefined {
++  if (typeof e === "object" && e !== null && "code" in e) {
++    const code = (e as { code?: unknown }).code;
++    if (typeof code === "string") return code;
++  }
++  return undefined;
++}
++
++/**
++ * 流式计算文件 SHA-256（十六进制小写，64 位）。
++ *
++ * 流式而非整读：安装二进制可达数十 MB，避免一次性载入内存；
++ * node:crypto createHash 按 chunk 喂入，与 `sha256sum` 结果一致。
++ */
++export async function sha256File(filePath: string): Promise<string> {
++  return new Promise<string>((resolve, reject) => {
++    const hash = createHash("sha256");
++    const stream = createReadStream(filePath);
++    stream.on("error", (e: unknown) => {
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      reject(
++        new BridgeError("FS_READ_FAILED", `读取文件失败：path=${filePath} reason=${reason}`, {
++          cause: e,
++        }),
++      );
++    });
++    stream.on("data", (chunk: unknown) => {
++      hash.update(chunk as Buffer);
++    });
++    stream.on("end", () => {
++      resolve(hash.digest("hex"));
++    });
++  });
++}
+diff --git a/plugins/codearts-bridge/src/core/install.ts b/plugins/codearts-bridge/src/core/install.ts
+new file mode 100644
+index 0000000000..f94f6abcec
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/install.ts
+@@ -0,0 +1,410 @@
++/**
++ * codearts-bridge 安装管家——安装状态探测（T1-03）。
++ *
++ * 职责（本任务）：`probeInstall` 只读采集 codearts CLI 安装态：
++ * 二进制存在性 / --version / sha256 / 备份有效性 / autoupdate 开关 / 钉版一致性。
++ * repair / upgrade / guard 由 T1-04 / T1-05 在本文件扩展。
++ *
++ * 主控裁定依据（SDD 2026-10-31，逐条落实）：
++ * - R-a 钉版状态显式化：`pinState` 三态（unpinned/consistent/drift）——
++ *   pinned.json 缺失时 drift=false 不得掩盖"未钉版"，调用方以 pinState 区分
++ *   "未钉版"与"已钉且一致"，禁止静默假定。
++ * - R-c autoupdate 读取：路径派生 `<installDir>/../codearts_cli.json`；
++ *   文件缺失 → autoupdateFlag=undefined（显式"未知"）；JSON 解析失败或字段
++ *   类型非法 → 抛出（显式，不静默 undefined）。
++ * - R-d probeInstall 语义：只读状态采集——业务态（缺失/坏哈希/无法执行/版本不符）
++ *   以状态字段如实表达、不抛业务错误；文件系统意外错误（非 ENOENT，如 EACCES）
++ *   → 抛出（消息含路径与原因）。`--version` 解析取输出首个 `/^\d+\.\d+\.\d+/m`
++ *   匹配；exec 失败 → version=undefined（状态可见）。
++ * - R-e 隔离：Exec 注入接口 + 默认 node 实现；测试绝不真跑 codearts 二进制、
++ *   绝不触碰真实 HOME。
++ *
++ * 漂移判定口径（哈希为内容身份，版本为可读复核）：
++ * - 已钉时：二进制缺失、或 sha256 与钉版不符 → drift；
++ *   版本仅在"可解析且不等"时参与判定（exec 失败导致版本未知不算版本漂移，
++ *   版本未知本身已由 version=undefined 如实呈现）。
++ * - 备份有效性 backupValid：备份存在且为非空常规文件；有钉版时还须哈希与钉版
++ *   一致（修复源强校验），无钉版时仅要求存在且非空（无比对基准）。
++ */
++import { spawn } from "node:child_process";
++import { readFile, stat } from "node:fs/promises";
++import type { Stats } from "node:fs";
++import * as path from "node:path";
++import type { BridgeConfig } from "./config";
++import { BridgeError } from "./errors";
++import { errnoOf, sha256File } from "./fsx";
++
++/* ───── 路径派生（单一出口，T1-04/05 复用） ───── */
++
++/** 二进制绝对路径：<installDir>/bin/codearts。 */
++export function binPathOf(installDir: string): string {
++  return path.join(installDir, "bin", "codearts");
++}
++
++/** 钉版记录路径：<stateDir>/pinned.json。 */
++export function pinnedJsonPath(stateDir: string): string {
++  return path.join(stateDir, "pinned.json");
++}
++
++/** autoupdate 开关载体（R-c）：<installDir>/../codearts_cli.json。 */
++export function codeartsCliJsonPath(installDir: string): string {
++  return path.join(installDir, "..", "codearts_cli.json");
++}
++
++/* ───── Exec 注入接口（R-e） ───── */
++
++/** 子进程执行结果（code 为退出码；被信号杀死时为 -1）。 */
++export interface ExecResult {
++  code: number;
++  stdout: string;
++  stderr: string;
++}
++
++/** 命令执行抽象：测试注入 fake（绝不真跑二进制），生产用 createNodeExec。 */
++export interface Exec {
++  run(cmd: string[]): Promise<ExecResult>;
++}
++
++/** createNodeExec 可调项（超时与输出上限默认值面向 --version 探测量级）。 */
++export interface NodeExecOptions {
++  timeoutMs?: number;
++  maxOutputBytes?: number;
++}
++
++const DEFAULT_TIMEOUT_MS = 10_000;
++const DEFAULT_MAX_OUTPUT_BYTES = 1 << 20; // 1 MiB：--version 输出远小于此
++
++/**
++ * 默认 Exec：node:child_process spawn。
++ *
++ * 显式失败（禁静默兜底）：
++ * - 超时 → BridgeError("EXEC_TIMEOUT")，进程 SIGKILL；
++ * - 输出超限 → BridgeError("EXEC_OUTPUT_OVERFLOW")，进程 SIGKILL（stdout+stderr 合并计数）；
++ * - spawn 层失败（ENOENT/EACCES 等）→ 原样 reject（由 probeInstall 转为
++ *   version=undefined 状态呈现——R-d：无法执行是业务态而非 FS 异常）。
++ */
++export function createNodeExec(opts: NodeExecOptions = {}): Exec {
++  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
++  const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
++  return {
++    run(cmd: string[]): Promise<ExecResult> {
++      return new Promise<ExecResult>((resolve, reject) => {
++        const file = cmd[0];
++        if (file === undefined) {
++          reject(new BridgeError("EXEC_EMPTY_CMD", "exec 命令为空（cmd[0] 缺失）"));
++          return;
++        }
++        const child = spawn(file, cmd.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
++        let stdout = "";
++        let stderr = "";
++        let bytes = 0;
++        let settled = false;
++        let timer: ReturnType<typeof setTimeout> | undefined;
++
++        const settleFail = (err: BridgeError) => {
++          if (settled) return;
++          settled = true;
++          if (timer !== undefined) clearTimeout(timer);
++          child.kill("SIGKILL");
++          reject(err);
++        };
++        const settleResolve = (result: ExecResult) => {
++          if (settled) return;
++          settled = true;
++          if (timer !== undefined) clearTimeout(timer);
++          resolve(result);
++        };
++
++        timer = setTimeout(() => {
++          settleFail(
++            new BridgeError("EXEC_TIMEOUT", `命令超时（>${timeoutMs}ms）已强制终止：cmd=${cmd.join(" ")}`, {
++              remediation: "检查目标二进制是否挂起；若持续超时请上报审计日志",
++            }),
++          );
++        }, timeoutMs);
++
++        const onChunk = (chunk: unknown) => {
++          bytes += (chunk as Buffer).length;
++          if (bytes > maxOutputBytes) {
++            settleFail(
++              new BridgeError(
++                "EXEC_OUTPUT_OVERFLOW",
++                `命令输出超过上限（>${maxOutputBytes} 字节）已强制终止：cmd=${cmd.join(" ")}`,
++              ),
++            );
++            return;
++          }
++          stdout += (chunk as Buffer).toString("utf8");
++        };
++        child.stdout?.on("data", onChunk);
++        child.stderr?.on("data", (chunk: unknown) => {
++          bytes += (chunk as Buffer).length;
++          if (bytes <= maxOutputBytes) stderr += (chunk as Buffer).toString("utf8");
++        });
++        child.on("error", (e: Error) => {
++          if (settled) return;
++          settled = true;
++          if (timer !== undefined) clearTimeout(timer);
++          reject(e); // spawn 层失败原样上抛（调用方决定语义）
++        });
++        child.on("close", (code) => {
++          settleResolve({ code: code ?? -1, stdout, stderr }); // null=被信号杀死 → -1（非零即可判定失败）
++        });
++      });
++    },
++  };
++}
++
++/* ───── 状态模型 ───── */
++
++/** 钉版记录（pinned.json 内容；本仓库自有格式，写入方为 T1-04/05）。 */
++export interface PinnedRecord {
++  version: string;
++  sha256: string;
++}
++
++/**
++ * 钉版一致性三态（R-a：未钉版必须与"已钉一致"可区分，禁止静默假定）：
++ * - "unpinned"：pinned.json 缺失（未钉版）；
++ * - "consistent"：已钉且二进制与钉版一致（哈希相等，版本相等或未知）；
++ * - "drift"：已钉但不一致——二进制缺失、哈希不符、或版本可解析且不等。
++ */
++export type PinState = "unpinned" | "consistent" | "drift";
++
++/** 安装状态（status 工具与守护共用的只读快照）。 */
++export interface InstallStatus {
++  /** 二进制绝对路径 <installDir>/bin/codearts。 */
++  path: string;
++  /** 二进制存在（常规文件）。 */
++  present: boolean;
++  /** --version 解析值（形如 26.10.9）；缺失/无法执行/解析失败 → undefined（R-d 状态呈现）。 */
++  version?: string;
++  /** 二进制内容 sha256（present 时计算）。 */
++  sha256?: string;
++  /**
++   * 规范备份路径 <installDir>/bin/codearts.bak-<version>（命名契约见背景）；
++   * 版本名取 钉版版本 ?? 当前解析版本 ?? "unknown"（未钉且版本未知时的信息性占位，
++   * 此时 backupValid 必为 false，真实状态由字段承载，占位名不参与任何行为）。
++   */
++  backupPath: string;
++  /** 备份可作恢复源：存在且非空常规文件；有钉版时须哈希与钉版一致。 */
++  backupValid: boolean;
++  /** codearts_cli.json 的 autoupdate 字段；文件或键缺失 → undefined（显式未知，R-c）。 */
++  autoupdateFlag?: boolean;
++  /** 钉版一致性三态（R-a）。 */
++  pinState: PinState;
++  /** 便捷字段 = pinState === "drift"（未钉版时 false，靠 pinState 区分）。 */
++  drift: boolean;
++  /** 钉版记录；pinState === "unpinned" 时为 undefined。 */
++  pinned?: PinnedRecord;
++}
++
++/* ───── 内部读取原语（ENOENT 容忍 + 其他错误显式抛） ───── */
++
++/** stat；ENOENT → undefined（显式"不存在"状态）；其他错误 → BridgeError（R-d）。 */
++async function statOrEnoent(target: string): Promise<Stats | undefined> {
++  try {
++    return await stat(target);
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return undefined;
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_STAT_FAILED", `stat 失败：path=${target} reason=${reason}`, {
++      cause: e,
++    });
++  }
++}
++
++/** 读文本；ENOENT → undefined；其他错误 → BridgeError（R-d）。 */
++async function readTextOrEnoent(file: string): Promise<string | undefined> {
++  try {
++    return await readFile(file, "utf8");
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return undefined;
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取文件失败：path=${file} reason=${reason}`, {
++      cause: e,
++    });
++  }
++}
++
++/* ───── 钉版记录读取（自有格式：损坏显式报错） ───── */
++
++const VERSION_FULL_RE = /^\d+\.\d+\.\d+$/;
++const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
++
++/** 读取并校验 pinned.json；缺失 → undefined（未钉版）；损坏/非法 → BridgeError。 */
++async function readPinned(stateDir: string): Promise<PinnedRecord | undefined> {
++  const file = pinnedJsonPath(stateDir);
++  const text = await readTextOrEnoent(file);
++  if (text === undefined) return undefined;
++
++  let raw: unknown;
++  try {
++    raw = JSON.parse(text);
++  } catch (e) {
++    throw new BridgeError("PINNED_INVALID", `钉版记录 JSON 解析失败：path=${file}`, {
++      remediation: "修正或删除 pinned.json（删除即视为未钉版状态）",
++      cause: e,
++    });
++  }
++  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
++    throw new BridgeError("PINNED_INVALID", `钉版记录须为 JSON 对象：path=${file}`);
++  }
++  const record = raw as Record<string, unknown>;
++  for (const key of Object.keys(record)) {
++    if (key !== "version" && key !== "sha256") {
++      throw new BridgeError("PINNED_INVALID", `钉版记录含未知键 "${key}"（仅允许 version/sha256）：path=${file}`);
++    }
++  }
++  const version = record.version;
++  if (typeof version !== "string" || !VERSION_FULL_RE.test(version)) {
++    throw new BridgeError("PINNED_INVALID", `钉版记录 version 须为 \\d+\\.\\d+\\.\\d+ 形态：path=${file}`);
++  }
++  const sha256 = record.sha256;
++  if (typeof sha256 !== "string" || !SHA256_HEX_RE.test(sha256)) {
++    throw new BridgeError("PINNED_INVALID", `钉版记录 sha256 须为 64 位十六进制：path=${file}`);
++  }
++  return { version, sha256: sha256.toLowerCase() };
++}
++
++/* ───── autoupdate 开关读取（R-c：外来用户文件，只检目标字段） ───── */
++
++/**
++ * 读取 codearts_cli.json 的 autoupdate 字段。
++ * - 文件缺失 → undefined（显式未知）；
++ * - JSON 解析失败 / 顶层非对象 / autoupdate 字段类型非法 → 抛出（R-c 显式）；
++ * - 外来文件的其他键一律不校验（只检目标字段，非兜底）。
++ */
++async function readAutoupdateFlag(installDir: string): Promise<boolean | undefined> {
++  const file = codeartsCliJsonPath(installDir);
++  const text = await readTextOrEnoent(file);
++  if (text === undefined) return undefined;
++
++  let raw: unknown;
++  try {
++    raw = JSON.parse(text);
++  } catch (e) {
++    throw new BridgeError("AUTOUPDATE_INVALID", `codearts_cli.json 解析失败：path=${file}`, {
++      remediation: "修正该文件的 JSON 语法（该文件属 codearts CLI 用户配置）",
++      cause: e,
++    });
++  }
++  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
++    throw new BridgeError("AUTOUPDATE_INVALID", `codearts_cli.json 顶层须为 JSON 对象：path=${file}`);
++  }
++  if (!("autoupdate" in raw)) return undefined;
++  const flag = (raw as Record<string, unknown>).autoupdate;
++  if (typeof flag !== "boolean") {
++    throw new BridgeError(
++      "AUTOUPDATE_INVALID",
++      `codearts_cli.json 的 autoupdate 字段类型非法（须为布尔）：path=${file}`,
++    );
++  }
++  return flag;
++}
++
++/* ───── --version 探测与备份检查 ───── */
++
++/** 版本解析（R-d）：取输出首个 `/^\d+\.\d+\.\d+/m` 匹配；stdout 优先、stderr 兜扫（版本串可能出现在任一流）。 */
++const VERSION_PREFIX_RE = /^\d+\.\d+\.\d+/m;
++
++/**
++ * 执行 `<bin> --version` 并解析版本。
++ * - 退出码非 0 → undefined（exec 失败，R-d）；
++ * - exec 抛错（spawn 层 ENOENT/EACCES 等）→ undefined（无法执行是业务态，R-d）；
++ * - 两流均无版本形串 → undefined（解析失败）。
++ */
++async function detectVersion(exec: Exec, binPath: string): Promise<string | undefined> {
++  let result: ExecResult;
++  try {
++    result = await exec.run([binPath, "--version"]);
++  } catch {
++    return undefined;
++  }
++  if (result.code !== 0) return undefined;
++  const match = VERSION_PREFIX_RE.exec(result.stdout) ?? VERSION_PREFIX_RE.exec(result.stderr);
++  return match?.[0];
++}
++
++/**
++ * 备份有效性检查：存在且为非空常规文件；有钉版时哈希须与钉版一致。
++ * - ENOENT → false（无备份是显式状态）；
++ * - 存在但非常规文件 → 抛 BridgeError（异常态，禁止静默当 false）；
++ * - 哈希读取失败（非 ENOENT FS 错误）→ 经 sha256File 显式抛出。
++ */
++async function checkBackup(backupPath: string, pin: PinnedRecord | undefined): Promise<boolean> {
++  const st = await statOrEnoent(backupPath);
++  if (st === undefined) return false;
++  if (!st.isFile()) {
++    throw new BridgeError("FS_PATH_NOT_FILE", `备份路径存在但不是常规文件：path=${backupPath}`, {
++      remediation: "检查备份文件是否被外部改动；可执行 codearts_repair 重建备份",
++    });
++  }
++  if (st.size === 0) return false; // 空备份无恢复价值：显式规则，非兜底
++  if (pin === undefined) return true; // 无钉版：无比对基准，存在且非空即可（backupValid 语义见头注）
++  return (await sha256File(backupPath)) === pin.sha256;
++}
++
++/* ───── probeInstall ───── */
++
++/**
++ * 只读探测安装状态（R-d）。绝不写任何文件、绝不删除残留（清理属 T1-04/T1-05）。
++ *
++ * @param cfg  全局配置（消费 installDir 与 stateDir）
++ * @param deps 可注入依赖；exec 缺省用 createNodeExec（测试注入 fake）
++ */
++export async function probeInstall(
++  cfg: BridgeConfig,
++  deps: { exec?: Exec } = {},
++): Promise<InstallStatus> {
++  const exec = deps.exec ?? createNodeExec();
++  const binPath = binPathOf(cfg.installDir);
++
++  // 1) 二进制存在性与内容/版本（缺失是显式状态；存在但非常规文件是异常态 → 抛）
++  let present = false;
++  let sha256: string | undefined;
++  let version: string | undefined;
++  const binStat = await statOrEnoent(binPath);
++  if (binStat !== undefined) {
++    if (!binStat.isFile()) {
++      throw new BridgeError("FS_PATH_NOT_FILE", `二进制路径存在但不是常规文件：path=${binPath}`, {
++        remediation: "检查安装目录是否被外部改动；可执行 codearts_repair 重建",
++      });
++    }
++    present = true;
++    sha256 = await sha256File(binPath);
++    version = await detectVersion(exec, binPath);
++  }
++
++  // 2) 钉版记录与 autoupdate 开关
++  const pin = await readPinned(cfg.stateDir);
++  const autoupdateFlag = await readAutoupdateFlag(cfg.installDir);
++
++  // 3) 备份（命名契约 codearts.bak-<version>；版本名来源按头注优先级）
++  const backupName = pin?.version ?? version ?? "unknown";
++  const backupPath = path.join(cfg.installDir, "bin", `codearts.bak-${backupName}`);
++  const backupValid = await checkBackup(backupPath, pin);
++
++  // 4) 钉版一致性（R-a 三态；漂移口径见头注：版本未知不判版本漂移）
++  let pinState: PinState;
++  if (pin === undefined) {
++    pinState = "unpinned";
++  } else if (present && sha256 === pin.sha256 && (version === undefined || version === pin.version)) {
++    pinState = "consistent";
++  } else {
++    pinState = "drift";
++  }
++
++  return {
++    path: binPath,
++    present,
++    version,
++    sha256,
++    backupPath,
++    backupValid,
++    autoupdateFlag,
++    pinState,
++    drift: pinState === "drift",
++    pinned: pin,
++  };
++}
+diff --git a/plugins/codearts-bridge/test/fixtures/install-fixtures.ts b/plugins/codearts-bridge/test/fixtures/install-fixtures.ts
+new file mode 100644
+index 0000000000..1778967f11
+--- /dev/null
++++ b/plugins/codearts-bridge/test/fixtures/install-fixtures.ts
+@@ -0,0 +1,146 @@
++/**
++ * T1-03 安装状态探测 fixtures（任务书五种形态 + R-a 未钉版形态）。
++ *
++ * 纪律（主控裁定 R-e）：
++ * - 测试绝不真跑 codearts 二进制（exec 全部注入 fake；真实 exec 测试只用 /bin/sh 脚本）；
++ * - 测试绝不触碰真实 HOME：所有 FS 落点由调用方传入的 root 目录派生
++ *   （约定在插件 .tmp/install-test/ 之下，afterAll 清理）；
++ * - 目录布局模拟真实环境（背景说明）：
++ *     <root>/installers/bin/codearts            二进制
++ *     <root>/installers/bin/codearts.bak-<ver>  备份（codearts.bak-<version> 命名契约）
++ *     <root>/installers/bin/codearts.delete     升级中断残留（only-delete 形态）
++ *     <root>/state/pinned.json                  钉版记录
++ *     <root>/codearts_cli.json                  autoupdate 开关（<installDir>/../codearts_cli.json）
++ */
++import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { sha256File } from "../../src/core/fsx";
++import type { Exec } from "../../src/core/install";
++
++/** 钉版基准版本（真实环境参考值，形如 26.10.9）。 */
++export const PINNED_VERSION = "26.10.9";
++
++/** 基准二进制内容（确定字节串，哈希可复现；仅为探针 fixture，绝非真二进制）。 */
++export const BIN_CONTENT = "fake codearts binary payload v26.10.9\n";
++
++/** 漂移内容（bad-hash 形态：与钉版内容不同 → 哈希漂移）。 */
++export const DRIFT_CONTENT = "fake codearts binary payload v99.0.0 (drifted)\n";
++
++/** fixture 形态（任务书五类 + R-a 未钉版）。 */
++export type InstallFixtureKind =
++  | "healthy" // 二进制在、哈希/版本与钉版一致、备份有效
++  | "missing" // 二进制缺失、备份有效（供 T1-04 repair 使用）
++  | "only-delete" // 二进制缺失只剩 codearts.delete、无备份（Review-Focus-1）
++  | "bad-hash" // 二进制内容哈希与钉版不符（版本输出正常——隔离哈希漂移路径）
++  | "bad-version" // 内容哈希与钉版一致、--version 输出不符（隔离版本漂移路径）
++  | "unpinned"; // 无钉版记录（R-a：未钉版必须与"已钉一致"可区分）
++
++/** fixture 产物（测试据此构造 BridgeConfig 与断言）。 */
++export interface InstallFixture {
++  root: string;
++  installDir: string;
++  stateDir: string;
++  binPath: string;
++  backupPath: string;
++  /** codearts_cli.json 绝对路径（autoupdate 开关载体）。 */
++  cliPath: string;
++  /** 钉版内容（BIN_CONTENT）的 sha256（写入 pinned.json 的期望值）。 */
++  pinnedSha256: string;
++  /** 注入 probeInstall 的 fake exec。 */
++  exec: Exec;
++  /** fake exec 收到的命令记录（断言调用参数/次数）。 */
++  execCalls: string[][];
++}
++
++/** 构造 fake exec：返回固定结果并记录每次调用（绝不执行任何真实进程）。 */
++export function fakeExec(
++  result: { stdout?: string; stderr?: string; code?: number },
++  calls: string[][],
++): Exec {
++  return {
++    run: async (cmd: string[]) => {
++      calls.push(cmd);
++      return { code: result.code ?? 0, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
++    },
++  };
++}
++
++/** 抛异常的 fake exec（模拟 spawn 层失败：进程起不来）。 */
++export function throwingExec(error: Error): Exec {
++  return { run: async () => Promise.reject(error) };
++}
++
++/**
++ * 搭建 fixture 目录并按 kind 填充。
++ * pinned.json 期望哈希统一从 .expected-content 暂存文件经 sha256File 计算（复用唯一哈希实现，禁止第二实现）。
++ */
++export async function makeInstallFixture(root: string, kind: InstallFixtureKind): Promise<InstallFixture> {
++  const installDir = path.join(root, "installers");
++  const stateDir = path.join(root, "state");
++  const binDir = path.join(installDir, "bin");
++  const binPath = path.join(binDir, "codearts");
++  const backupPath = path.join(binDir, `codearts.bak-${PINNED_VERSION}`);
++  const cliPath = path.join(root, "codearts_cli.json");
++  const execCalls: string[][] = [];
++
++  await mkdir(binDir, { recursive: true });
++  await mkdir(stateDir, { recursive: true });
++
++  // 钉版哈希：经唯一实现 sha256File 从暂存文件计算，随后即删
++  const refPath = path.join(root, ".expected-content");
++  await writeFile(refPath, BIN_CONTENT, "utf8");
++  const pinnedSha256 = await sha256File(refPath);
++  await rm(refPath);
++
++  // 按形态布置 binDir 文件
++  switch (kind) {
++    case "healthy":
++    case "bad-version":
++    case "unpinned":
++      await writeFile(binPath, BIN_CONTENT, "utf8");
++      await writeFile(backupPath, BIN_CONTENT, "utf8");
++      break;
++    case "missing":
++      await writeFile(backupPath, BIN_CONTENT, "utf8");
++      break;
++    case "only-delete":
++      // 升级中断残留：只剩 codearts.delete，无二进制、无备份
++      await writeFile(path.join(binDir, "codearts.delete"), BIN_CONTENT, "utf8");
++      break;
++    case "bad-hash":
++      await writeFile(binPath, DRIFT_CONTENT, "utf8");
++      await writeFile(backupPath, BIN_CONTENT, "utf8");
++      break;
++  }
++
++  // 钉版记录（unpinned 形态不写）
++  if (kind !== "unpinned") {
++    await writePinnedFile(stateDir, { version: PINNED_VERSION, sha256: pinnedSha256 });
++  }
++
++  // autoupdate 开关（默认 false；个别测试自行覆写/删除）
++  await writeFile(cliPath, JSON.stringify({ autoupdate: false }), "utf8");
++
++  // fake exec：--version 输出按形态给定（missing/only-delete 不会被调用）。
++  // 输出契约（R-d）：版本串位于行首（probe 按 /^\d+\.\d+\.\d+/m 行首解析）
++  const versionOutput = kind === "bad-version" ? "99.99.99\n" : `${PINNED_VERSION}\n`;
++  const exec = fakeExec({ stdout: versionOutput }, execCalls);
++
++  return { root, installDir, stateDir, binPath, backupPath, cliPath, pinnedSha256, exec, execCalls };
++}
++
++/** 写 pinned.json（fixtures 与测试共用；格式契约：{"version": string, "sha256": string}）。 */
++export async function writePinnedFile(
++  stateDir: string,
++  record: { version: string; sha256: string },
++): Promise<void> {
++  await mkdir(stateDir, { recursive: true });
++  await writeFile(path.join(stateDir, "pinned.json"), JSON.stringify(record), "utf8");
++}
++
++/** 把 fixture 二进制变为可执行 shell 脚本（仅真实 exec 端到端测试使用；不跑真 codearts）。 */
++export async function makeBinExecutableShScript(binPath: string, versionOutput: string): Promise<void> {
++  // 脚本文件内为字面 \n（sh 的 printf 负责转义为换行），故模板串写 \\n
++  await writeFile(binPath, `#!/bin/sh\nprintf '${versionOutput}\\n'\n`, "utf8");
++  await chmod(binPath, 0o755);
++}
+diff --git a/plugins/codearts-bridge/test/fsx.test.ts b/plugins/codearts-bridge/test/fsx.test.ts
+new file mode 100644
+index 0000000000..db30ff7588
+--- /dev/null
++++ b/plugins/codearts-bridge/test/fsx.test.ts
+@@ -0,0 +1,65 @@
++/**
++ * T1-03 fsx 文件原语测试（R-b：本任务仅 sha256File；T1-04 在同文件扩展原语）。
++ *
++ * 纪律：FS 落点在插件 .tmp/fsx-test/ 之下，beforeEach 重建、afterAll 清理；
++ * 期望哈希用 node:crypto createHash 独立计算（测试侧 oracle，与被测实现分列）。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { createHash } from "node:crypto";
++import { mkdir, rm, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { sha256File } from "../src/core/fsx";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "fsx-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++describe("sha256File", () => {
++  it("小文件哈希与独立 oracle（createHash）一致", async () => {
++    const file = path.join(TEST_ROOT, "small.bin");
++    const content = "fake codearts binary payload v26.10.9\n";
++    await writeFile(file, content, "utf8");
++    const expected = createHash("sha256").update(content, "utf8").digest("hex");
++    expect(await sha256File(file)).toBe(expected);
++    expect(expected).toMatch(/^[0-9a-f]{64}$/);
++  });
++
++  it("空文件哈希为 SHA-256 空串标准值", async () => {
++    const file = path.join(TEST_ROOT, "empty.bin");
++    await writeFile(file, "", "utf8");
++    expect(await sha256File(file)).toBe(
++      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    );
++  });
++
++  it("大文件（跨流式 chunk，>128KB）哈希正确", async () => {
++    const file = path.join(TEST_ROOT, "large.bin");
++    // 确定性内容拼到 300KB（超过默认 64KB 流 chunk，覆盖多 chunk 聚合路径）
++    const piece = "codearts-bridge-sha256-chunk-boundary-payload-0123456789\n";
++    const content = piece.repeat(Math.ceil(300 * 1024 / piece.length));
++    await writeFile(file, content, "utf8");
++    const expected = createHash("sha256").update(content, "utf8").digest("hex");
++    expect(await sha256File(file)).toBe(expected);
++  });
++
++  it("文件不存在 → 抛 BridgeError(FS_READ_FAILED)，消息含路径与原因", async () => {
++    const file = path.join(TEST_ROOT, "nope.bin");
++    const err: unknown = await sha256File(file).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(Error);
++    expect((err as Error).name).toBe("BridgeError");
++    expect((err as { code?: string }).code).toBe("FS_READ_FAILED");
++    expect((err as Error).message).toContain(file);
++    expect((err as Error).message).toContain("ENOENT");
++  });
++});
+diff --git a/plugins/codearts-bridge/test/install.test.ts b/plugins/codearts-bridge/test/install.test.ts
+new file mode 100644
+index 0000000000..74878aec98
+--- /dev/null
++++ b/plugins/codearts-bridge/test/install.test.ts
+@@ -0,0 +1,364 @@
++/**
++ * T1-03 安装状态探测测试（bun:test）。
++ *
++ * 纪律（主控裁定 R-a/R-c/R-d/R-e）：
++ * - 绝不真跑 codearts 二进制：exec 一律注入 fake（唯一例外用 /bin/sh 脚本测真实 exec 原语）；
++ * - 绝不触碰真实 HOME：cfg 经 loadConfig 注入 .tmp/install-test/ 下的绝对路径；
++ * - probeInstall 只读状态采集：业务态以字段如实表达（不抛业务错）；
++ *   FS 意外错误（非 ENOENT）与配置文件损坏 → 显式抛 BridgeError；
++ * - afterAll 清理临时目录（用后即删）。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import { sha256File } from "../src/core/fsx";
++import { createNodeExec, probeInstall } from "../src/core/install";
++import type { BridgeConfig } from "../src/core/config";
++import {
++  BIN_CONTENT,
++  PINNED_VERSION,
++  fakeExec,
++  makeBinExecutableShScript,
++  makeInstallFixture,
++  throwingExec,
++  writePinnedFile,
++} from "./fixtures/install-fixtures";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "install-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 由 fixture 构造隔离配置（loadConfig 纯函数，无 FS 副作用）。 */
++function cfgOf(fixture: { installDir: string; stateDir: string }): BridgeConfig {
++  return loadConfig({ installDir: fixture.installDir, stateDir: fixture.stateDir }, {});
++}
++
++describe("BridgeError 结构化错误", () => {
++  it("携带 code 与可选 remediation，且是 Error 实例", () => {
++    const err = new BridgeError("BIN_MISSING_NO_BACKUP", "二进制缺失且备份无效", {
++      remediation: "重新安装或从官方入口获取",
++    });
++    expect(err).toBeInstanceOf(Error);
++    expect(err.name).toBe("BridgeError");
++    expect(err.code).toBe("BIN_MISSING_NO_BACKUP");
++    expect(err.remediation).toBe("重新安装或从官方入口获取");
++    expect(err.message).toContain("二进制缺失且备份无效");
++  });
++
++  it("remediation 缺省为 undefined；cause 经 options 透传", () => {
++    const cause = new Error("EACCES");
++    const noRem = new BridgeError("FS_READ_FAILED", "读取失败", { cause });
++    expect(noRem.remediation).toBeUndefined();
++    expect((noRem as { cause?: unknown }).cause).toBe(cause);
++  });
++});
++
++describe("probeInstall 五种 fixture 形态", () => {
++  it("healthy：present=true、版本/哈希与钉版一致、备份有效、drift=false", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "healthy"), "healthy");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++
++    expect(status.path).toBe(fx.binPath);
++    expect(status.present).toBe(true);
++    expect(status.version).toBe(PINNED_VERSION);
++    expect(status.sha256).toBe(fx.pinnedSha256);
++    expect(status.backupPath).toBe(fx.backupPath);
++    expect(status.backupValid).toBe(true);
++    expect(status.autoupdateFlag).toBe(false);
++    expect(status.pinState).toBe("consistent");
++    expect(status.drift).toBe(false);
++    expect(status.pinned).toEqual({ version: PINNED_VERSION, sha256: fx.pinnedSha256 });
++    // --version 探测恰好一次，参数为 [二进制路径, "--version"]
++    expect(fx.execCalls).toEqual([[fx.binPath, "--version"]]);
++  });
++
++  it("missing-with-valid-backup：present=false、backupValid=true（供 T1-04 repair 使用）；exec 零调用", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "missing"), "missing");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++
++    expect(status.present).toBe(false);
++    expect(status.version).toBeUndefined();
++    expect(status.sha256).toBeUndefined();
++    expect(status.backupValid).toBe(true);
++    expect(status.backupPath).toBe(fx.backupPath);
++    // 二进制不在，哈希无从比对 → 与钉版记录不符（漂移含缺失，注释见 InstallStatus.drift）
++    expect(status.pinState).toBe("drift");
++    expect(status.drift).toBe(true);
++    // 二进制缺失时绝不发起 --version 探测
++    expect(fx.execCalls).toEqual([]);
++  });
++
++  it("only-delete（Review-Focus-1）：二进制缺失且无备份 → probe 返回状态而非抛错，backupValid=false", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "only-delete"), "only-delete");
++    // 显式断言 resolves：结构性错误留给 T1-04 repair 分支，probe 本身绝不抛业务错
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++
++    expect(status.present).toBe(false);
++    expect(status.backupValid).toBe(false);
++    expect(status.pinState).toBe("drift");
++    expect(status.drift).toBe(true);
++    expect(status.version).toBeUndefined();
++    expect(fx.execCalls).toEqual([]);
++  });
++
++  it("bad-hash：内容哈希与钉版不符 → drift=true（版本输出正常，隔离哈希漂移路径）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bad-hash"), "bad-hash");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++
++    expect(status.present).toBe(true);
++    expect(status.version).toBe(PINNED_VERSION); // 版本轴正常
++    expect(status.sha256).not.toBe(fx.pinnedSha256); // 哈希轴漂移
++    expect(status.pinState).toBe("drift");
++    expect(status.drift).toBe(true);
++  });
++
++  it("bad-version：哈希与钉版一致、--version 输出不符 → drift=true（隔离版本漂移路径）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bad-version"), "bad-version");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++
++    expect(status.present).toBe(true);
++    expect(status.version).toBe("99.99.99");
++    expect(status.sha256).toBe(fx.pinnedSha256); // 哈希轴正常
++    expect(status.pinState).toBe("drift");
++    expect(status.drift).toBe(true);
++  });
++
++  it("钉版一致但 --version 不可执行（code=1）→ 版本未知不判漂移，哈希为准 → consistent；version=undefined 如实呈现", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "exec-fail"), "healthy");
++    const exec = fakeExec({ code: 1, stdout: "", stderr: "boom" }, fx.execCalls);
++    const status = await probeInstall(cfgOf(fx), { exec });
++
++    expect(status.present).toBe(true);
++    expect(status.version).toBeUndefined(); // R-d：exec 失败 → version=undefined（状态可见）
++    expect(status.sha256).toBe(fx.pinnedSha256);
++    expect(status.pinState).toBe("consistent");
++    expect(status.drift).toBe(false);
++  });
++
++  it("exec 抛异常（spawn 层失败）→ 不抛出，version=undefined 状态呈现", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "exec-throw"), "healthy");
++    const status = await probeInstall(cfgOf(fx), {
++      exec: throwingExec(new Error("spawn EACCES")),
++    });
++
++    expect(status.present).toBe(true);
++    expect(status.version).toBeUndefined();
++    expect(status.drift).toBe(false); // 哈希与钉版一致，版本未知不判漂移
++  });
++});
++
++describe("R-a 钉版状态显式化（未钉版 ≠ 已钉一致）", () => {
++  it("unpinned：pinState=unpinned、drift=false 但 pinned=undefined——与 healthy 的 consistent 可区分", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "unpinned"), "unpinned");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++
++    expect(status.pinState).toBe("unpinned");
++    expect(status.drift).toBe(false); // drift=false 不掩盖未钉版——区分看 pinState
++    expect(status.pinned).toBeUndefined();
++    expect(status.present).toBe(true);
++    expect(status.version).toBe(PINNED_VERSION);
++  });
++
++  it("unpinned 且备份存在：无钉版时 backupValid 仅要求存在且非空（哈希无比对基准）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "unpinned-bak"), "unpinned");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.backupValid).toBe(true);
++  });
++});
++
++describe("R-c autoupdate 开关读取（<installDir>/../codearts_cli.json）", () => {
++  it("autoupdate=true 时 status.autoupdateFlag=true 如实呈现", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "au-true"), "healthy");
++    await writeFile(fx.cliPath, JSON.stringify({ autoupdate: true }), "utf8");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.autoupdateFlag).toBe(true);
++  });
++
++  it("文件缺失 → autoupdateFlag=undefined（显式未知，不抛错）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "au-missing"), "healthy");
++    await rm(fx.cliPath);
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.autoupdateFlag).toBeUndefined();
++  });
++
++  it("JSON 键缺省（文件合法但无 autoupdate 键）→ undefined", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "au-nokey"), "healthy");
++    await writeFile(fx.cliPath, JSON.stringify({ other: 1 }), "utf8");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.autoupdateFlag).toBeUndefined();
++  });
++
++  it("JSON 解析失败 → 抛 BridgeError(AUTOUPDATE_INVALID)，消息含路径", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "au-corrupt"), "healthy");
++    await writeFile(fx.cliPath, "{ not json !!!", "utf8");
++    const err: unknown = await probeInstall(cfgOf(fx), { exec: fx.exec }).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("AUTOUPDATE_INVALID");
++    expect((err as Error).message).toContain(fx.cliPath);
++  });
++
++  it("autoupdate 字段类型非法（字符串）→ 抛错，不静默当 undefined", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "au-badtype"), "healthy");
++    await writeFile(fx.cliPath, JSON.stringify({ autoupdate: "yes" }), "utf8");
++    const err: unknown = await probeInstall(cfgOf(fx), { exec: fx.exec }).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("AUTOUPDATE_INVALID");
++    expect((err as Error).message).toContain("autoupdate");
++  });
++});
++
++describe("钉版记录 pinned.json 校验（自有格式，损坏显式报错）", () => {
++  it("JSON 解析失败 → 抛 BridgeError(PINNED_INVALID)，消息含路径", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "pin-corrupt"), "healthy");
++    await writeFile(path.join(fx.stateDir, "pinned.json"), "not-json{", "utf8");
++    const err: unknown = await probeInstall(cfgOf(fx), { exec: fx.exec }).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("PINNED_INVALID");
++    expect((err as Error).message).toContain("pinned.json");
++  });
++
++  it("schema 非法（sha256 非 64 位十六进制）→ 抛错", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "pin-badsha"), "healthy");
++    await writeFile(
++      path.join(fx.stateDir, "pinned.json"),
++      JSON.stringify({ version: PINNED_VERSION, sha256: "deadbeef" }),
++      "utf8",
++    );
++    await expect(probeInstall(cfgOf(fx), { exec: fx.exec })).rejects.toThrow(/sha256/);
++  });
++
++  it("schema 非法（含未知键）→ 抛错（防拼写错误静默丢字段）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "pin-unknown-key"), "healthy");
++    await writeFile(
++      path.join(fx.stateDir, "pinned.json"),
++      JSON.stringify({
++        version: PINNED_VERSION,
++        sha256: fx.pinnedSha256,
++        versions: PINNED_VERSION, // 拼写错误的键
++      }),
++      "utf8",
++    );
++    await expect(probeInstall(cfgOf(fx), { exec: fx.exec })).rejects.toThrow(/versions/);
++  });
++});
++
++describe("R-d FS 意外错误显式抛出（非 ENOENT）", () => {
++  it("二进制路径存在但是目录 → 抛 BridgeError(FS_PATH_NOT_FILE)，消息含路径", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bin-is-dir"), "missing");
++    await rm(fx.binPath, { force: true }); // missing 形态本无二进制
++    await mkdir(fx.binPath, { recursive: true }); // 换成目录：异常态，显式抛
++    const err: unknown = await probeInstall(cfgOf(fx), { exec: fx.exec }).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("FS_PATH_NOT_FILE");
++    expect((err as Error).message).toContain(fx.binPath);
++  });
++
++  it("备份路径存在但是目录 → 抛错（不静默当 backupValid=false）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-is-dir"), "missing");
++    await rm(fx.backupPath, { force: true });
++    await mkdir(fx.backupPath, { recursive: true });
++    const err: unknown = await probeInstall(cfgOf(fx), { exec: fx.exec }).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("FS_PATH_NOT_FILE");
++    expect((err as Error).message).toContain(fx.backupPath);
++  });
++
++  it("备份存在但为空文件（有钉版）→ backupValid=false（空备份无效，显式规则）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-empty"), "healthy");
++    await writeFile(fx.backupPath, "", "utf8");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.backupValid).toBe(false);
++    expect(status.drift).toBe(false); // 备份无效不改变钉版一致性判定（判定只看二进制）
++  });
++
++  it("备份存在但哈希与钉版不符 → backupValid=false（备份损坏，T1-04 repair 不得使用）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-corrupt"), "healthy");
++    await writeFile(fx.backupPath, "corrupted backup bytes\n", "utf8");
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.backupValid).toBe(false);
++    expect(status.present).toBe(true); // 二进制本身仍健康
++    expect(status.drift).toBe(false);
++  });
++});
++
++describe("createNodeExec（默认 exec 原语；真实进程仅用 /bin/sh，绝不跑真 codearts）", () => {
++  it("端到端：可执行 sh 脚本 fixture → probe 全链路 healthy", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "real-exec"), "healthy");
++    await makeBinExecutableShScript(fx.binPath, PINNED_VERSION);
++    // 脚本内容替换了 fixture 二进制 → 钉版记录按当前部署的真实哈希重写（钉版=当前期望）
++    await writePinnedFile(fx.stateDir, {
++      version: PINNED_VERSION,
++      sha256: await sha256File(fx.binPath),
++    });
++    const status = await probeInstall(cfgOf(fx)); // 不注入 exec → 默认 createNodeExec
++    expect(status.present).toBe(true);
++    expect(status.version).toBe(PINNED_VERSION);
++    expect(status.pinState).toBe("consistent");
++  });
++
++  it("端到端：二进制无执行权限（0644）→ 不抛错，version=undefined 状态呈现", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "real-noexec"), "healthy");
++    // 覆写为同内容但无执行位的文件（无 x 位 → 即便 root 也 EACCES，确定性）：
++    // 哈希仍与钉版一致 → 版本未知不判漂移；version=undefined 单独呈现 exec 失败
++    await writeFile(fx.binPath, BIN_CONTENT, "utf8");
++    await chmod(fx.binPath, 0o644);
++    const status = await probeInstall(cfgOf(fx));
++    expect(status.present).toBe(true);
++    expect(status.version).toBeUndefined();
++    expect(status.sha256).toBe(fx.pinnedSha256);
++    expect(status.pinState).toBe("consistent");
++    expect(status.drift).toBe(false);
++  });
++
++  it("超时（timeoutMs 可配）→ 抛 BridgeError(EXEC_TIMEOUT)，进程被强杀", async () => {
++    const exec = createNodeExec({ timeoutMs: 200 });
++    const err: unknown = await exec.run(["sh", "-c", "sleep 5"]).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("EXEC_TIMEOUT");
++  });
++
++  it("输出超限（maxOutputBytes 可配）→ 抛 BridgeError(EXEC_OUTPUT_OVERFLOW)", async () => {
++    const exec = createNodeExec({ timeoutMs: 5000, maxOutputBytes: 8 });
++    const err: unknown = await exec.run(["sh", "-c", "printf '0123456789abcdef'"]).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as { code?: string }).code).toBe("EXEC_OUTPUT_OVERFLOW");
++  });
++
++  it("正常捕获 stdout 与退出码", async () => {
++    const exec = createNodeExec({ timeoutMs: 5000 });
++    const result = await exec.run(["sh", "-c", "printf '26.10.9'; exit 3"]);
++    expect(result.code).toBe(3);
++    expect(result.stdout).toBe("26.10.9");
++  });
++});

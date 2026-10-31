@@ -1,0 +1,1438 @@
+# Review package: 4797bfb3..b5be623412
+
+## Commits
+b5be623412 codearts-bridge(T2-04): structured 传输 — JSONL 事件解析/会话续接/错误分级/AK-SK 前置检查 — createStructuredTransport(exec) 实现 CodeartsTransport 六方法（签名偏差注明：plan 卡 (cfg,exec,aksk?)，types.ts 唯一真相源以 start(cfg) 交付配置、R-s2 前置 readAksk(cfg.akskFile)，避免 installDir/凭据双真相源并对齐 T2-02/T2-03 先例；全事件驱动无轮询故不注入时钟）。R-s1 回合=进程：inject 即 spawn <installDir>/bin/codearts run <prompt> --format json --print-logs（argv 数组禁 shell 拼接，多行 prompt 合法），--session <id> 续接；session id 事件行宽容提取（sessionID/session_id 首现捕获不改写），非 JSON 行/未知 JSON 事件原文转 output（不静默丢弃）。R-s2 AK/SK 前置：每次 start 执行 readAksk（非缓存），缺失/不完整 → AKSK_MISSING（remediation 含官方配置入口 portal/settings/cli-auth 与 akskFile 写法），不静默转 PTY。R-s3 env 装配：父进程全量环境+CODEARTS_CLI_AK/SK 注入，OPENCODE_MODE 不注入。R-s4 并发=1：活跃回合再 inject → ROUND_ACTIVE；stop=detached+负 PID 组杀（/proc 实证无残留）、ESRCH 幂等、会话终态（inject/start(ref) → SESSION_NOT_ALIVE）；回合退出 code=0 → 一次性 done、code≠0 → error（无 done，会话不死亡可续接）。R-s5 事件→信号映射表入文件头注释（session.id→step/message.part→output/error→error/其余原文 output）；classifyError 纯函数（ECONNRESET/timeout/429/503→retryable，认证失败→fatal 且优先）。nodeRunSpawnProc 生产 seam（lookPath 预检→STRUCTURED_SPAWN_FAILED、双流独立 StringDecoder、退出残段冲刷、spawn error 显式转 code=null 退出）。fake-run.ts fixture 七场景（normal/stall/error/crash/echo/env/session-continuation，env 只输出键存在性绝不泄漏值）经 wrapper+bun 真实 spawn 全离线驱动；28 新测试（fake exec 确定性 + 真机链路），全量 251 pass/1 skip/0 fail + typecheck 零错误
+
+## Files changed
+ .../src/core/transport/structured.ts               | 597 +++++++++++++++++
+ .../test/fixtures/fake-codearts/fake-run.ts        | 104 +++
+ .../test/transport-structured.test.ts              | 707 +++++++++++++++++++++
+ 3 files changed, 1408 insertions(+)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/transport/structured.ts b/plugins/codearts-bridge/src/core/transport/structured.ts
+new file mode 100644
+index 0000000000..be8d41a82f
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/transport/structured.ts
+@@ -0,0 +1,597 @@
++/**
++ * codearts-bridge structured 传输（T2-04）—— `codearts run --format json` 驱动。
++ *
++ * 职责：CodeartsTransport 的结构化通道实现——**每回合 = 一个独立
++ * `<installDir>/bin/codearts run <prompt> --format json --print-logs` 进程**
++ * （回合进程退出即回合结束，内核内存每回合归零——痛点②治理主路径；会话连续性
++ * 经 `--session <id>` 续接）。契约唯一真相源为 types.ts；本文件实现其全部六方法，
++ * 并对齐 T2-01 FakeTransport 的可观测语义（T3-03 监督状态机可迁移基准）。
++ *
++ * 主控裁定对照（2026-10-31，逐条落实）：
++ * - R-s1 回合=进程：inject(ref, prompt) 即发起新回合——spawn argv 一律数组传递
++ *   （禁 shell 字符串拼接，prompt 为单个 argv 元素，空格/特殊字符不被拆词解释）；
++ *   `--session <id>` 续接（会话 id 已捕获时）。session id 从事件行宽容提取：
++ *   任意 JSON 对象行的 `sessionID` / `session_id` 字符串字段，**首现即捕获、
++ *   后续不改写**；非 JSON 行保留原文为 output 信号（宽容解析，不静默丢弃）。
++ * - R-s2 AK/SK 前置：每次 start 均执行 readAksk(cfg.akskFile)（非缓存）；缺失
++ *  （文件不存在 / AK、SK 任一为空）→ BridgeError(AKSK_MISSING)，remediation 含
++ *   官方配置入口与 config.env 说明；**不静默转 PTY**。读取错误（EACCES 等）
++ *   由 readAksk 原样向上传播（显式不吞）。会话缓存最近一次成功 start 的凭据，
++ *   后续回合 env 装配用缓存值（凭据文件中途删除不追溯已建会话——显式语义）。
++ * - R-s3 env 装配：沿用父进程全量环境（wrapper 全量字段语义：不裁剪任何变量），
++ *   仅叠加 CODEARTS_CLI_AK / CODEARTS_CLI_SK；OPENCODE_MODE 不注入（交由 run
++ *   子命令语义；如实测发现必须，须显式注释依据再补——当前无证据）。
++ * - R-s4 并发=1：同一 ref 存在活跃回合（已 spawn 且退出回调未到）时再 inject →
++ *   BridgeError(ROUND_ACTIVE)；kill = 直接杀进程+进程组（生产 spawn detached 使
++ *   回合进程为进程组长，stop 经 process.kill(-pid, SIGKILL) 组杀——T2-02 教训：
++ *   防孤儿内部 server；ESRCH 视为终止目标已达成，其余错误显式抛
++ *   STRUCTURED_STOP_FAILED）；进程退出 → 一次性 done（code=0）/ error（code≠0）
++ *   信号并清理（回合状态留账，下次 inject 覆盖）。
++ * - R-s5 事件→信号映射表（唯一真相源，本表即注释）：
++ *   ┌──────────────────────────────────┬─────────────────────────────────────┐
++ *   │ JSONL 行                          │ Signal                              │
++ *   ├──────────────────────────────────┼─────────────────────────────────────┤
++ *   │ JSON 对象 type="session.id"       │ 捕获会话 id（首现）+ step（原文整行） │
++ *   │ JSON 对象 type="message.part"     │ output（text=part.text，无则原文整行）│
++ *   │ JSON 对象 type="error"            │ error（text=message，无则原文整行）   │
++ *   │ 其余 JSON 对象（未知事件）          │ output（原文整行，宽容不丢弃）        │
++ *   │ 非 JSON 行（日志噪声/横幅）         │ output（原文整行，宽容不丢弃）        │
++ *   │ 任意 JSON 对象含 sessionID/        │ 捕获会话 id（首现优先，不改写）       │
++ *   │ session_id 字符串字段              │ （与上述映射叠加，不互斥）            │
++ *   │ 进程退出 code=0                   │ done（一次性，无 text，随后迭代结束） │
++ *   │ 进程退出 code≠0                   │ error（一次性，text=退出码详情，       │
++ *   │                                  │  无 done；随后迭代结束）              │
++ *   └──────────────────────────────────┴─────────────────────────────────────┘
++ *   classifyError(line)：ECONNRESET / timeout / 429 / 503 → "retryable"；
++ *   认证失败 → "fatal"（**优先于 retryable**——凭据缺失重试无意义，须人工配置）；
++ *   其余 → undefined。子串宽容匹配（面向 T3 重试策略的分类线索，非解析器）。
++ *
++ * 设计裁决（实现者决策，供评审）：
++ * - 签名：`createStructuredTransport(exec)`——plan 卡写 `(cfg, exec, aksk?)`，
++ *   但 types.ts（T2-01 唯一真相源）以 start(cfg) 逐次交付配置、aksk 经
++ *   readAksk(cfg.akskFile) 在 start 内前置读取（R-s2），为避免 installDir/凭据
++ *   双真相源并对齐 T2-02/T2-03 先例，取 (exec) 单参（本传输无轮询时钟需求：
++ *   全事件驱动，行回调/退出回调直接驱动，无需注入 clock）。
++ * - 语义映射：inject = 发起新回合（text 即本轮 prompt；接口注"注入一段文本
++ *  （如续跑指令）"的 structured 对应物）；prompt 允许多行/任意字符（argv 元素
++ *   直传，无 PTY 两段式提交问题，故无 INJECT_TEXT_MULTILINE 检查）；空串 prompt
++ *   显式拒绝（INJECT_TEXT_EMPTY——空回合必为调用方缺陷）。
++ * - alive() 语义：!closed（会话可接受新回合即"存活"）。回合进程存活与否属回合
++ *   状态，由 snapshot.meta.activeRound / lastExit 如实标注——回合失败（exit≠0）
++ *   产 error 信号但**不**宣告会话死亡（监督层可续接新回合重试，T3 依赖此语义；
++ *   与 PTY 宿主"进程死=会话死"的固有差异源于回合=进程模型）。
++ * - stop 为会话终态（closed）：终止活跃回合进程组、观察终止（不产 done）、
++ *   后续 inject/start(ref) 显式 SESSION_NOT_ALIVE（与 PTY 宿主终态语义一致）。
++ * - stdout/stderr 合并为同一行流（按到达序）；每流独立 StringDecoder（多字节
++ *   跨 chunk 完整还原）；进程退出时冲刷残段（stdout 先于 stderr）——最后一行
++ *   无换行符的事件不丢失。
++ * - start(cfg) 不 spawn 任何进程（回合进程仅由 inject 发起）：start 只做 AK/SK
++ *   前置检查与会话登记；ref.id = `structured-<n>`（本实例内唯一不透明标识）。
++ *
++ * 语义裁决（显式报错，禁静默兜底；与 Fake/script 对齐项注明）：
++ * - 未知 ref（未注册/kind 不符）：SESSION_UNKNOWN（与 Fake 同）；
++ * - 活跃回合中 inject：ROUND_ACTIVE（并发=1，R-s4）；空 prompt：INJECT_TEXT_EMPTY；
++ * - 同一 ref 并发第二个 observe：OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
++ * - observe 尊重 opts.signal（T9 基准）：abort=立即放弃——残存未消费信号丢弃
++ *   不交付当前消费者、保留给下一次 observe、不 flush、不抛错；
++ * - stop 后 observe 终止（不产 done）；回合退出信号交付完毕后迭代自然结束
++ *   （再 observe 为立即结束的空迭代——空闲会话无信号流，等下一回合）；
++ * - spawn 失败（bin 缺失/不可执行，lookPath 预检）：STRUCTURED_SPAWN_FAILED
++ *  （remediation 指向 codearts_status/repair）；组杀失败（非 ESRCH）：
++ *   STRUCTURED_STOP_FAILED——均显式抛出。
++ */
++
++import { spawn } from "node:child_process";
++import * as path from "node:path";
++import { StringDecoder } from "node:string_decoder";
++import { readAksk, type Aksk, type BridgeConfig } from "../config";
++import { BridgeError } from "../errors";
++import { lookPath } from "./shared";
++import type {
++  CodeartsTransport,
++  ObserveOptions,
++  SessionRef,
++  Signal,
++  TransportKind,
++} from "./types";
++
++/** 回合进程退出信息（code=null 表示 spawn 本身失败，signal 携带原因码）。 */
++export interface ProcExit {
++  code: number | null;
++  signal: string | null;
++}
++
++/** 回合子进程句柄（注入 seam；单播回调，start 注入端在 spawn 后接线一次）。 */
++export interface ProcChild {
++  pid: number;
++  /** 注册行回调：stdout/stderr 按到达序解码分行的完整行（含残段冲刷）。 */
++  onLine(cb: (line: string) => void): void;
++  /** 注册退出回调（一次性）。 */
++  onExit(cb: (exit: ProcExit) => void): void;
++  /** 终止进程组（生产：detached + 负 PID SIGKILL；ESRCH 幂等）。 */
++  kill(): void;
++  alive(): boolean;
++}
++
++/** 回合进程执行器（注入 seam）：测试注入 fake（离线零进程），生产用 nodeRunSpawnProc。 */
++export interface StructuredExec {
++  /** spawn 一个回合进程；argv 数组传参（禁 shell 拼接）；spawn 失败同步抛错。 */
++  spawnProc(args: string[], env: NodeJS.ProcessEnv): ProcChild;
++}
++
++/* ───── 生产缺省 ProcChild 实现（node child_process，直 exec 不经 shell） ───── */
++
++/**
++ * 生产缺省 spawnProc：直接 exec args[0]（绝对路径，detached 使其为进程组长），
++ * stdin=ignore（prompt 走 argv，回合进程不读 stdin——无写端 EPIPE 面）。
++ * - 可执行文件缺失/不可执行：先 lookPath 预检（accessSync X_OK）再 spawn，
++ *   同步抛 STRUCTURED_SPAWN_FAILED（无竞态窗口）；
++ * - R-p6 同款 UTF-8 纪律：stdout/stderr 各持独立 StringDecoder；
++ * - 退出时冲刷两流残段（stdout 先于 stderr）后回调 exit——最后一行无换行符
++ *   的事件不丢失；
++ * - spawn 期 'error'（预检后的竞态，如 EACCES/EMFILE）：显式转退出回调
++ *   （code=null，signal=SPAWN_ERROR:<errno>），由传输层产出 error 信号，绝不静默；
++ * - kill = process.kill(-pid, SIGKILL) 组杀（R-s4：防孤儿内部 server）；
++ *   ESRCH = 已死（幂等），其余错误显式抛 STRUCTURED_STOP_FAILED。
++ */
++export function nodeRunSpawnProc(args: string[], env: NodeJS.ProcessEnv): ProcChild {
++  const exe = args[0];
++  if (exe === undefined || exe === "") {
++    throw new BridgeError("STRUCTURED_SPAWN_FAILED", "spawnProc 参数缺少可执行文件路径", {
++      remediation: "检查 structured 传输装配参数（<installDir>/bin/codearts）。",
++    });
++  }
++  const resolved = lookPath(exe, env); // 含 "/" → accessSync X_OK 直检
++  if (resolved === null) {
++    throw new BridgeError("STRUCTURED_SPAWN_FAILED", `可执行文件缺失或不可执行：${exe}`, {
++      remediation: "运行 codearts_status 检查安装完整性；必要时用 codearts_repair 修复。",
++    });
++  }
++  const child = spawn(resolved, args.slice(1), {
++    detached: true, // R-s4：回合进程为新进程组长，供 kill(-pid) 组杀
++    env,
++    stdio: ["ignore", "pipe", "pipe"],
++  });
++  if (child.pid === undefined) {
++    throw new BridgeError("STRUCTURED_SPAWN_FAILED", `进程 spawn 失败：${exe}`);
++  }
++  const pid: number = child.pid; // 收窄捕获（child.pid 类型为 number|undefined）
++
++  let exited = false;
++  const decOut = new StringDecoder("utf8");
++  const decErr = new StringDecoder("utf8");
++  let partialOut = ""; // 未遇 \n 的行尾残段（跨 chunk 保持）
++  let partialErr = "";
++  let lineSink: ((line: string) => void) | null = null;
++  let exitSink: ((exit: ProcExit) => void) | null = null;
++
++  const emitLine = (line: string): void => {
++    lineSink?.(line); // 空行也如实交付（宽容，不静默丢弃）
++  };
++
++  /** 增量解码 → 完整行（按流独立缓冲，跨 chunk 多字节安全）。 */
++  const feed = (chunk: string, which: "out" | "err"): void => {
++    const partial = which === "out" ? (partialOut += chunk) : (partialErr += chunk);
++    const parts = partial.split("\n");
++    const rest = parts.pop() ?? ""; // 末段可能不完整：留待下一增量
++    if (which === "out") partialOut = rest;
++    else partialErr = rest;
++    for (const raw of parts) {
++      emitLine(raw.endsWith("\r") ? raw.slice(0, -1) : raw);
++    }
++  };
++
++  /** 退出时残段冲刷（进程已终，无更多输入；stdout 先于 stderr）。 */
++  const flush = (partial: string): void => {
++    if (partial === "") return;
++    emitLine(partial.endsWith("\r") ? partial.slice(0, -1) : partial);
++  };
++
++  child.stdout?.on("data", (b: Buffer) => feed(decOut.write(b), "out"));
++  child.stderr?.on("data", (b: Buffer) => feed(decErr.write(b), "err"));
++  // 流错误（典型：读端异常）= 底层进程已死：alive() 如实转 false（显式状态，
++  // 不改变错误呈现——exit 事件仍会到达并驱动 error 信号）。
++  child.stdout?.on("error", () => {
++    exited = true;
++  });
++  child.stderr?.on("error", () => {
++    exited = true;
++  });
++  child.on("exit", (code, signal) => {
++    exited = true;
++    flush(partialOut);
++    partialOut = "";
++    flush(partialErr);
++    partialErr = "";
++    exitSink?.({ code, signal });
++  });
++  child.on("error", (e: NodeJS.ErrnoException) => {
++    // spawn 失败（预检后竞态）：显式转退出回调（code=null），绝不静默吞掉。
++    if (exited) return;
++    exited = true;
++    exitSink?.({ code: null, signal: `SPAWN_ERROR:${e.code ?? "UNKNOWN"}` });
++  });
++
++  return {
++    pid,
++    onLine(cb) {
++      lineSink = cb;
++    },
++    onExit(cb) {
++      exitSink = cb;
++    },
++    kill() {
++      if (exited) return;
++      try {
++        process.kill(-pid, "SIGKILL"); // R-s4：负 pid = 进程组 SIGKILL
++      } catch (e) {
++        const code = (e as NodeJS.ErrnoException | null)?.code;
++        if (code !== "ESRCH") {
++          throw new BridgeError(
++            "STRUCTURED_STOP_FAILED",
++            `回合进程组终止失败：pid=${pid} errno=${code ?? String(e)}`,
++            { cause: e },
++          );
++        }
++        // ESRCH：进程组已不存在——终止目标已达成（stop 幂等），非静默兜底
++      }
++    },
++    alive() {
++      return !exited;
++    },
++  };
++}
++
++/* ───── 会话状态 ───── */
++
++/** 单个回合的可变状态（活跃回合与刚退出回合共用；下次 inject 覆盖）。 */
++interface RoundState {
++  child: ProcChild;
++  /** 退出回调已到（回合终局；此后会话空闲，可发起新回合）。 */
++  exitSeen: boolean;
++  /** 回合终局信号（done/error）是否已入队（只产一次）。 */
++  exitSignalEnqueued: boolean;
++}
++
++/** 单个 structured 会话的全部可变状态（经 ref.id 寻址；含已 stop 会话：留账不丢）。 */
++interface StructSession {
++  ref: SessionRef;
++  /** 最近一次成功 start 绑定的配置（回合 argv 装配用；start(ref) 刷新）。 */
++  cfg: BridgeConfig;
++  /** 最近一次成功 start 前置读取的凭据（回合 env 装配用；R-s2 注）。 */
++  aksk: Aksk;
++  /** 已捕获的 codearts 会话 id（null = 尚未建立；首现捕获后不改写）。 */
++  codeartsSessionId: string | null;
++  /** 当前回合（null = 从未发起/已被新一轮覆盖）。 */
++  round: RoundState | null;
++  /** 已发起回合总数（snapshot.meta.rounds）。 */
++  roundSeq: number;
++  /** 最近一次回合退出信息（snapshot.meta.lastExit）。 */
++  lastExit: ProcExit | null;
++  /** raw 缓冲：output/error 信号 text 按序累积（每条后接 \n；与消费无关）。 */
++  raw: string;
++  /** 待消费信号队列（事件行 / 回合终局信号）。 */
++  queue: Signal[];
++  /** observe 挂起等待者（wakeAll 唤醒后自旋复查状态）。 */
++  waiters: Array<() => void>;
++  /** 当前活跃观察者标记（单观察者模型；null = 无）。 */
++  observer: symbol | null;
++  /** stop 置位：会话终态（观察终止、注入拒绝）。 */
++  closed: boolean;
++}
++
++/** 会话唤醒/等待机制（与 pty-script 同构；本传输无轮询，纯事件驱动）。 */
++function wakeAll(s: StructSession): void {
++  const waiters = s.waiters.splice(0);
++  for (const wake of waiters) wake();
++}
++
++function waitFor(s: StructSession): Promise<void> {
++  return new Promise((resolve) => {
++    s.waiters.push(resolve);
++  });
++}
++
++/* ───── structured 传输 ───── */
++
++/**
++ * 构造 structured 传输（回合=进程）。
++ * @param exec 回合进程执行器注入 seam：生产传 { spawnProc: nodeRunSpawnProc }；
++ *   测试注入 fake（离线零进程）或经 nodeRunSpawnProc 真实 spawn fixture。
++ */
++export function createStructuredTransport(exec: StructuredExec): CodeartsTransport {
++  const kind: TransportKind = "structured";
++  /** 会话表：id → 状态（含已 stop 会话：snapshot/留账不丢）。 */
++  const sessions = new Map<string, StructSession>();
++  let idNext = 0;
++
++  function requireSession(ref: SessionRef): StructSession {
++    const s = ref.kind === kind ? sessions.get(ref.id) : undefined;
++    if (s === undefined) {
++      throw new BridgeError("SESSION_UNKNOWN", `未知会话引用：kind=${ref.kind} id=${ref.id}`, {
++        remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
++      });
++    }
++    return s;
++  }
++
++  /**
++   * R-s5 事件行解析 → 信号入队（映射表见文件头——唯一真相源）。
++   * 宽容纪律：非 JSON 行、非对象 JSON、未知事件类型一律原文 output（不静默丢弃）；
++   * 会话 id 提取对所有 JSON 对象行生效（sessionID/session_id，首现捕获不改写）。
++   */
++  function handleLine(s: StructSession, line: string): void {
++    let obj: unknown = undefined;
++    try {
++      obj = JSON.parse(line);
++    } catch {
++      // 非 JSON：走原文 output 分支
++    }
++    if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
++      const ev = obj as Record<string, unknown>;
++      // 会话 id 宽容提取（首现优先，捕获后不改写）
++      if (s.codeartsSessionId === null) {
++        const sid = ev.sessionID ?? ev.session_id;
++        if (typeof sid === "string" && sid !== "") s.codeartsSessionId = sid;
++      }
++      const type = typeof ev.type === "string" ? ev.type : null;
++      if (type === "session.id") {
++        s.queue.push({ t: "step", at: Date.now(), text: line });
++        wakeAll(s);
++        return;
++      }
++      if (type === "message.part") {
++        const part = ev.part;
++        const partText =
++          typeof part === "object" && part !== null && typeof (part as Record<string, unknown>).text === "string"
++            ? ((part as Record<string, unknown>).text as string)
++            : null;
++        const text = partText ?? (typeof ev.text === "string" ? ev.text : line);
++        s.raw += `${text}\n`;
++        s.queue.push({ t: "output", at: Date.now(), text });
++        wakeAll(s);
++        return;
++      }
++      if (type === "error") {
++        const text = typeof ev.message === "string" ? ev.message : line;
++        s.raw += `${text}\n`;
++        s.queue.push({ t: "error", at: Date.now(), text });
++        wakeAll(s);
++        return;
++      }
++      // 其余 JSON 对象：落到下方原文 output（宽容不丢弃）
++    }
++    s.raw += `${line}\n`;
++    s.queue.push({ t: "output", at: Date.now(), text: line });
++    wakeAll(s);
++  }
++
++  const transport: CodeartsTransport = {
++    kind,
++
++    async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
++      // R-s2：AK/SK 前置检查——每次 start 都执行（非缓存）；readAksk 的非 ENOENT
++      // 错误原样向上传播（显式不吞）。
++      const aksk = await readAksk(cfg.akskFile);
++      if (
++        aksk === undefined ||
++        aksk.AK === undefined ||
++        aksk.AK === "" ||
++        aksk.SK === undefined ||
++        aksk.SK === ""
++      ) {
++        throw new BridgeError(
++          "AKSK_MISSING",
++          `structured 传输要求 AK/SK 凭据（F2 实测：无头 run 命令强制 CODEARTS_CLI_AK/SK）：akskFile=${cfg.akskFile}`,
++          {
++            remediation: `在 https://codearts.huaweicloud.com/portal/settings/cli-auth 获取 CLI 凭据，写入 ${cfg.akskFile}（两行：AK=… / SK=…，权限 0600）后重试；如需免凭据交互请显式配置 pty 传输，本传输不静默切换。`,
++          },
++        );
++      }
++      if (ref !== undefined) {
++        const s = requireSession(ref);
++        if (s.closed) {
++          throw new BridgeError("SESSION_NOT_ALIVE", `会话已停止，不可复用：id=${ref.id}`, {
++            remediation: "structured 会话 stop 后为终态；请新建会话（start 不带 ref）。",
++          });
++        }
++        s.cfg = cfg; // 刷新绑定配置与凭据（下一回合装配用最新值）
++        s.aksk = aksk;
++        return { ...s.ref };
++      }
++      const id = `structured-${++idNext}`;
++      const created: SessionRef = { kind, id };
++      sessions.set(id, {
++        ref: created,
++        cfg,
++        aksk,
++        codeartsSessionId: null,
++        round: null,
++        roundSeq: 0,
++        lastExit: null,
++        raw: "",
++        queue: [],
++        waiters: [],
++        observer: null,
++        closed: false,
++      });
++      return { ...created };
++    },
++
++    async inject(ref: SessionRef, text: string): Promise<void> {
++      const s = requireSession(ref);
++      if (s.closed) {
++        throw new BridgeError("SESSION_NOT_ALIVE", `会话已停止，拒绝注入：id=${ref.id}`, {
++          remediation: "structured 会话 stop 后为终态；请新建会话（start 不带 ref）。",
++        });
++      }
++      // R-s4 并发=1：活跃回合（已 spawn、退出回调未到）期间禁止新回合
++      if (s.round !== null && !s.round.exitSeen) {
++        throw new BridgeError("ROUND_ACTIVE", `会话已有活跃回合（并发=1）：id=${ref.id}`, {
++          remediation: "等待当前回合结束（done/error 信号）或 stop 终止后再发起新回合。",
++        });
++      }
++      if (text.length === 0) {
++        throw new BridgeError("INJECT_TEXT_EMPTY", "注入文本为空（prompt 不得为空串）", {
++          remediation: "提供非空 prompt；空回合必为调用方缺陷，本传输显式拒绝。",
++        });
++      }
++      // R-s1：argv 数组传参（禁 shell 拼接）；--session 续接已捕获会话
++      const argv = [path.join(s.cfg.installDir, "bin", "codearts"), "run", text];
++      if (s.codeartsSessionId !== null) argv.push("--session", s.codeartsSessionId);
++      argv.push("--format", "json", "--print-logs");
++      // R-s3：父进程全量环境 + CODEARTS_CLI_AK/SK 注入；OPENCODE_MODE 不注入
++      const env: NodeJS.ProcessEnv = {
++        ...process.env,
++        CODEARTS_CLI_AK: s.aksk.AK,
++        CODEARTS_CLI_SK: s.aksk.SK,
++      };
++      const child = exec.spawnProc(argv, env); // spawn 失败（bin 缺失等）同步抛出，回合不登记
++      s.roundSeq++;
++      const round: RoundState = { child, exitSeen: false, exitSignalEnqueued: false };
++      s.round = round;
++      child.onLine((line) => handleLine(s, line));
++      child.onExit((exit) => {
++        round.exitSeen = true;
++        s.lastExit = exit;
++        if (round.exitSignalEnqueued) return; // 只产一次（防御重复回调）
++        round.exitSignalEnqueued = true;
++        // 注：stop() 组杀触发的退出同样如实入账（error 信号入队）——会话已
++        // closed，该信号随终态保留在队列（记录事实），不向已终止的观察补投 done。
++        if (exit.code === 0) {
++          s.queue.push({ t: "done", at: Date.now() }); // R-s5：退出码 0 → done（无 text）
++        } else {
++          // 回合失败：error 信号（会话不死亡——可续接新回合，见 alive() 语义注）
++          const detail = `回合进程异常退出：code=${exit.code} signal=${exit.signal ?? "null"}`;
++          s.raw += `${detail}\n`;
++          s.queue.push({ t: "error", at: Date.now(), text: detail });
++        }
++        wakeAll(s);
++      });
++    },
++
++    observe(ref: SessionRef, observeOpts?: ObserveOptions): AsyncIterable<Signal> {
++      const s = requireSession(ref);
++      if (s.observer !== null) {
++        throw new BridgeError("OBSERVER_ACTIVE", `会话已有活跃观察者（单观察者模型）：id=${ref.id}`, {
++          remediation: "先结束当前观察（迭代完成/return/abort）再重新 observe。",
++        });
++      }
++      if (observeOpts?.signal?.aborted) return emptySignals(); // 未开始即取消
++
++      const token = Symbol("observer");
++      s.observer = token;
++      const signal = observeOpts?.signal;
++      let terminated = false;
++      const release = (): void => {
++        if (s.observer === token) s.observer = null;
++      };
++
++      async function* iterate(): AsyncGenerator<Signal> {
++        const onAbort = (): void => wakeAll(s);
++        signal?.addEventListener("abort", onAbort, { once: true });
++        try {
++          while (true) {
++            // abort = 立即放弃：残存不交付当前消费者、保留在队列给下一次 observe（T9 基准同态）
++            if (signal?.aborted || terminated) return;
++            if (s.queue.length > 0) {
++              yield s.queue.shift() as Signal;
++              continue;
++            }
++            if (s.closed) return; // stop：观察直接终止（不产 done，与 Fake 同态）
++            if (s.round !== null && s.round.exitSignalEnqueued) {
++              return; // 回合终局信号已交付：本次观察自然终结（空闲会话无信号流）
++            }
++            await waitFor(s);
++          }
++        } finally {
++          signal?.removeEventListener("abort", onAbort);
++          release();
++        }
++      }
++
++      // 包装迭代器（与 FakeTransport M34 / pty-script 同构，来源标注）：显式
++      // return/throw 先同步终结挂起等待并释放观察者，再委托内部 generator——
++      // "未启动即 return"（generator 体未执行、finally 不触发）也不泄漏。
++      const inner = iterate();
++      const iterator: AsyncIterator<Signal> = {
++        next: () => inner.next(),
++        return: (v?: unknown) => {
++          terminated = true;
++          release();
++          wakeAll(s);
++          return inner.return(v as undefined);
++        },
++        throw: (e?: unknown) => {
++          terminated = true;
++          release();
++          wakeAll(s);
++          return inner.throw(e);
++        },
++      };
++      return { [Symbol.asyncIterator]: () => iterator };
++    },
++
++    async alive(ref: SessionRef): Promise<boolean> {
++      // structured 语义：会话可接受新回合即"存活"（回合进程存活状态见
++      // snapshot.meta.activeRound/lastExit；回合失败不宣告会话死亡）。
++      return !requireSession(ref).closed;
++    },
++
++    async stop(ref: SessionRef): Promise<void> {
++      const s = requireSession(ref);
++      if (s.closed) return; // 幂等
++      s.closed = true;
++      // R-s4：直接杀进程+进程组（detached+负 PID；ESRCH=已达成，见生产实现注）
++      if (s.round !== null && !s.round.exitSeen && s.round.child.alive()) {
++        s.round.child.kill();
++      }
++      wakeAll(s);
++    },
++
++    async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
++      const s = requireSession(ref);
++      return {
++        // raw = output/error 信号文本按序累积（每条后接 \n）；step/done 不入 raw
++        raw: s.raw,
++        meta: {
++          id: s.ref.id,
++          kind: s.ref.kind,
++          host: "structured",
++          codeartsSessionId: s.codeartsSessionId,
++          activeRound: s.round !== null && !s.round.exitSeen,
++          rounds: s.roundSeq,
++          lastExit: s.lastExit === null ? null : { ...s.lastExit },
++          alive: !s.closed,
++          closed: s.closed,
++        },
++      };
++    },
++  };
++
++  return transport;
++}
++
++/**
++ * R-s5 错误分级（纯函数；供 T3 监督层对 error 信号文本分类）。
++ * 优先级：认证失败（fatal，须人工配置凭据，重试无意义）先于可重试特征。
++ * 匹配为行内子串宽容匹配（分类线索，非解析器）。
++ */
++export function classifyError(line: string): "retryable" | "fatal" | undefined {
++  if (line.includes("认证失败")) return "fatal";
++  const lower = line.toLowerCase();
++  if (
++    lower.includes("econnreset") ||
++    lower.includes("timeout") ||
++    line.includes("429") ||
++    line.includes("503")
++  ) {
++    return "retryable";
++  }
++  return undefined;
++}
++
++/** 空信号迭代（observe 收到已 abort 的 signal 时返回；不占观察者）。 */
++function emptySignals(): AsyncIterable<Signal> {
++  return (async function* () {})();
++}
+diff --git a/plugins/codearts-bridge/test/fixtures/fake-codearts/fake-run.ts b/plugins/codearts-bridge/test/fixtures/fake-codearts/fake-run.ts
+new file mode 100644
+index 0000000000..c59634ca32
+--- /dev/null
++++ b/plugins/codearts-bridge/test/fixtures/fake-codearts/fake-run.ts
+@@ -0,0 +1,104 @@
++/**
++ * fake-run.ts — `codearts run` 测试替身（T2-04）。
++ *
++ * 经生产 seam（nodeRunSpawnProc）真实 spawn（离线本地；绝不跑真实 codearts）。
++ * 由测试装配的 `<installDir>/bin/codearts` wrapper 调用，形态：
++ *   wrapper: #!/bin/sh
++ *            exec '<bun>' '<本文件>' --scenario <s> "$@"
++ *   传输层拼装的回合 argv（不含 bin 本体）经 "$@" 透传：
++ *            run <prompt> [--session <id>] --format json --print-logs
++ *
++ * 场景（--scenario）：
++ *   normal（缺省）: 首回合输出 session.id + 两条 message.part；带 --session 则
++ *                   输出"续接:<id>"一条 message.part（证明参数经 wrapper 端到端
++ *                   送达）；退出码 0。
++ *   session-continuation: 显式续接场景——有 --session 输出"续接:<id>"；否则输出
++ *                   新 session.id + "首回合:<prompt>"；退出码 0。
++ *   echo:           输出自身回合 argv（JSON 行，type=argv）——供测试断言传输层
++ *                   拼装的 argv 形态（含 --session、空格 prompt 不被拆词）；退出码 0。
++ *   env:            输出 CODEARTS_CLI_AK/CODEARTS_CLI_SK 键存在性（"set"/"unset"，
++ *                   **绝不输出值**——凭据不跨进程边界）；退出码 0。
++ *   error:          输出 {"type":"error", message:"认证失败…"}（F2 实测文案）；
++ *                   退出码 0（error 事件 ≠ 回合失败；回合失败由退出码表达）。
++ *   crash:          向 stderr 输出非 JSON 行（宽容解析样本）后以退出码 7 终止
++ *                   （回合失败路径：exit≠0 → error 信号、无 done）。
++ *   stall:          输出 session.id 后常驻（永不退出的 interval），供 stop 进程组
++ *                   终止测试经 /proc 扫描核对无残留。
++ *
++ * 退出方式：一律 process.exitCode 赋值 + 自然结束（避免 pipe 缓冲未刷即退）；
++ * 仅 stall 例外（常驻，靠外部 kill）。
++ */
++
++const args = process.argv.slice(2);
++
++let scenario = "normal";
++if (args[0] === "--scenario") {
++  scenario = args[1] ?? "normal";
++}
++
++/** 回合参数解析（传输层拼装形态：run <prompt> [--session <id>] --format json --print-logs） */
++const runIdx = args.indexOf("run");
++const roundPrompt = runIdx >= 0 ? (args[runIdx + 1] ?? "") : "";
++const sessionIdx = args.indexOf("--session");
++const sessionId = sessionIdx >= 0 ? (args[sessionIdx + 1] ?? null) : null;
++
++/** 结构化事件输出：一行一个 JSON 对象（JSONL）。 */
++const out = (obj: Record<string, unknown>): void => {
++  console.log(JSON.stringify(obj));
++};
++
++switch (scenario) {
++  case "stall": {
++    out({ type: "session.id", sessionID: "ses-stall-1" });
++    setInterval(() => {}, 1_000_000); // 常驻：直到被进程组 kill
++    break;
++  }
++  case "error": {
++    out({
++      type: "error",
++      message: "认证失败，没有设置环境变量CODEARTS_CLI_AK/CODEARTS_CLI_SK",
++    });
++    process.exitCode = 0;
++    break;
++  }
++  case "crash": {
++    console.error("kernel panic: fake 内部崩溃（非 JSON 行，宽容解析样本）");
++    process.exitCode = 7;
++    break;
++  }
++  case "echo": {
++    out({ type: "argv", argv: args });
++    process.exitCode = 0;
++    break;
++  }
++  case "env": {
++    out({
++      type: "env",
++      CODEARTS_CLI_AK: process.env.CODEARTS_CLI_AK !== undefined ? "set" : "unset",
++      CODEARTS_CLI_SK: process.env.CODEARTS_CLI_SK !== undefined ? "set" : "unset",
++    });
++    process.exitCode = 0;
++    break;
++  }
++  case "session-continuation": {
++    if (sessionId !== null) {
++      out({ type: "message.part", part: { type: "text", text: `续接:${sessionId}` } });
++    } else {
++      out({ type: "session.id", sessionID: "ses-cont-1" });
++      out({ type: "message.part", part: { type: "text", text: `首回合:${roundPrompt}` } });
++    }
++    process.exitCode = 0;
++    break;
++  }
++  default: {
++    if (sessionId !== null) {
++      out({ type: "message.part", part: { type: "text", text: `续接:${sessionId}` } });
++    } else {
++      out({ type: "session.id", sessionID: "ses-fake-001" });
++      out({ type: "message.part", part: { type: "text", text: `回复:${roundPrompt}` } });
++      out({ type: "message.part", part: { type: "text", text: "done-part" } });
++    }
++    process.exitCode = 0;
++    break;
++  }
++}
+diff --git a/plugins/codearts-bridge/test/transport-structured.test.ts b/plugins/codearts-bridge/test/transport-structured.test.ts
+new file mode 100644
+index 0000000000..b7bbec81ba
+--- /dev/null
++++ b/plugins/codearts-bridge/test/transport-structured.test.ts
+@@ -0,0 +1,707 @@
++/**
++ * T2-04 structured 传输测试（bun:test）。
++ *
++ * 主控裁定对照（2026-10-31）：
++ * - R-s1 回合=进程：每回合 spawn `<installDir>/bin/codearts run <prompt> --format
++ *   json --print-logs`（argv 数组，禁 shell 拼接）；`--session <id>` 续接；session
++ *   id 从事件行宽容提取（sessionID/session_id 首现）；非 JSON 行保留原文为 output
++ *   信号（宽容解析，不静默丢弃）。
++ * - R-s2 AK/SK 前置：start 前置检查 readAksk(cfg.akskFile)；缺失 →
++ *   BridgeError(AKSK_MISSING)（remediation 含官方配置入口与 config.env 说明）；
++ *   不静默转 PTY。
++ * - R-s3 env 装配：沿用父进程全量环境 + 注入 CODEARTS_CLI_AK/SK；OPENCODE_MODE
++ *   不注入（交由 run 子命令语义）。
++ * - R-s4 并发=1：同一 ref 活跃回合中新回合显式错误（ROUND_ACTIVE）；kill=直接杀
++ *   进程+进程组（detached+负 PID）；进程退出 → done/error 信号并清理。
++ * - R-s5 事件→信号映射表（唯一真相源见 structured.ts 文件头）；classifyError：
++ *   ECONNRESET/timeout/429/503 → retryable；认证失败 → fatal；其余 undefined。
++ *
++ * 隔离：fake exec 全离线（确定性、零进程）；真机链路经生产 seam
++ * nodeRunSpawnProc 实跑 fake-run.ts fixture（wrapper + bun，绝不跑真实
++ * codearts、不触真实 HOME）；FS 落点仅插件 test/.tmp/，afterEach 清理
++ * （含 /proc 残留进程清扫，防用例中途失败跨用例污染）。
++ */
++import { afterEach, describe, expect, it } from "bun:test";
++import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import * as path from "node:path";
++import { loadConfig, type BridgeConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import {
++  classifyError,
++  createStructuredTransport,
++  nodeRunSpawnProc,
++  type ProcChild,
++  type ProcExit,
++} from "../src/core/transport/structured";
++import type { SessionRef, Signal } from "../src/core/transport/types";
++
++/** 测试用临时根（工作目录内 .tmp/，用后即删，禁系统临时目录）。 */
++const TMP_ROOT = path.join(import.meta.dir, ".tmp", "t12");
++
++/** fake-run.ts fixture 路径。 */
++const FIXTURE = path.join(import.meta.dir, "fixtures", "fake-codearts", "fake-run.ts");
++
++/* ───── 测试环境装配 ───── */
++
++/** sh 单引号转义（wrapper 内路径，数据源仅测试临时路径）。 */
++function shq(s: string): string {
++  return `'${s.replaceAll("'", `'\\''`)}'`;
++}
++
++interface Ctx {
++  root: string;
++  cfg: BridgeConfig;
++}
++
++/**
++ * 建立与真实环境完全隔离的测试上下文：临时 aksk 文件（缺省 AK/SK 就绪）+
++ * installDir。withBin=true 时再写 `<installDir>/bin/codearts` wrapper（sh 脚本
++ * exec bun 运行 fake-run.ts；scenario 固化在 wrapper 中——传输层只认 bin 路径，
++ * 场景切换经重写 wrapper 实现）。
++ */
++function makeCtx(
++  opts: {
++    withBin?: boolean;
++    scenario?: string;
++    aksk?: "full" | "ak-only" | "empty-sk" | "none";
++  } = {},
++): Ctx {
++  const akskMode = opts.aksk ?? "full";
++  mkdirSync(TMP_ROOT, { recursive: true });
++  const root = mkdtempSync(path.join(TMP_ROOT, "ctx-"));
++  const akskFile = path.join(root, "config.env");
++  if (akskMode === "full") writeFileSync(akskFile, "AK=ak-test\nSK=sk-test\n");
++  else if (akskMode === "ak-only") writeFileSync(akskFile, "AK=ak-test\n");
++  else if (akskMode === "empty-sk") writeFileSync(akskFile, "AK=ak-test\nSK=\n");
++  // none：不写文件（缺失）
++  const installDir = path.join(root, "installers");
++  mkdirSync(installDir, { recursive: true });
++  if (opts.withBin) {
++    writeBinWrapper(installDir, opts.scenario);
++  }
++  const cfg = loadConfig({ stateDir: path.join(root, "state"), installDir, akskFile }, {});
++  return { root, cfg };
++}
++
++/** 写 `<installDir>/bin/codearts` wrapper（scenario 可选固化）。 */
++function writeBinWrapper(installDir: string, scenario?: string): string {
++  const binDir = path.join(installDir, "bin");
++  mkdirSync(binDir, { recursive: true });
++  const scenarioArg = scenario ? ` --scenario ${scenario}` : "";
++  const binPath = path.join(binDir, "codearts");
++  writeFileSync(binPath, `#!/bin/sh\nexec ${shq(process.execPath)} ${shq(FIXTURE)}${scenarioArg} "$@"\n`);
++  chmodSync(binPath, 0o755); // 显式 chmod：writeFileSync 的 mode 受 umask 掩蔽
++  return binPath;
++}
++
++/* ───── 测试替身：fake ProcChild / fake exec ───── */
++
++interface FakeProc extends ProcChild {
++  pid: number;
++  killed: number;
++  isAlive: boolean;
++  exits: ProcExit[];
++  emitLine(line: string): void;
++  exit(code: number | null, signal: string | null): void;
++}
++
++function makeFakeProc(pid: number): FakeProc {
++  let lineCb: ((line: string) => void) | null = null;
++  let exitCb: ((e: ProcExit) => void) | null = null;
++  const p: FakeProc = {
++    pid,
++    killed: 0,
++    isAlive: true,
++    exits: [],
++    onLine(cb) {
++      lineCb = cb;
++    },
++    onExit(cb) {
++      exitCb = cb;
++    },
++    kill() {
++      p.killed++;
++      p.isAlive = false;
++    },
++    alive() {
++      return p.isAlive;
++    },
++    emitLine(line) {
++      lineCb?.(line);
++    },
++    exit(code, signal) {
++      p.isAlive = false;
++      const e: ProcExit = { code, signal };
++      p.exits.push(e);
++      exitCb?.(e);
++    },
++  };
++  return p;
++}
++
++/** fake exec：记录每次 spawnProc 的 (args, env)，按调用序产出 fake child。 */
++function makeFakeExec() {
++  const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
++  const procs: FakeProc[] = [];
++  return {
++    calls,
++    procs,
++    exec: {
++      spawnProc(args: string[], env: NodeJS.ProcessEnv): ProcChild {
++        calls.push({ args, env });
++        const p = makeFakeProc(1000 + procs.length);
++        procs.push(p);
++        return p;
++      },
++    },
++  };
++}
++
++/** 生产 seam 真实 spawn（离线本地 fixture）。 */
++const realExec = {
++  spawnProc(args: string[], env: NodeJS.ProcessEnv): ProcChild {
++    return nodeRunSpawnProc(args, env);
++  },
++};
++
++/* ───── 测试辅助 ───── */
++
++const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
++
++/** 断言 fn 拒绝并以指定 code 的 BridgeError 落定（禁静默兜底——未抛即失败）。 */
++async function expectBridgeError(fn: () => Promise<unknown>, code: string): Promise<BridgeError> {
++  try {
++    await fn();
++  } catch (e) {
++    expect(e).toBeInstanceOf(BridgeError);
++    expect((e as BridgeError).code).toBe(code);
++    return e as BridgeError;
++  }
++  throw new Error(`期望抛出 BridgeError(${code})，但未抛出`);
++}
++
++/** 同步版 expectBridgeError（observe/start 同步抛错路径）。 */
++function expectSyncBridgeError(fn: () => unknown, code: string): BridgeError {
++  try {
++    fn();
++  } catch (e) {
++    expect(e).toBeInstanceOf(BridgeError);
++    expect((e as BridgeError).code).toBe(code);
++    return e as BridgeError;
++  }
++  throw new Error(`期望同步抛出 BridgeError(${code})，但未抛出`);
++}
++
++/** 限时收集信号直至谓词命中（超时抛错，避免用例悬挂）。 */
++async function collectUntil(
++  iter: AsyncIterator<Signal>,
++  until: (sig: Signal, acc: string) => boolean,
++  timeoutMs = 8000,
++): Promise<{ got: Signal[]; acc: string }> {
++  const got: Signal[] = [];
++  let acc = "";
++  const deadline = Date.now() + timeoutMs;
++  while (true) {
++    const remaining = deadline - Date.now();
++    if (remaining <= 0) {
++      throw new Error(`collectUntil 超时（${timeoutMs}ms）；已收 ${got.length} 条，累计文本=${JSON.stringify(acc)}`);
++    }
++    const r = await Promise.race([iter.next(), sleep(remaining).then(() => null)]);
++    if (r === null) throw new Error(`collectUntil 超时（等待 next 挂起）；累计文本=${JSON.stringify(acc)}`);
++    if (r.done) return { got, acc };
++    got.push(r.value);
++    if (r.value.text !== undefined) acc += r.value.text;
++    if (until(r.value, acc)) return { got, acc };
++  }
++}
++
++/** 迭代器封装（显式 return 释放观察者）。 */
++function iterOf(t: AsyncIterable<Signal>): AsyncIterator<Signal> {
++  return t[Symbol.asyncIterator]();
++}
++
++/** /proc 全量 cmdline 扫描（进程残留核对）。 */
++function procCmdlines(): string[] {
++  const out: string[] = [];
++  for (const entry of readdirSync("/proc")) {
++    if (!/^\d+$/.test(entry)) continue;
++    try {
++      out.push(readFileSync(path.join("/proc", entry, "cmdline")).toString("utf8").replaceAll("\0", " "));
++    } catch {
++      // 进程已消失：跳过（扫描语义）
++    }
++  }
++  return out;
++}
++
++const hasFixtureMarker = (lines: string[], scenario?: string): boolean =>
++  lines.some((c) => c.includes("fake-run.ts") && (scenario === undefined || c.includes(`--scenario ${scenario}`)));
++
++/** 测试侧清场：杀掉一切残留的 fake-run.ts 进程（用例中途失败时防跨用例污染）。 */
++function killLeftovers(): void {
++  for (const entry of readdirSync("/proc")) {
++    if (!/^\d+$/.test(entry)) continue;
++    try {
++      const cmd = readFileSync(path.join("/proc", entry, "cmdline")).toString("utf8");
++      if (cmd.includes("fake-run.ts")) process.kill(Number(entry), "SIGKILL");
++    } catch {
++      // 进程已消失：清场目标已达成
++    }
++  }
++}
++
++afterEach(() => {
++  killLeftovers();
++  rmSync(TMP_ROOT, { recursive: true, force: true });
++});
++
++/* ═══════ R-s2 AK/SK 前置检查（start 门控） ═══════ */
++
++describe("R-s2 AK/SK 前置检查（start 门控）", () => {
++  it("aksk 文件缺失 → start 抛 AKSK_MISSING，remediation 含官方配置入口与文件路径；零 spawn（不静默转 PTY）", async () => {
++    const ctx = makeCtx({ aksk: "none" });
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const err = await expectBridgeError(() => t.start(ctx.cfg), "AKSK_MISSING");
++    expect(err.remediation).toContain("https://codearts.huaweicloud.com/portal/settings/cli-auth");
++    expect(err.remediation).toContain(ctx.cfg.akskFile);
++    expect(fake.calls.length).toBe(0); // 前置失败绝不 spawn
++  });
++
++  it("仅 AK 无 SK、或 SK 为空串 → 均 AKSK_MISSING（凭据不完整视同缺失，显式报错）", async () => {
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ctx1 = makeCtx({ aksk: "ak-only" });
++    await expectBridgeError(() => t.start(ctx1.cfg), "AKSK_MISSING");
++    const ctx2 = makeCtx({ aksk: "empty-sk" });
++    await expectBridgeError(() => t.start(ctx2.cfg), "AKSK_MISSING");
++    expect(fake.calls.length).toBe(0);
++  });
++
++  it("AK/SK 就绪 → start 成功：ref.kind=structured；start(ref) 幂等返回同 ref", async () => {
++    const ctx = makeCtx();
++    const t = createStructuredTransport(makeFakeExec().exec);
++    const ref = await t.start(ctx.cfg);
++    expect(ref.kind).toBe("structured");
++    const again = await t.start(ctx.cfg, ref);
++    expect(again).toEqual(ref);
++  });
++
++  it("start(ref) 每次都重新执行前置检查（非缓存）：凭据文件删除后 start(ref) → AKSK_MISSING", async () => {
++    const ctx = makeCtx();
++    const t = createStructuredTransport(makeFakeExec().exec);
++    const ref = await t.start(ctx.cfg);
++    rmSync(ctx.cfg.akskFile);
++    await expectBridgeError(() => t.start(ctx.cfg, ref), "AKSK_MISSING");
++  });
++});
++
++/* ═══════ R-s1 回合=进程：argv/env 装配（fake exec 断言） ═══════ */
++
++describe("R-s1 回合=进程：argv/env 装配", () => {
++  it("首回合 argv = [bin, run, <prompt>, --format, json, --print-logs]（无 --session；prompt 含空格保持单元素）；env 注入 AK/SK 且全量继承父环境、OPENCODE_MODE 不注入", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "你好 世界");
++    expect(fake.calls.length).toBe(1);
++    const call = fake.calls[0]!;
++    expect(call.args).toEqual([
++      path.join(ctx.cfg.installDir, "bin", "codearts"),
++      "run",
++      "你好 世界",
++      "--format",
++      "json",
++      "--print-logs",
++    ]);
++    // R-s3：CODEARTS_CLI_AK/SK 注入；其余字段沿用父进程全量环境（wrapper 字段语义）
++    expect(call.env.CODEARTS_CLI_AK).toBe("ak-test");
++    expect(call.env.CODEARTS_CLI_SK).toBe("sk-test");
++    expect(call.env.PATH).toBe(process.env.PATH);
++    expect(call.env.OPENCODE_MODE).toBe(process.env.OPENCODE_MODE); // 不注入：与父进程一致
++  });
++
++  it("session id 捕获（sessionID 首现）→ 第二回合 argv 含 --session <id>；后续行携带不同 id 不改写（首现优先）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p1");
++    fake.procs[0]!.emitLine('{"type":"session.id","sessionID":"ses-1"}');
++    fake.procs[0]!.exit(0, null);
++    await t.inject(ref, "p2");
++    const args2 = fake.calls[1]!.args;
++    expect(args2).toContain("--session");
++    expect(args2[args2.indexOf("--session") + 1]).toBe("ses-1");
++    fake.procs[1]!.emitLine('{"type":"message.part","sessionID":"ses-OTHER","part":{"text":"x"}}');
++    fake.procs[1]!.exit(0, null);
++    await t.inject(ref, "p3");
++    const args3 = fake.calls[2]!.args;
++    expect(args3[args3.indexOf("--session") + 1]).toBe("ses-1");
++  });
++
++  it("session_id 蛇形键同样宽容捕获（无 type 字段的事件行也扫描）；捕获前回合 argv 无 --session", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p1");
++    expect(fake.calls[0]!.args.includes("--session")).toBe(false);
++    fake.procs[0]!.emitLine('{"foo":"bar","session_id":"ses-snake"}');
++    fake.procs[0]!.exit(0, null);
++    await t.inject(ref, "p2");
++    const args2 = fake.calls[1]!.args;
++    expect(args2[args2.indexOf("--session") + 1]).toBe("ses-snake");
++  });
++
++  it("空 prompt 显式拒绝（INJECT_TEXT_EMPTY），零 spawn", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await expectBridgeError(() => t.inject(ref, ""), "INJECT_TEXT_EMPTY");
++    expect(fake.calls.length).toBe(0);
++  });
++});
++
++/* ═══════ R-s5 事件→信号映射（fake exec 确定性） ═══════ */
++
++describe("R-s5 事件→信号映射", () => {
++  it("映射表：session.id→step；message.part(part.text)→output；type=error(message)→error；非 JSON 行→output(原文)；未知 JSON 对象→output(原文)；顺序保持", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const p = fake.procs[0]!;
++    p.emitLine('{"type":"session.id","sessionID":"ses-m"}');
++    p.emitLine('{"type":"message.part","part":{"type":"text","text":"第一段"}}');
++    p.emitLine("this is not json（日志噪声样本）");
++    p.emitLine('{"type":"error","message":" boom "}');
++    p.emitLine('{"type":"custom.event","payload":1}');
++    p.emitLine('{"type":"message.part","part":{"text":"末段"}}');
++    p.exit(0, null);
++    const it = iterOf(t.observe(ref));
++    const r1 = await it.next();
++    expect(r1.value!.t).toBe("step"); // session.id → step
++    expect(r1.value!.text).toBe('{"type":"session.id","sessionID":"ses-m"}');
++    const r2 = await it.next();
++    expect(r2.value!.t).toBe("output");
++    expect(r2.value!.text).toBe("第一段"); // part.text 提取
++    const r3 = await it.next();
++    expect(r3.value!.t).toBe("output");
++    expect(r3.value!.text).toBe("this is not json（日志噪声样本）"); // 非 JSON 原文保留
++    const r4 = await it.next();
++    expect(r4.value!.t).toBe("error");
++    expect(r4.value!.text).toBe(" boom "); // message 提取
++    const r5 = await it.next();
++    expect(r5.value!.t).toBe("output");
++    expect(r5.value!.text).toBe('{"type":"custom.event","payload":1}'); // 未知 JSON 原文
++    const r6 = await it.next();
++    expect(r6.value!.t).toBe("output");
++    expect(r6.value!.text).toBe("末段");
++    const r7 = await it.next();
++    expect(r7.value!.t).toBe("done"); // 退出码 0 → done
++    expect(r7.value!.text).toBeUndefined();
++    const r8 = await it.next();
++    expect(r8.done).toBe(true); // 迭代自然结束
++  });
++
++  it("退出码 0 → 一次性 done；done 后迭代结束（不重复交付）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    fake.procs[0]!.exit(0, null);
++    const { got } = await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
++    expect(got.filter((s) => s.t === "done").length).toBe(1);
++  });
++
++  it("退出码 7 → error 信号（text 含 code=7）、无 done、迭代结束（回合失败路径）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    fake.procs[0]!.exit(7, null);
++    const it = iterOf(t.observe(ref));
++    const r = await collectUntil(it, (sig) => sig.t === "error" && (sig.text ?? "").includes("code=7"));
++    expect(r.got.some((s) => s.t === "done")).toBe(false);
++    const next = await it.next();
++    expect(next.done).toBe(true);
++  });
++
++  it("error 事件后正常退出 0 → error 与 done 都交付（error 事件 ≠ 回合失败，回合失败只看退出码）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    fake.procs[0]!.emitLine('{"type":"error","message":"warn-ish"}');
++    fake.procs[0]!.exit(0, null);
++    const { got } = await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
++    expect(got.some((s) => s.t === "error" && s.text === "warn-ish")).toBe(true);
++    expect(got.some((s) => s.t === "done")).toBe(true);
++  });
++
++  it("回合结束后再 observe → 立即正常结束的空迭代（不悬挂；回合=进程，空闲会话无信号流）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    fake.procs[0]!.emitLine('{"type":"message.part","part":{"text":"x"}}');
++    fake.procs[0]!.exit(0, null);
++    const it1 = iterOf(t.observe(ref));
++    await collectUntil(it1, (sig) => sig.t === "done"); // 第一次观察消费完
++    await it1.return?.(); // 释放观察者（单观察者模型）
++    const it2 = iterOf(t.observe(ref));
++    const r = await Promise.race([it2.next(), sleep(500).then(() => null)]);
++    expect(r).not.toBeNull(); // 未悬挂
++    expect(r!.done).toBe(true); // 且立即正常结束
++  });
++
++  it("snapshot：raw = output/error 信号文本按序累积（每行一条 \\n，step/done 不入 raw）；meta{host/codeartsSessionId/rounds/lastExit/alive}", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const p = fake.procs[0]!;
++    p.emitLine('{"type":"session.id","sessionID":"ses-r"}');
++    p.emitLine('{"type":"message.part","part":{"text":"甲"}}');
++    p.emitLine('{"type":"error","message":"乙"}');
++    p.exit(0, null);
++    await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
++    const snap = await t.snapshot(ref);
++    expect(snap.raw).toBe("甲\n乙\n");
++    expect(snap.meta.host).toBe("structured");
++    expect(snap.meta.codeartsSessionId).toBe("ses-r");
++    expect(snap.meta.rounds).toBe(1);
++    expect(snap.meta.alive).toBe(true); // 回合结束 ≠ 会话死亡（可续接新回合）
++    expect(snap.meta.lastExit).toEqual({ code: 0, signal: null });
++  });
++});
++
++/* ═══════ classifyError（R-s5 纯函数） ═══════ */
++
++describe("classifyError（R-s5 错误分级）", () => {
++  it("ECONNRESET / timeout / 429 / 503 → retryable（大小写不敏感、行内子串命中）", () => {
++    expect(classifyError("read ECONNRESET connection broken")).toBe("retryable");
++    expect(classifyError("Request TIMEOUT after 30s")).toBe("retryable");
++    expect(classifyError("HTTP 429 Too Many Requests")).toBe("retryable");
++    expect(classifyError("upstream 503 Service Unavailable")).toBe("retryable");
++  });
++
++  it("认证失败 → fatal 且优先于 retryable；其余 → undefined", () => {
++    expect(classifyError("认证失败，没有设置环境变量CODEARTS_CLI_AK/CODEARTS_CLI_SK")).toBe("fatal");
++    expect(classifyError("认证失败且上游 503")).toBe("fatal"); // fatal 优先：重试无意义
++    expect(classifyError(" everything is fine ")).toBeUndefined();
++    expect(classifyError("")).toBeUndefined();
++  });
++});
++
++/* ═══════ R-s4 并发与生命周期 ═══════ */
++
++describe("R-s4 并发与生命周期", () => {
++  it("活跃回合中 inject → ROUND_ACTIVE（并发=1）；回合结束后可再注入新回合", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p1");
++    await expectBridgeError(() => t.inject(ref, "p2"), "ROUND_ACTIVE");
++    fake.procs[0]!.exit(0, null);
++    await t.inject(ref, "p3"); // 不误报
++    expect(fake.calls.length).toBe(2);
++  });
++
++  it("stop：kill 进程（fake 记数）、alive=false、挂起 observe 立即结束且不产 done、stop 幂等", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const it = iterOf(t.observe(ref));
++    const pending = it.next(); // 挂起等待
++    await t.stop(ref);
++    const r = await pending;
++    expect(r.done).toBe(true); // 不产 done 信号，直接终止（与 Fake/PTY 同态）
++    expect(fake.procs[0]!.killed).toBe(1);
++    expect(await t.alive(ref)).toBe(false);
++    await t.stop(ref); // 幂等
++    expect(fake.procs[0]!.killed).toBe(1);
++  });
++
++  it("stop 后：inject → SESSION_NOT_ALIVE；start(ref) → SESSION_NOT_ALIVE（stop 为会话终态）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    fake.procs[0]!.exit(0, null);
++    await t.stop(ref);
++    await expectBridgeError(() => t.inject(ref, "q"), "SESSION_NOT_ALIVE");
++    await expectBridgeError(() => t.start(ctx.cfg, ref), "SESSION_NOT_ALIVE");
++  });
++
++  it("未知 ref（未注册 / kind 不符）→ 各方法 SESSION_UNKNOWN", async () => {
++    const ctx = makeCtx();
++    const t = createStructuredTransport(makeFakeExec().exec);
++    await t.start(ctx.cfg);
++    const ghost: SessionRef = { kind: "structured", id: "structured-999" };
++    const wrongKind: SessionRef = { kind: "pty", id: "structured-1" };
++    await expectBridgeError(() => t.inject(ghost, "x"), "SESSION_UNKNOWN");
++    await expectBridgeError(() => t.inject(wrongKind, "x"), "SESSION_UNKNOWN");
++    expectSyncBridgeError(() => t.observe(ghost), "SESSION_UNKNOWN");
++    await expectBridgeError(() => t.alive(ghost), "SESSION_UNKNOWN");
++    await expectBridgeError(() => t.stop(ghost), "SESSION_UNKNOWN");
++    await expectBridgeError(() => t.snapshot(ghost), "SESSION_UNKNOWN");
++  });
++
++  it("并发第二 observe → OBSERVER_ACTIVE（单观察者）；结束后可重新 observe", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const it1 = iterOf(t.observe(ref));
++    expectSyncBridgeError(() => t.observe(ref), "OBSERVER_ACTIVE");
++    await it1.return?.(); // 释放观察者
++    const it3 = iterOf(t.observe(ref)); // 释放后可重新 observe
++    const pending = it3.next();
++    fake.procs[0]!.emitLine('{"type":"message.part","part":{"text":"y"}}');
++    const r = await pending;
++    expect(r.value!.text).toBe("y");
++    await it3.return?.();
++  });
++
++  it("abort（T9 基准）：未开始即取消→空迭代；消费部分后 abort→立即放弃（残存保留给下一次 observe）；挂起等待中 abort→正常落定不抛错", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    // ① 未开始即取消：空迭代
++    const ctrl0 = new AbortController();
++    ctrl0.abort();
++    const r0 = await iterOf(t.observe(ref, { signal: ctrl0.signal })).next();
++    expect(r0.done).toBe(true);
++    // ② 两条入队，消费一条后 abort → 立即放弃，"b" 留给下一次 observe
++    const p = fake.procs[0]!;
++    p.emitLine('{"type":"message.part","part":{"text":"a"}}');
++    p.emitLine('{"type":"message.part","part":{"text":"b"}}');
++    const ctrl = new AbortController();
++    const it1 = iterOf(t.observe(ref, { signal: ctrl.signal }));
++    const r1 = await it1.next();
++    expect(r1.value!.text).toBe("a");
++    ctrl.abort();
++    const r2 = await it1.next();
++    expect(r2.done).toBe(true); // abort → 立即放弃，不交付 "b"
++    await it1.return?.();
++    // ③ 残存保留：新观察者交付 "b"
++    const it3 = iterOf(t.observe(ref));
++    const r3 = await it3.next();
++    expect(r3.value!.text).toBe("b");
++    await it3.return?.();
++    // ④ 挂起等待中 abort → next 正常落定（done），不抛错
++    const ctrl2 = new AbortController();
++    const it4 = iterOf(t.observe(ref, { signal: ctrl2.signal }));
++    const pending = it4.next(); // 队列已空、回合未结束 → 挂起
++    ctrl2.abort();
++    const r4 = await pending;
++    expect(r4.done).toBe(true);
++  });
++});
++
++/* ═══════ 生产 seam nodeRunSpawnProc（真实进程，离线 fixture） ═══════ */
++
++describe("nodeRunSpawnProc 生产 seam（真实进程，离线 fixture）", () => {
++  it("bin 缺失 → inject 显式 STRUCTURED_SPAWN_FAILED；回合计数不增（spawn 前抛出）", async () => {
++    const ctx = makeCtx({ withBin: false }); // installDir 无 bin/codearts
++    const t = createStructuredTransport(realExec);
++    const ref = await t.start(ctx.cfg);
++    const err = await expectBridgeError(() => t.inject(ref, "p"), "STRUCTURED_SPAWN_FAILED");
++    expect(err.remediation).toBeDefined();
++    const snap = await t.snapshot(ref);
++    expect(snap.meta.rounds).toBe(0);
++  });
++
++  it("e2e normal 全链：session.id→step、message.part→output×2、exit 0→done；raw/meta 如实", async () => {
++    const ctx = makeCtx({ withBin: true, scenario: "normal" });
++    const t = createStructuredTransport(realExec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "构建检查");
++    const { got } = await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
++    expect(got[0]!.t).toBe("step");
++    expect(got[0]!.text ?? "").toContain("ses-fake-001");
++    expect(got.some((s) => s.t === "output" && s.text === "回复:构建检查")).toBe(true);
++    expect(got.some((s) => s.t === "output" && s.text === "done-part")).toBe(true);
++    expect(got[got.length - 1]!.t).toBe("done");
++    const snap = await t.snapshot(ref);
++    expect(snap.meta.codeartsSessionId).toBe("ses-fake-001");
++    expect(snap.meta.rounds).toBe(1);
++    expect(snap.meta.lastExit).toEqual({ code: 0, signal: null });
++    expect(snap.raw).toBe("回复:构建检查\ndone-part\n");
++  });
++
++  it("e2e 会话续接：第二回合（echo 场景）argv 经 wrapper 端到端含 --session ses-fake-001 与完整 prompt（空格不拆词）", async () => {
++    const ctx = makeCtx({ withBin: true, scenario: "normal" });
++    const t = createStructuredTransport(realExec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "你好 世界");
++    const it1 = iterOf(t.observe(ref));
++    await collectUntil(it1, (sig) => sig.t === "done");
++    await it1.return?.(); // 释放观察者
++    // 第二回合换 echo 场景 wrapper（同 installDir 重写 bin；spawn 逐回合读文件）
++    writeBinWrapper(ctx.cfg.installDir, "echo");
++    await t.inject(ref, "第二轮 指令");
++    const { acc } = await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
++    expect(acc).toContain("--session");
++    expect(acc).toContain("ses-fake-001");
++    expect(acc).toContain("第二轮 指令"); // prompt 含空格经 "$@" 透传不拆词（禁 shell 拼接的实证）
++  });
++
++  it("e2e env 注入：子进程 env 键存在性 set（值绝不跨进程边界——fixture 只输出 set/unset）", async () => {
++    const ctx = makeCtx({ withBin: true, scenario: "env" });
++    const t = createStructuredTransport(realExec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const { acc } = await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
++    expect(acc).toContain('"CODEARTS_CLI_AK":"set"');
++    expect(acc).toContain('"CODEARTS_CLI_SK":"set"');
++    expect(acc).not.toContain("ak-test"); // 值未泄漏到子进程输出
++    expect(acc).not.toContain("sk-test");
++  });
++
++  it("e2e crash：stderr 非 JSON 行→output(原文)；exit 7→error 信号含 code=7、无 done；meta.lastExit.code=7", async () => {
++    const ctx = makeCtx({ withBin: true, scenario: "crash" });
++    const t = createStructuredTransport(realExec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const it = iterOf(t.observe(ref));
++    const { got } = await collectUntil(it, (sig) => sig.t === "error" && (sig.text ?? "").includes("code=7"));
++    expect(got.some((s) => s.t === "output" && (s.text ?? "").includes("kernel panic"))).toBe(true);
++    expect(got.some((s) => s.t === "done")).toBe(false);
++    const snap = await t.snapshot(ref);
++    expect((snap.meta.lastExit as ProcExit).code).toBe(7);
++  });
++
++  it("e2e stall + stop：进程组终止（detached+负 PID）——/proc 扫描 stop 前有、stop 后无残留", async () => {
++    const ctx = makeCtx({ withBin: true, scenario: "stall" });
++    const t = createStructuredTransport(realExec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "step"); // stall 已输出 session.id：进程就绪
++    expect(hasFixtureMarker(procCmdlines(), "stall")).toBe(true);
++    await t.stop(ref);
++    const deadline = Date.now() + 3000;
++    while (Date.now() < deadline && hasFixtureMarker(procCmdlines(), "stall")) {
++      await sleep(100);
++    }
++    expect(hasFixtureMarker(procCmdlines(), "stall")).toBe(false);
++    expect(await t.alive(ref)).toBe(false);
++  }, 15000);
++});

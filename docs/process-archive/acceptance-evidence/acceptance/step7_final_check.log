@@ -1,0 +1,4 @@
+--- config.env 存在性: 不存在（见 step6 日志）
+--- TUI 进程终检: 空
+--- 守护终态: active, health ok, actives=0
+--- git 改动: .codeartsdoer/package.json + opencode.json（均为既有 WIP，非本任务所改）

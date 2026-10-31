@@ -1,0 +1,6 @@
+--- 修复：硬链接还原 bin/codearts（26.10.9）:
+-rwxr-xr-x 2 wsc wsc 161024128 10月 30 20:20 /home/wsc/.codeartsdoer/installers/bin/codearts
+-rwxr-xr-x 2 wsc wsc 161024128 10月 30 20:20 /home/wsc/.codeartsdoer/installers/bin/codearts.bak-26.10.9
+-rwxr-xr-x 1 wsc wsc 161024128 10月 24 23:52 /home/wsc/.codeartsdoer/installers/bin/codearts.delete
+--- codearts --version 复验:
+26.10.9

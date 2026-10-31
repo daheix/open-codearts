@@ -1,0 +1,9 @@
+--- codearts --version:
+/home/wsc/.codeartsdoer/installers/codearts: 行 30: /home/wsc/.codeartsdoer/installers/bin/codearts: 没有那个文件或目录
+--- codearts-bridge status (bun src/cli.ts):
+{
+  "ok": true,
+  "version": "dev",
+  "uptime": 4787.018,
+  "actives": 0
+}

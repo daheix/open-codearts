@@ -1,0 +1,12 @@
+-- 18:23:44 systemctl kill -KILL 守护
+-- 4s 后状态（修复前此处=崩溃循环 activating）
+active
+10月 31 18:23:47 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 18:23:47 wsc-Default-string codearts-bridge[604261]: [codearts-bridge] 启动对账完成：resumed=1 blocked=0
+-- /health
+{"ok":true,"version":"dev","uptime":0.605,"actives":1}
+-- 对账后目标 #2 状态
+phase active session {'kind': 'pty', 'id': 'script-2'} rounds 3 strikes 1
+-- 重建的 TUI 进程
+604277 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+604278 /home/wsc/.codeartsdoer/installers/bin/codearts

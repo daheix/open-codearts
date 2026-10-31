@@ -1,0 +1,3 @@
+本页 1000 条 nextCursor 1000
+{'goal.start': 1, 'goal.inject': 2, 'goal.retry': 605, 'goal.warning': 391, 'goal.restart': 1}
+gmvw930qa-b7fa087c-300 goal.restart  session-died 

@@ -1,0 +1,10 @@
+goals 目录已清空（全部为本次验收 debris，均已取证）
+--- 守护恢复验证 2026-10-31T17:46:42+08:00:
+active
+{"ok":true,"version":"dev","uptime":20.652,"actives":0}
+     Active: active (running) since Sat 2026-10-31 17:46:22 +08; 20s ago
+   Main PID: 583237 (bun)
+10月 31 17:46:22 wsc-Default-string codearts-bridge[583237]: [codearts-bridge] 启动对账完成：resumed=0 blocked=0
+10月 31 17:46:22 wsc-Default-string codearts-bridge[583237]: codearts-bridge daemon: 监听 127.0.0.1:4577（version=dev，stateDir=/home/wsc/.codearts-bridge）；SIGINT/SIGTERM 优雅停止
+--- goals 列表（应为空）:
+[]

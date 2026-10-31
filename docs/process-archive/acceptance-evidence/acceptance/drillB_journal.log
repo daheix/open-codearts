@@ -1,0 +1,49 @@
+=== journal 2026-10-31T17:45:45+08:00 ===
+10月 31 17:45:33 wsc-Default-string systemd[2128]: codearts-bridge.service: Scheduled restart job, restart counter is at 5.
+10月 31 17:45:33 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 17:45:33 wsc-Default-string codearts-bridge[582439]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+10月 31 17:45:33 wsc-Default-string codearts-bridge[582439]: [codearts-bridge] 清除陈旧 daemon.pid（pid=582415 已不存在）：path=/home/wsc/.codearts-bridge/daemon.pid
+10月 31 17:45:33 wsc-Default-string codearts-bridge[582439]: [codearts-bridge] CLI 内部错误：BridgeError: 未知会话引用：kind=pty id=script-2
+10月 31 17:45:33 wsc-Default-string codearts-bridge[582439]:     at requireSession (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:265:17)
+10月 31 17:45:33 wsc-Default-string codearts-bridge[582439]:     at alive (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:421:17)
+10月 31 17:45:33 wsc-Default-string codearts-bridge[582439]:     at reconcileLocked (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/goal/state.ts:445:40)
+10月 31 17:45:33 wsc-Default-string systemd[2128]: codearts-bridge.service: Main process exited, code=exited, status=1/FAILURE
+10月 31 17:45:33 wsc-Default-string systemd[2128]: codearts-bridge.service: Failed with result 'exit-code'.
+10月 31 17:45:36 wsc-Default-string systemd[2128]: codearts-bridge.service: Scheduled restart job, restart counter is at 6.
+10月 31 17:45:36 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 17:45:36 wsc-Default-string codearts-bridge[582549]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+10月 31 17:45:36 wsc-Default-string codearts-bridge[582549]: [codearts-bridge] 清除陈旧 daemon.pid（pid=582439 已不存在）：path=/home/wsc/.codearts-bridge/daemon.pid
+10月 31 17:45:36 wsc-Default-string codearts-bridge[582549]: [codearts-bridge] CLI 内部错误：BridgeError: 未知会话引用：kind=pty id=script-2
+10月 31 17:45:36 wsc-Default-string codearts-bridge[582549]:     at requireSession (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:265:17)
+10月 31 17:45:36 wsc-Default-string codearts-bridge[582549]:     at alive (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:421:17)
+10月 31 17:45:36 wsc-Default-string codearts-bridge[582549]:     at reconcileLocked (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/goal/state.ts:445:40)
+10月 31 17:45:36 wsc-Default-string systemd[2128]: codearts-bridge.service: Main process exited, code=exited, status=1/FAILURE
+10月 31 17:45:36 wsc-Default-string systemd[2128]: codearts-bridge.service: Failed with result 'exit-code'.
+10月 31 17:45:39 wsc-Default-string systemd[2128]: codearts-bridge.service: Scheduled restart job, restart counter is at 7.
+10月 31 17:45:39 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 17:45:39 wsc-Default-string codearts-bridge[582577]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+10月 31 17:45:39 wsc-Default-string codearts-bridge[582577]: [codearts-bridge] 清除陈旧 daemon.pid（pid=582549 已不存在）：path=/home/wsc/.codearts-bridge/daemon.pid
+10月 31 17:45:39 wsc-Default-string codearts-bridge[582577]: [codearts-bridge] CLI 内部错误：BridgeError: 未知会话引用：kind=pty id=script-2
+10月 31 17:45:39 wsc-Default-string codearts-bridge[582577]:     at requireSession (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:265:17)
+10月 31 17:45:39 wsc-Default-string codearts-bridge[582577]:     at alive (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:421:17)
+10月 31 17:45:39 wsc-Default-string codearts-bridge[582577]:     at reconcileLocked (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/goal/state.ts:445:40)
+10月 31 17:45:39 wsc-Default-string systemd[2128]: codearts-bridge.service: Main process exited, code=exited, status=1/FAILURE
+10月 31 17:45:39 wsc-Default-string systemd[2128]: codearts-bridge.service: Failed with result 'exit-code'.
+10月 31 17:45:43 wsc-Default-string systemd[2128]: codearts-bridge.service: Scheduled restart job, restart counter is at 8.
+10月 31 17:45:43 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 17:45:43 wsc-Default-string codearts-bridge[582642]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+10月 31 17:45:43 wsc-Default-string codearts-bridge[582642]: [codearts-bridge] 清除陈旧 daemon.pid（pid=582577 已不存在）：path=/home/wsc/.codearts-bridge/daemon.pid
+10月 31 17:45:43 wsc-Default-string codearts-bridge[582642]: [codearts-bridge] CLI 内部错误：BridgeError: 未知会话引用：kind=pty id=script-2
+10月 31 17:45:43 wsc-Default-string codearts-bridge[582642]:     at requireSession (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:265:17)
+10月 31 17:45:43 wsc-Default-string codearts-bridge[582642]:     at alive (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/transport/pty-script.ts:421:17)
+10月 31 17:45:43 wsc-Default-string codearts-bridge[582642]:     at reconcileLocked (/home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/core/goal/state.ts:445:40)
+10月 31 17:45:43 wsc-Default-string systemd[2128]: codearts-bridge.service: Main process exited, code=exited, status=1/FAILURE
+10月 31 17:45:43 wsc-Default-string systemd[2128]: codearts-bridge.service: Failed with result 'exit-code'.
+--- 当前服务状态:
+activating
+● codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）
+     Loaded: loaded (/home/wsc/.config/systemd/user/codearts-bridge.service; enabled; preset: enabled)
+     Active: activating (auto-restart) (Result: exit-code) since Sat 2026-10-31 17:45:43 +08; 2s ago
+    Process: 582642 ExecStart=/home/wsc/.bun/bin/bun /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/cli.ts daemon (code=exited, status=1/FAILURE)
+   Main PID: 582642 (code=exited, status=1/FAILURE)
+        CPU: 95ms

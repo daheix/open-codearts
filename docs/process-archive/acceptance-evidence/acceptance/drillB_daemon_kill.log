@@ -1,0 +1,47 @@
+=== 演练B 2026-10-31T17:45:20+08:00 kill 守护 ===
+KILL 已发
+--- 1s 后状态:
+activating
+--- 4s 后状态:
+activating
+--- 新 MainPID 与启动对账日志:
+     Active: activating (auto-restart) (Result: exit-code) since Sat 2026-10-31 17:45:23 +08; 707ms ago
+   Main PID: 582363 (code=exited, status=1/FAILURE)
+--- 守护健康:
+try1: curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+try2: curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+try3: curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+try4: curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+try5: curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+--- 目标 #2 对账后状态:
+curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/usr/lib/python3.12/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+--- 目标 #2 审计尾部:
+curl: (7) Failed to connect to 127.0.0.1 port 4577 after 0 ms: Couldn't connect to server
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+  File "/usr/lib/python3.12/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)

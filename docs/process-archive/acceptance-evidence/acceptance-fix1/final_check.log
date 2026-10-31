@@ -1,0 +1,9 @@
+stop→ stopped
+-- 终检：无 TUI 残留
+无残留 ✓
+-- 守护健康
+{"ok":true,"version":"dev","uptime":16.911,"actives":0}
+[{"goalId":"gmvw930qa-b7fa087c","state":"stopped","rounds":3,"strikes":2,"objective":"【复验】在当前目录创建 hello-bridge.txt 并写入 ok"},{"goalId":"gmvw96ozf-b17cad98","state":"stopped","rounds":3,"strikes":1,"objective":"【复验B】守护崩溃对账恢复"}]
+-- journal 尾部错误扫描（修复前此处必有 BridgeError 崩溃循环）
+0
+0 条 BridgeError ✓

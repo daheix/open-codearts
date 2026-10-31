@@ -1,0 +1,7 @@
+=== 演练A 2026-10-31T17:39:47+08:00 杀会话进程 ===
+--- 杀前 TUI 进程（精确锚定，排除守护/自身）:
+577837 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+577838 /home/wsc/.codeartsdoer/installers/bin/codearts
+--- kill -9 目标: script=577837 codearts=577838
+--- 杀后复核（应为空）:
+(空=已清)

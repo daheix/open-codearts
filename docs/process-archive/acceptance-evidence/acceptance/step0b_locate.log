@@ -1,0 +1,40 @@
+--- 插件 bin 与 package.json bin:
+{
+  "name": "codearts-bridge",
+  "version": "0.1.0",
+  "description": "codearts-bridge：opencode 插件薄壳 + 核心库 + 守护（安装管家/双传输/目标引擎）",
+  "type": "module",
+  "exports": {
+    ".": "./src/server.ts",
+    "./server": "./src/server.ts"
+  },
+  "bin": {
+    "codearts-bridge": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^5.9.3"
+  }
+}
+--- codearts 实际位置探测:
+/home/wsc/.codeartsdoer/installers/codearts
+bin
+codearts
+codearts.bak-26.9.26
+codearts-launch.sh
+/home/wsc/.codeartsdoer/codearts-data/codearts.json
+/home/wsc/.codeartsdoer/codearts_cli.json.bak-20261030
+/home/wsc/.codeartsdoer/codearts_cli.json
+/home/wsc/.codeartsdoer/installers/codearts
+/home/wsc/.codeartsdoer/installers/codearts-launch.sh
+/home/wsc/.codeartsdoer/installers/bin/codearts.bak-26.10.9
+/home/wsc/.codeartsdoer/installers/bin/codearts.delete
+/home/wsc/.codeartsdoer/installers/codearts.bak-26.9.26
+/home/wsc/.local/bin/codeartsGUI

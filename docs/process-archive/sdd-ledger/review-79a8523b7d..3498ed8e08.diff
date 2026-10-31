@@ -1,0 +1,4111 @@
+# Review package: 79a8523b7d..3498ed8e08
+
+## Commits
+3498ed8e08 codearts-bridge(T4-05): 安装包与组件升级支持 — install.sh/uninstall.sh 引导 + doctor/self-upgrade/upgrade-cli/uninstall 四子命令
+11099e3528 codearts-bridge(T4-04): 收官 — LICENSE/CHANGELOG 入插件目录（与公开仓对齐，防同步误删）
+c1f00c34d0 codearts-bridge(T4-04): 终审修复 — 会话 raw 封顶（512KB 尾滚动+丢弃计数）/守护指引文案/maxRounds 如实化/README 内存与 TUI-ready 表述修正
+
+## Files changed
+ plugins/codearts-bridge/CHANGELOG.md               | 105 +++
+ plugins/codearts-bridge/LICENSE                    |  21 +
+ plugins/codearts-bridge/README.md                  |  34 +-
+ plugins/codearts-bridge/install.sh                 | 139 ++++
+ plugins/codearts-bridge/package.json               |   2 +-
+ plugins/codearts-bridge/src/cli.ts                 | 114 ++++
+ plugins/codearts-bridge/src/core/doctor.ts         | 732 +++++++++++++++++++++
+ plugins/codearts-bridge/src/core/selfupgrade.ts    | 394 +++++++++++
+ .../src/core/transport/pty-script.ts               |  22 +-
+ .../codearts-bridge/src/core/transport/pty-tmux.ts |  18 +-
+ .../codearts-bridge/src/core/transport/shared.ts   |  95 +++
+ .../src/core/transport/structured.ts               |  38 +-
+ plugins/codearts-bridge/src/core/uninstaller.ts    | 234 +++++++
+ plugins/codearts-bridge/src/core/upgrade.ts        |  30 +
+ plugins/codearts-bridge/src/goal-tools.ts          |  14 +-
+ plugins/codearts-bridge/test/doctor.test.ts        | 665 +++++++++++++++++++
+ plugins/codearts-bridge/test/installer.test.ts     | 586 +++++++++++++++++
+ .../codearts-bridge/test/transport-script.test.ts  |  13 +
+ .../test/transport-structured.test.ts              |  18 +
+ .../codearts-bridge/test/transport-tmux.test.ts    |  12 +
+ plugins/codearts-bridge/uninstall.sh               |  23 +
+ 21 files changed, 3278 insertions(+), 31 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/CHANGELOG.md b/plugins/codearts-bridge/CHANGELOG.md
+new file mode 100644
+index 0000000000..785b38dbe6
+--- /dev/null
++++ b/plugins/codearts-bridge/CHANGELOG.md
+@@ -0,0 +1,105 @@
++# 更新日志
++
++本文件记录面向使用者的重要变更。格式参考[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
++
++## [0.4.0] - 2026-10-31
++
++安装包与组件升级支持（T4-05）：系统级安装/卸载引导 + 三条升级通道全打通，
++别人开箱即用，后续各组件（bridge / codearts CLI / opencode）升级均有安全通道。
++
++### 新增
++
++**安装与卸载引导**
++
++- `install.sh`（仓库根，幂等可重跑）：前置探测 git/bun（缺 bun 官方脚本自动装到
++  `~/.bun`）→ `bun install` → opencode 接线（幂等写全局自动加载入口，先备份后写）→
++  systemd 守护安装（`--no-daemon` 跳过；无 systemctl 显式提示跳过）→ 质量门
++  （typecheck+test）→ `doctor` 体检与组件摘要。参数：`--no-daemon` / `--state-dir <绝对路径>` /
++  `--skip-gate`（测试/CI 专用）/ `--help`；任一步骤失败显式报错非 0 退出。
++- `uninstall.sh` + `codearts-bridge uninstall`：移除 opencode 自动加载入口（先备份）
++  与 systemd 三单元；**默认保留** `~/.codearts-bridge` 状态数据与 codearts CLI；
++  `--purge` 才清状态目录（HOME/根/过浅路径守卫）；非交互必须 `--yes`。
++
++**体检与升级（CLI 子命令）**
++
++- `codearts-bridge doctor`：八项环境体检（opencode ≥2.1 / bun / codearts CLI 安装态 /
++  登录态或 AK/SK / systemd 三单元 / 守护 /health / 磁盘占用阈值告警 / 官方端点网络），
++  ✓/⚠/✗ + 中文修复指引；人类可读 + 尾部结构化 JSON 双输出（`--json` 仅 JSON）；
++  聚合退出码（任何 ✗ → 1；⚠ 不阻塞）。判定函数纯逻辑与 IO 采集分离，全部单测。
++- `codearts-bridge self-upgrade`：bridge 自升级安全通道——`git fetch` → 比对
++  origin/main → 备份提交号到状态目录 → `reset --hard` → bun install（lock 变更时）→
++  typecheck/test 门 → 守护活跃则重启并轮询 /health → **失败自动回滚备份提交并重启
++  守护**（零损坏；回滚失败显式报错并保留备份记录）。脏工作树显式拒绝（reset 不可逆）。
++- `codearts-bridge upgrade-cli`：codearts CLI 受控升级薄封装——探测当前版本 →
++  与官方清单一致即 already-latest → 否则走 T1-05 受控升级（哈希校验/原子部署/复验/
++  旧版转备份，失败零损坏语义完整继承）；未安装时兼作一键安装。
++
++### 变更
++
++- `package.json` 版本号 0.1.0 → 0.4.0（与 CHANGELOG 对齐）。
++
++[0.4.0]: https://github.com/daheix/open-codearts/releases
++
++## [0.3.0-dev] - 2026-10-31
++
++首个公开发布的开发版：opencode 插件 + 核心库 + 守护进程全量交付，
++`bun test` 463 项用例全绿（462 pass + 1 项 tmux 真机条件跳过）。
++
++### 新增
++
++**安装管家（M1）**——让 CLI 安装/升级不再"断链"
++
++- `codearts_status`：安装版本、钉定状态、备份有效性、autoupdate 开关、
++  AK/SK 凭据、数据库/日志体量一屏总览。
++- `codearts_repair`：从有效备份原子自愈（校验→部署→复验→审计），
++  支持清理 `.delete` 残局；bin 健康时返回 already-healthy。
++- `codearts_upgrade`：受控升级——下载→哈希校验→同数据集暂存→copy 原子部署→
++  复验→旧版转备份，**任何一步失败零损坏**（失败自动回滚并保留快照）。
++- `codearts_health`：内核 RSS、DB/WAL 字节、堆转储计数、最近错误（去重 ≤20 条）。
++- `codearts_hygiene`：堆转储清理 / WAL checkpoint / 日志轮转；dry-run 清单=执行清单。
++
++**传输与单回合执行（M2）**
++
++- `codearts_run`：单回合执行，自动选传输——已配置 AK/SK 走 `structured`
++  （`codearts run --format json` 回合制进程），否则走 PTY（CLI 登录态）。
++  选择结果与原因显式返回，**无静默降级**。
++- 三种传输实现：`structured`（回合=进程，内存每回合归零）、
++  `pty`+tmux（可 attach 观看、跨守护重启存活）、`pty`+script（零依赖兜底）。
++- 超时即停止并返回结构化超时结果；进度流式上报；会话中途可取消。
++
++**目标引擎与守护（M3）**——"永不挂起"的受监督长任务
++
++- 目标五件套：`codearts_goal_start` / `goal_status` / `goal_list` / `goal_logs` /
++  `goal_control`（pause / resume / stop）。
++- 契约驱动监督：`[GOAL-PLAN]` / `[GOAL-STEP n/N]` / `[GOAL-DONE]` 标记 +
++  独立验收命令**双过**才算完成；回显防护防自骗。
++- 故障自愈：停滞 60s 自动续跑；模型/网络错误无限重试（60s 封顶、连续 ≥10 次告警
++  但不停止）；回合进程死自动重建断点续跑；守护/宿主重启对账恢复（不双注入）。
++- 守护进程：`codearts-bridge service install` 一键安装 systemd user 单元
++  （Restart=always）+ 每分钟 watchdog（连续 2 次无响应自动重启）。
++- 回呼通知：目标停滞/告警/终态尽力通知发起会话（失败仅审计，不阻塞目标）。
++
++**插件接入（本版实测）**
++
++- opencode **2.2.5**：全局自动加载目录 `~/.config/opencode/plugins/*.ts`
++  实测生效——新建入口文件后约 0.25s 热加载，无需改配置、无需重启服务；
++  `package.json` 的 `exports` 被采用（入口可为 `src/server.ts`）。
++- opencode **2.1.4**：项目级 `plugin`（单数）键 + 绝对目录路径 + 根 `index.ts`。
++
++### 已知限制
++
++- AK/SK 未配置时 `structured` 传输显式 `AKSK_MISSING`（不静默转 PTY）。
++- opencode 2.1.4 全局配置键不参与热重载加载（用自动加载目录替代）。
++- TUI 存在交互式自升级对话框，监督引擎带 TUI-ready 门后再注入。
++- 华为云官方升级流程存在"先改名后部署 + 跨数据集 rename"缺陷（本管家已规避并可自愈）。
++
++[0.3.0-dev]: https://github.com/daheix/open-codearts/releases
++
++### 修复（真机验收回归，2026-10-31）
++
++- alive() 改布尔契约（未知/死会话返回 false，不再抛错致守护永久下线）
++- 死会话重启风暴修复（start 重建自检，不再回传死 ref）
++- PTY 注入多行安全（契约可整块送达 TUI；两段式提交保留）
++- 生产 verifyRun 接线（目标验收命令可执行）
++- 死会话 resume 自动重建
++- 会话 raw 缓冲 512KB 封顶（尾滚动+丢弃计数）
+diff --git a/plugins/codearts-bridge/LICENSE b/plugins/codearts-bridge/LICENSE
+new file mode 100644
+index 0000000000..6041cb2481
+--- /dev/null
++++ b/plugins/codearts-bridge/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 codearts-bridge contributors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/plugins/codearts-bridge/README.md b/plugins/codearts-bridge/README.md
+index ae396fa321..b0b30ce71a 100644
+--- a/plugins/codearts-bridge/README.md
++++ b/plugins/codearts-bridge/README.md
+@@ -5,38 +5,68 @@ opencode V2 插件（薄壳）+ 核心库 + 守护进程：为 CodeArts CLI 提
+ 
+ - 设计文档：`docs/superpowers/specs/2026-10-30-codearts-integration-opencode-design.md`
+ - 当前阶段：M1+M2+M3 全部完成（463 计数测试全绿）；**使用文档（安装/AK-SK/工具速查/
+   故障排查/CHANGELOG）以公开仓库为准**：https://github.com/daheix/open-codearts
+   （稳定检出 `/home/wsc/wsc/open-codearts`）。本 README 定位为开发文档。
+ 
+ ## 目录结构
+ 
+ ```
+ plugins/codearts-bridge/
++├── install.sh          # 安装引导（幂等；接线/守护/质量门/体检）
++├── uninstall.sh        # 卸载引导（转调 codearts-bridge uninstall）
+ ├── package.json        # name: codearts-bridge；exports["."/"./server"] → src/server.ts
+ ├── tsconfig.json       # strict + moduleResolution bundler + bun-types
+ ├── index.ts            # 目录加载兼容入口（见下"加载方式（实测）"）
+ ├── plugin/index.ts     # 裸目录 shim（备用入口，实测注释）
+ ├── src/
+ │   ├── server.ts       # opencode 插件入口：Plugin.define + codearts_status 冒烟工具
+-│   └── core/config.ts  # 全局常量（PLUGIN_ID / TOOL_NAMESPACE / 版本）
+-└── test/server.test.ts # bun:test：插件形状 + 工具注册 + execute 行为
++│   ├── cli.ts          # CLI：daemon/service/doctor/self-upgrade/upgrade-cli/uninstall
++│   └── core/           # config/install/upgrade/doctor/selfupgrade/uninstaller/service/
++│                       # health/fsx/run/transport/goal（核心库）
++└── test/               # bun:test 全量用例（含 install.sh 沙箱 HOME 集成）
+ ```
+ 
+ ## 常用命令
+ 
+ ```bash
+ bun install          # 安装依赖（@opencode/plugin 2.2.3 钉版）
+ bun test             # 单元测试
+ bun run typecheck    # tsc --noEmit
+ ```
+ 
++## 给别人安装（三行）
++
++```bash
++git clone https://github.com/daheix/open-codearts && cd open-codearts
++bash install.sh                 # 缺 bun 自动装；接线 opencode；默认装 systemd 守护；跑质量门
++codearts-bridge doctor          # 体检（等价：bun src/cli.ts doctor）
++```
++
++- `install.sh` 幂等可重跑；常用参数：`--no-daemon`（跳过 systemd 守护）、
++  `--state-dir <绝对路径>`（自定义状态根）、`--help`。
++- install.sh 不安装 codearts CLI（独立产品）：`bun src/cli.ts upgrade-cli` 一键安装/升级；
++  凭据配置见下文 AK/SK 节（或 `codearts login` 后用登录态）。
++- 卸载：`bash uninstall.sh --yes`（默认保留 `~/.codearts-bridge` 数据与 codearts CLI；
++  `--purge` 连状态目录一并清除）。
++
++## 升级
++
++| 组件 | 命令 | 说明 |
++|------|------|------|
++| bridge 自身 | `codearts-bridge self-upgrade` | `git fetch` → 有更新则 `reset --hard origin/main` → bun install（lock 变更时）→ typecheck+test 门 → 守护重启 → /health 验证；**失败自动回滚备份提交**（记录在 `<stateDir>/self-upgrade-backup.json`）。`--skip-tests`/`--skip-typecheck` 可跳门禁 |
++| codearts CLI | `codearts-bridge upgrade-cli` | 官方 release-info → 已最新即返回 → 否则受控升级（哈希校验/原子部署/复验/旧版转备份，失败零损坏） |
++| opencode | 官方渠道 | 兼容矩阵：≥2.1 支持 V2 插件（本插件硬性要求）；2.1.4 走项目级 `plugin` 键+目录路径；**2.2.5 起推荐全局自动加载目录** `~/.config/opencode/plugins/*.ts`（install.sh 的接线形态，`exports` 被采用、热加载生效） |
++
++`codearts-bridge doctor` 可随时体检八项组件状态（opencode/bun/codearts CLI/凭据/
++systemd 单元/守护 /health/磁盘占用/官方端点网络），任何 ✗ 退出码非 0。
++
+ ## 插件契约
+ 
+ - 默认导出：`Plugin.define({ id: "codearts-bridge", setup })`（`@opencode/plugin` 2.2.3）。
+ - 注册唯一冒烟工具：命名空间内名 `status` + `options.namespace = "codearts"`
+   ⇒ 对外有效名 `codearts_status`；`execute` 返回 `{ ok: true, version }`。
+ - setup 含不兼容守卫（依 SDD 台账 Ruling（2026-10-31，修复环 I1））：
+   宿主上下文缺少 `tool.transform` 时**显式 throw**（错误消息含插件 id、缺失项与
+   期望契约 opencode V2 插件 API），由宿主以 `failed to load plugin` 记录——
+   仓库铁律：出错即显式报错，禁止静默退化。
+ 
+diff --git a/plugins/codearts-bridge/install.sh b/plugins/codearts-bridge/install.sh
+new file mode 100755
+index 0000000000..2254d05dc3
+--- /dev/null
++++ b/plugins/codearts-bridge/install.sh
+@@ -0,0 +1,139 @@
++#!/usr/bin/env bash
++#
++# codearts-bridge 安装引导脚本（T4-05）——开箱即用 + 幂等可重跑。
++#
++# 流程（任一步骤失败即显式报错、非 0 退出；无静默兜底）：
++#   1. 前置探测：git / bun（PATH → ~/.bun/bin；bun 缺失走官方脚本装到 ~/.bun）；
++#   2. 定位仓库根（本脚本所在目录）并 bun install；
++#   3. opencode 接线（幂等）：写 ~/.config/opencode/plugins/codearts-bridge.ts
++#      （一行 re-export 指向本仓库 index.ts 绝对路径）；已等价 → 跳过；
++#      已存在但不等价 → 先备份 .bak-<时间戳> 再写；
++#   4. systemd 守护（默认开；--no-daemon 跳过）：codearts-bridge service install
++#      （生成 user 单元 + daemon-reload + enable --now）；无 systemctl → 跳过并提示；
++#   5. 质量门：bun run typecheck && bun test；
++#   6. doctor 体检 + 结尾摘要（各组件状态与后续指引）。
++#
++# 参数：
++#   --no-daemon          跳过 systemd 守护安装（前台运行 codearts-bridge daemon 亦可）
++#   --state-dir <路径>   状态根（绝对路径；缺省 ~/.codearts-bridge，经环境变量
++#                        CODEARTS_BRIDGE_STATE_DIR 传递给 service install 与 doctor）
++#   --skip-gate          跳过第 5 步质量门（仅供测试/CI：嵌套 bun test 会自递归；
++#                        正常安装不要使用）
++#   --help               打印本帮助
++#
++# 纪律：set -euo pipefail；只写 HOME 下的接线与 systemd 单元；绝不改动仓库内容。
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++WITH_DAEMON=1
++STATE_DIR=""
++SKIP_GATE=0
++
++log()  { echo "[install] $*"; }
++die()  { echo "[install] ✗ $*" >&2; exit 1; }
++
++usage() {
++  awk 'NR>1 && !/^#/ {exit} NR>1 {print substr($0, 3)}' "${BASH_SOURCE[0]}"
++}
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --no-daemon) WITH_DAEMON=0; shift ;;
++    --state-dir)
++      [ $# -ge 2 ] || die "--state-dir 需要一个绝对路径参数"
++      STATE_DIR="$2"; shift 2 ;;
++    --skip-gate) SKIP_GATE=1; shift ;;
++    --help) usage; exit 0 ;;
++    *) die "未知参数：$1（--help 查看用法）" ;;
++  esac
++done
++
++if [ -n "$STATE_DIR" ]; then
++  case "$STATE_DIR" in
++    /*) ;;
++    *) die "--state-dir 必须为绝对路径：$STATE_DIR" ;;
++  esac
++  export CODEARTS_BRIDGE_STATE_DIR="$STATE_DIR"
++fi
++
++# ── 1. 前置探测 ──────────────────────────────────────────────
++command -v git >/dev/null 2>&1 || die "git 未安装：请先安装 git（apt install git 等）后重试"
++
++if command -v bun >/dev/null 2>&1; then
++  BUN="$(command -v bun)"
++elif [ -x "$HOME/.bun/bin/bun" ]; then
++  BUN="$HOME/.bun/bin/bun"
++  export PATH="$HOME/.bun/bin:$PATH"
++else
++  log "未检出 bun → 官方脚本安装到 ~/.bun ..."
++  command -v curl >/dev/null 2>&1 || die "curl 未安装：无法自动安装 bun，请手动安装 bun 后重试"
++  curl -fsSL https://bun.sh/install | bash
++  [ -x "$HOME/.bun/bin/bun" ] || die "bun 安装脚本执行完成但 $HOME/.bun/bin/bun 不在场（安装失败）"
++  BUN="$HOME/.bun/bin/bun"
++  export PATH="$HOME/.bun/bin:$PATH"
++fi
++log "✓ bun：$("$BUN" --version)（$BUN）"
++log "✓ git：$(git --version)"
++
++# ── 2. 依赖安装 ──────────────────────────────────────────────
++cd "$REPO_ROOT"
++log "bun install（repo=$REPO_ROOT）..."
++"$BUN" install
++log "✓ 依赖就绪"
++
++# ── 3. opencode 接线（幂等，先备份后写） ─────────────────────
++PLUGIN_DIR="$HOME/.config/opencode/plugins"
++TARGET="$PLUGIN_DIR/codearts-bridge.ts"
++EXPECTED="export { default } from \"${REPO_ROOT}/index.ts\";"
++if [ -f "$TARGET" ] && [ "$(cat "$TARGET")" = "$EXPECTED" ]; then
++  log "✓ opencode 接线已等价，跳过：$TARGET"
++else
++  mkdir -p "$PLUGIN_DIR"
++  if [ -f "$TARGET" ]; then
++    BACKUP="${TARGET}.bak-$(date +%Y%m%d%H%M%S)"
++    cp "$TARGET" "$BACKUP"
++    log "⚠ 既有接线不等价，已备份：$BACKUP"
++  fi
++  printf '%s\n' "$EXPECTED" > "$TARGET"
++  log "✓ opencode 接线已写入：$TARGET → $REPO_ROOT/index.ts"
++fi
++
++# ── 4. systemd 守护（--no-daemon 跳过；无 systemctl 跳过并提示） ──
++if [ "$WITH_DAEMON" = "1" ]; then
++  if command -v systemctl >/dev/null 2>&1; then
++    log "安装 systemd user 单元（守护 + watchdog，enable --now）..."
++    "$BUN" "$REPO_ROOT/src/cli.ts" service install
++    log "✓ systemd 守护已安装并启动（journalctl --user -t codearts-bridge 可查日志）"
++  else
++    log "⚠ 未检出 systemctl：跳过守护安装；前台运行：$BUN $REPO_ROOT/src/cli.ts daemon"
++  fi
++else
++  log "--no-daemon：跳过 systemd 守护安装（前台运行：$BUN $REPO_ROOT/src/cli.ts daemon）"
++fi
++
++# ── 5. 质量门（--skip-gate 跳过；仅供测试/CI） ───────────────
++if [ "$SKIP_GATE" = "1" ]; then
++  log "--skip-gate：跳过质量门（typecheck/test）——仅供测试/CI 使用"
++else
++  log "质量门：bun run typecheck ..."
++  "$BUN" run typecheck
++  log "质量门：bun test ..."
++  "$BUN" test
++  log "✓ 质量门通过"
++fi
++
++# ── 6. doctor 体检 + 摘要 ────────────────────────────────────
++log "doctor 环境体检 ..."
++"$BUN" "$REPO_ROOT/src/cli.ts" doctor || die "doctor 体检存在失败项（✗），请按上方修复指引处理后重跑"
++
++echo ""
++log "✓ 安装完成。组件摘要："
++log "  - bridge 仓库：$REPO_ROOT（codearts-bridge self-upgrade 可自升级）"
++log "  - opencode 接线：$TARGET（重启 opencode 会话或等待热加载生效）"
++if [ "$WITH_DAEMON" = "1" ] && command -v systemctl >/dev/null 2>&1; then
++  log "  - 守护：systemd user 常驻（codearts-bridge service status 查看）"
++else
++  log "  - 守护：未安装（前台运行 $BUN $REPO_ROOT/src/cli.ts daemon）"
++fi
++log "  - codearts CLI：未装时执行 codearts-bridge upgrade-cli 安装；升级用 codearts-bridge upgrade-cli"
++log "  - 卸载：bash $REPO_ROOT/uninstall.sh（--purge 连状态目录一并清除）"
+diff --git a/plugins/codearts-bridge/package.json b/plugins/codearts-bridge/package.json
+index 9b9221d9d5..47d7716d15 100644
+--- a/plugins/codearts-bridge/package.json
++++ b/plugins/codearts-bridge/package.json
+@@ -1,13 +1,13 @@
+ {
+   "name": "codearts-bridge",
+-  "version": "0.1.0",
++  "version": "0.4.0",
+   "description": "codearts-bridge：opencode 插件薄壳 + 核心库 + 守护（安装管家/双传输/目标引擎）",
+   "type": "module",
+   "exports": {
+     ".": "./src/server.ts",
+     "./server": "./src/server.ts"
+   },
+   "bin": {
+     "codearts-bridge": "./src/cli.ts"
+   },
+   "scripts": {
+diff --git a/plugins/codearts-bridge/src/cli.ts b/plugins/codearts-bridge/src/cli.ts
+index 3bb694fd76..e1eb9e50dd 100644
+--- a/plugins/codearts-bridge/src/cli.ts
++++ b/plugins/codearts-bridge/src/cli.ts
+@@ -68,31 +68,44 @@ import {
+   defaultRunClock,
+   needsTmuxProbe,
+   probeTmuxAvailable,
+   selectTransport,
+ } from "./core/run";
+ import type { RunClock, TransportSelection } from "./core/run";
+ import type { CodeartsTransport } from "./core/transport/types";
+ import { GOAL_SWEEP_INTERVAL_MS, GoalHost, defaultTickLoop } from "./daemon-goals";
+ import type { TickLoop } from "./daemon-goals";
+ import { createDaemon, daemonPidPath } from "./daemon";
++import { doctorCommand as doctorReport } from "./core/doctor";
++import { SELF_UPGRADE_GATE_MAX_OUTPUT_BYTES, SELF_UPGRADE_GATE_TIMEOUT_MS, selfUpgrade } from "./core/selfupgrade";
++import { uninstallCommand } from "./core/uninstaller";
++import type { UninstallDeps } from "./core/uninstaller";
++import { upgradeCli } from "./core/upgrade";
+ 
+ const USAGE = `用法: codearts-bridge <命令>
+ 
+ 命令:
+   version            打印插件版本
+   status             探测守护进程健康（GET <daemonUrl>/health，3s 超时；不可达→非零退出）
+   daemon             前台启动守护进程（SIGINT/SIGTERM 优雅停止；挂载目标域 GoalHost）
+   service install    安装 systemd user 单元（守护 + watchdog timer）并 enable --now
+   service status     查看单元在场性与运行状态（stdout JSON）
+   service uninstall  卸载单元（只删本插件单元，不动其他单元）
+   watchdog-probe     watchdog 探测（systemd timer 每分钟调用；连续 2 次无响应重启守护）
++  doctor             环境体检八项（opencode/bun/codearts CLI/凭据/systemd/守护/磁盘/网络）
++                     ✓/⚠/✗ + 修复指引；尾部输出结构化 JSON；--json 仅 JSON；✗→退出码 1
++  self-upgrade       bridge 自升级（git fetch→reset --hard origin/main→门禁→守护重启；
++                     失败自动回滚备份提交；--skip-tests/--skip-typecheck 可跳门禁）
++  upgrade-cli        codearts CLI 受控升级（探测→无更新即已最新→否则官方包受控升级，
++                     失败零损坏）
++  uninstall          卸载接线（opencode 自动加载入口 + systemd 单元；默认保留状态目录
++                     与 codearts CLI；--purge 清状态目录；非交互须 --yes）
+   help               打印本帮助`;
+ 
+ /** status 命令的探活超时（R-d5 固定 3s；导出供测试引用同一真相）。 */
+ export const STATUS_TIMEOUT_MS = 3000;
+ 
+ /** stderr 结构化错误出口（CLI 侧统一形态，与 HTTP/工具层 error.code 词汇一致）。 */
+ function printCliError(code: string, message: string, remediation?: string): void {
+   console.error(
+     JSON.stringify({ error: { code, message, ...(remediation !== undefined ? { remediation } : {}) } }, null, 2),
+   );
+@@ -644,20 +657,109 @@ export async function watchdogProbeCommand(cfg: BridgeConfig = loadConfig(), dep
+   } catch (e) {
+     const be = e instanceof BridgeError ? e : undefined;
+     printCliError(
+       be?.code ?? "WATCHDOG_PROBE_FAILED",
+       `watchdog-probe 失败：${e instanceof Error ? e.message : String(e)}`,
+     );
+     return 1;
+   }
+ }
+ 
++/* ───── T4-05：doctor / self-upgrade / upgrade-cli / uninstall 命令 ───── */
++
++/** 门禁与 git/systemctl 命令的生产缺省 Exec（self-upgrade 门禁可达数十秒）。 */
++function gateExec(): Exec {
++  return createNodeExec({ timeoutMs: SELF_UPGRADE_GATE_TIMEOUT_MS, maxOutputBytes: SELF_UPGRADE_GATE_MAX_OUTPUT_BYTES });
++}
++
++/** doctor 命令：环境体检八项（--json 仅结构化输出）；退出码=聚合判定（✗→1）。 */
++export async function doctorCliCommand(argv: readonly string[], cfg: BridgeConfig = loadConfig()): Promise<number> {
++  const json = argv.includes("--json");
++  return doctorReport(cfg, {}, { json });
++}
++
++/** self-upgrade 命令：安全自升级（--skip-tests/--skip-typecheck 跳门禁）。 */
++export async function selfUpgradeCliCommand(
++  argv: readonly string[],
++  cfg: BridgeConfig = loadConfig(),
++): Promise<number> {
++  let result;
++  try {
++    result = await selfUpgrade(
++      cfg,
++      { exec: gateExec() },
++      { skipTests: argv.includes("--skip-tests"), skipTypecheck: argv.includes("--skip-typecheck") },
++    );
++  } catch (e) {
++    const be = e instanceof BridgeError ? e : undefined;
++    printCliError(
++      be?.code ?? "SELF_UPGRADE_FAILED",
++      `self-upgrade 失败：${e instanceof Error ? e.message : String(e)}`,
++      be?.remediation,
++    );
++    return 1;
++  }
++  console.log(JSON.stringify(result, null, 2));
++  return 0;
++}
++
++/** upgrade-cli 命令：codearts CLI 受控升级（探测→无更新→受控升级，失败零损坏）。 */
++export async function upgradeCliCommand(cfg: BridgeConfig = loadConfig()): Promise<number> {
++  try {
++    const result = await upgradeCli(cfg, { exec: gateExec() });
++    console.log(JSON.stringify(result, null, 2));
++    return 0;
++  } catch (e) {
++    const be = e instanceof BridgeError ? e : undefined;
++    printCliError(
++      be?.code ?? "UPGRADE_CLI_FAILED",
++      `codearts CLI 升级失败：${e instanceof Error ? e.message : String(e)}`,
++      be?.remediation,
++    );
++    return 1;
++  }
++}
++
++/** uninstall 命令参数解析结果。 */
++interface UninstallArgs {
++  yes: boolean;
++  purge: boolean;
++}
++
++/** 解析 uninstall 参数；未知参数显式报错（禁静默忽略）。 */
++function parseUninstallArgs(argv: readonly string[]): UninstallArgs | undefined {
++  const args: UninstallArgs = { yes: false, purge: false };
++  for (const a of argv) {
++    if (a === "--yes") args.yes = true;
++    else if (a === "--purge") args.purge = true;
++    else {
++      printCliError("CLI_ARG_INVALID", `uninstall 未知参数 "${a}"（仅支持 --yes/--purge）`);
++      return undefined;
++    }
++  }
++  return args;
++}
++
++/** uninstall 命令：卸载接线（默认保留状态目录与 codearts CLI）。 */
++export async function uninstallCliCommand(
++  argv: readonly string[],
++  cfg: BridgeConfig = loadConfig(),
++): Promise<number> {
++  const args = parseUninstallArgs(argv);
++  if (args === undefined) return 2;
++  const deps: UninstallDeps = {
++    exec: createNodeExec({ timeoutMs: 30_000 }),
++    serviceUninstall: serviceUninstallCommand,
++  };
++  return uninstallCommand(cfg, deps, { yes: args.yes, purge: args.purge });
++}
++
+ /** CLI 命令分派（返回退出码；仅 import.meta.main 时由底部出口真正 exit）。 */
+ export async function main(argv: readonly string[]): Promise<number> {
+   const cmd = argv[0];
+   if (cmd === undefined || cmd === "help") {
+     console.log(USAGE);
+     return 0;
+   }
+   if (cmd === "version") {
+     console.log(`${PLUGIN_ID} ${PLUGIN_VERSION}`);
+     return 0;
+@@ -672,20 +774,32 @@ export async function main(argv: readonly string[]): Promise<number> {
+     const sub = argv[1];
+     if (sub === "install") return serviceInstallCommand(loadConfig());
+     if (sub === "status") return serviceStatusCommand(loadConfig());
+     if (sub === "uninstall") return serviceUninstallCommand(loadConfig());
+     console.error(`codearts-bridge: service 未知子命令 "${sub ?? ""}"（须为 install/status/uninstall）\n${USAGE}`);
+     return 2;
+   }
+   if (cmd === "watchdog-probe") {
+     return watchdogProbeCommand(loadConfig());
+   }
++  if (cmd === "doctor") {
++    return doctorCliCommand(argv.slice(1));
++  }
++  if (cmd === "self-upgrade") {
++    return selfUpgradeCliCommand(argv.slice(1));
++  }
++  if (cmd === "upgrade-cli") {
++    return upgradeCliCommand(loadConfig());
++  }
++  if (cmd === "uninstall") {
++    return uninstallCliCommand(argv.slice(1));
++  }
+   console.error(`codearts-bridge: 未知命令 "${cmd}"\n${USAGE}`);
+   return 2;
+ }
+ 
+ // 仅直接执行时进入命令分派（被测试/其他模块导入时不产生副作用）
+ if (import.meta.main) {
+   main(Bun.argv.slice(2)).then(
+     (code) => process.exit(code),
+     (e: unknown) => {
+       // 分派层意外异常：显式落 stderr + 非零退出（禁静默吞错）
+diff --git a/plugins/codearts-bridge/src/core/doctor.ts b/plugins/codearts-bridge/src/core/doctor.ts
+new file mode 100644
+index 0000000000..f3c8ca5521
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/doctor.ts
+@@ -0,0 +1,732 @@
++/**
++ * codearts-bridge doctor 环境体检（T4-05）。
++ *
++ * 职责：对"开箱即用"所需的全套组件做只读体检，逐项输出 ✓/⚠/✗ 与中文修复指引，
++ * 并给出聚合退出码（任何 ✗ → 1）。八项检查（任务书顺序）：
++ *   ① opencode 在场与版本（≥2.1 支持 V2 插件）      id=opencode
++ *   ② bun 在场（PATH → ~/.bun/bin/bun 两路探测）    id=bun
++ *   ③ codearts CLI 安装状态（probeInstall 只读快照） id=codearts-cli
++ *   ④ 登录态（<kernelDataDir>/auth.json）或 AK/SK   id=credential
++ *   ⑤ systemd 三单元在场性与 is-active              id=systemd
++ *   ⑥ 守护 /health 可达（3s 超时）                  id=daemon
++ *   ⑦ 磁盘占用（db/wal/dumps/logs，阈值告警）        id=disk
++ *   ⑧ 官方 release-info 端点 HEAD（5s 超时，失败=⚠） id=network
++ *
++ * 结构纪律（任务书"纯逻辑与 IO 分离"）：
++ * - 判定函数 judgeXxx(obs) 为纯函数：观察值（普通对象）→ DoctorCheck，全部单测覆盖；
++ * - 采集器 collectXxx 负责真实 IO（注入 exec/fetch/目录），把一切失败归一为观察值
++ *   （present/reachable/error 字段），绝不向上抛业务错误——体检的职责是"如实报告"
++ *   而非中途夭折；采集层的意外 FS 错误也归一为 error 观察值以 ✗ 呈现；
++ * - doctorCommand 负责输出（人类可读 + 结构化 JSON 双输出）与退出码聚合。
++ *
++ * 等级语义：
++ * - ok  = 开箱可用；
++ * - warn= 有缺陷但不阻塞核心功能（修复指引必附）；
++ * - fail= 状态损坏/关键依赖缺失（聚合退出码 1）。
++ * 网络（⑧）与守护（⑥）按任务书固定为 ⚠ 不阻塞——检查器自身失败除外。
++ *
++ * 隔离纪律：exec/fetch/homeDir/kernelDataDir 全部可注入；测试绝不触碰真实 HOME、
++ * 绝不真实联网、绝不调用真实 systemctl（单元缺失时不发起任何 systemctl 调用）。
++ */
++import { stat } from "node:fs/promises";
++import { homedir } from "node:os";
++import * as path from "node:path";
++import { loadConfig, readAksk } from "./config";
++import type { Aksk, BridgeConfig } from "./config";
++import { BridgeError } from "./errors";
++import { errnoOf } from "./fsx";
++import { collectHealth } from "./health";
++import { createNodeExec, probeInstall } from "./install";
++import type { Exec, InstallStatus } from "./install";
++import { SERVICE_UNIT_NAMES } from "./service";
++
++/* ───── 结果模型 ───── */
++
++/** 检查等级：ok=可用 / warn=有缺陷不阻塞 / fail=损坏或关键缺失。 */
++export type CheckLevel = "ok" | "warn" | "fail";
++
++/** 单项体检结果（id 稳定，供结构化消费方编程化分支）。 */
++export interface DoctorCheck {
++  id: string;
++  level: CheckLevel;
++  /** 人类可读一句话结论（✓/⚠/✗ 前缀由输出层添加）。 */
++  summary: string;
++  /** ⚠/✗ 时的中文修复指引。 */
++  remediation?: string;
++  /** 结构化细节（版本/字节/状态等；不含凭据值）。 */
++  detail?: Record<string, unknown>;
++}
++
++/** 八项检查的稳定 id 与顺序（任务书 ①..⑧）。 */
++export const DOCTOR_CHECK_IDS = [
++  "opencode",
++  "bun",
++  "codearts-cli",
++  "credential",
++  "systemd",
++  "daemon",
++  "disk",
++  "network",
++] as const;
++
++/** 与 cli.ts FetchLike 同形（该类型在 cli 层，core 不反向依赖；M78 双份同码先例）。 */
++export type FetchLike = (url: URL | string, init?: RequestInit) => Promise<Response>;
++
++/** 守护探活超时（与 cli.ts STATUS_TIMEOUT_MS 同口径 3s）。 */
++export const DOCTOR_DAEMON_TIMEOUT_MS = 3_000;
++
++/** 网络可达性 HEAD 超时（任务书固定 5s）。 */
++export const DOCTOR_NETWORK_TIMEOUT_MS = 5_000;
++
++/* ───── 磁盘阈值（⑦；字节） ───── */
++
++export const DOCTOR_DISK_DUMPS_WARN_BYTES = 500 * 1024 * 1024; // 堆快照 500MB
++export const DOCTOR_DISK_LOGS_WARN_BYTES = 1024 * 1024 * 1024; // 日志总量 1GB
++export const DOCTOR_DISK_WAL_WARN_BYTES = 256 * 1024 * 1024; // WAL 256MB
++
++/** opencode V2 插件契约的最低版本（任务书固定 ≥2.1）。 */
++export const DOCTOR_OPENCODE_MIN = "2.1.0";
++
++/** 内核数据目录缺省值（与 health.ts R-h3 缺省同口径；注入优先）。 */
++const KERNEL_DATA_DIR_DEFAULT = ".codeartsdoer/cli-data";
++
++/** 官方 release-info 端点（与 upgrade.ts RELEASE_INFO_URL 同源；HEAD 探活用）。 */
++const NETWORK_PROBE_URL =
++  "https://ide.cn-north-4.myhuaweicloud.com/v1/release-info/latest" +
++  "?sub_product_name=cli-linux-x64&os_type=debian&arch=X86-64";
++
++/* ───── 工具纯函数 ───── */
++
++/** 字节的人类可读格式（体检文案用；非负整数，非法输入显式抛）。 */
++export function humanBytes(bytes: number): string {
++  if (!Number.isInteger(bytes) || bytes < 0) {
++    throw new BridgeError("DOCTOR_INPUT_INVALID", `humanBytes 须为非负整数，实际为 ${String(bytes)}`);
++  }
++  if (bytes < 1024) return `${bytes}B`;
++  const units = ["KB", "MB", "GB", "TB"] as const;
++  let value = bytes;
++  let unit = -1;
++  while (value >= 1024 && unit < units.length - 1) {
++    value /= 1024;
++    unit++;
++  }
++  return `${value.toFixed(1)}${units[unit]}`;
++}
++
++/** 解析 x.y.z 三段版本号为数值元组；非法形态显式抛（禁静默钳位）。 */
++function parseSemver(v: string): [number, number, number] {
++  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v);
++  if (m === null) {
++    throw new BridgeError("VERSION_PARSE_INVALID", `版本须为 x.y.z 形态，实际为 ${JSON.stringify(v)}`);
++  }
++  return [Number(m[1]), Number(m[2]), Number(m[3])];
++}
++
++/** 语义化版本比较：a<b → -1；a==b → 0；a>b → 1。非法输入显式抛。 */
++export function compareVersions(a: string, b: string): number {
++  const pa = parseSemver(a);
++  const pb = parseSemver(b);
++  for (let i = 0; i < 3; i++) {
++    const x = pa[i] ?? 0;
++    const y = pb[i] ?? 0;
++    if (x !== y) return x < y ? -1 : 1;
++  }
++  return 0;
++}
++
++/** 从命令输出提取首个 x.y.z 版本串（stdout 优先、stderr 兜扫；与 install.ts R-d 同口径）。 */
++function extractVersion(stdout: string, stderr: string): string | undefined {
++  const re = /^\d+\.\d+\.\d+/m;
++  return re.exec(stdout)?.[0] ?? re.exec(stderr)?.[0];
++}
++
++/* ───── 观察值类型（采集器输出 / 判定函数输入） ───── */
++
++export interface OpencodeObservation {
++  present: boolean;
++  version?: string;
++}
++
++export interface BunObservation {
++  present: boolean;
++  version?: string;
++}
++
++export interface CodeartsObservation {
++  status?: InstallStatus;
++  error?: string;
++}
++
++export interface CredentialObservation {
++  /** <kernelDataDir>/auth.json 存在且为常规文件（CLI 登录态）。 */
++  authJsonExists: boolean;
++  /** AK/SK 解析结果（readAksk；值仅用于判定，绝不进入 summary/detail）。 */
++  aksk?: Aksk;
++  error?: string;
++}
++
++export interface SystemdObservation {
++  systemctlAvailable: boolean;
++  units?: { daemon: boolean; watchdogService: boolean; watchdogTimer: boolean };
++  active?: { daemon: boolean; watchdogTimer: boolean };
++  error?: string;
++}
++
++export interface DaemonHealthObservation {
++  ok: boolean;
++  reason?: string;
++}
++
++export interface DiskObservation {
++  dbBytes: number;
++  walBytes: number;
++  dumps: { files: number; bytes: number };
++  logsBytes: number;
++  error?: string;
++}
++
++export interface NetworkObservation {
++  reachable: boolean;
++  status?: number;
++  reason?: string;
++}
++
++/* ───── 判定函数（纯逻辑） ───── */
++
++/** ① opencode：未检出/版本<2.1/版本不可解析 → warn；≥2.1 → ok。 */
++export function judgeOpencode(obs: OpencodeObservation): DoctorCheck {
++  if (!obs.present) {
++    return {
++      id: "opencode",
++      level: "warn",
++      summary: "opencode 未检出（插件宿主缺失，codearts_* 工具无法自动加载）",
++      remediation: "安装 opencode ≥2.1（https://opencode.ai）；安装后本插件经全局自动加载目录生效",
++      detail: { present: false },
++    };
++  }
++  if (obs.version === undefined) {
++    return {
++      id: "opencode",
++      level: "warn",
++      summary: "opencode 在场但版本无法解析（无法核验 V2 插件契约 ≥2.1）",
++      remediation: "核查 opencode --version 输出；建议升级至 ≥2.1",
++      detail: { present: true },
++    };
++  }
++  let meetsMin = false;
++  try {
++    meetsMin = compareVersions(obs.version, DOCTOR_OPENCODE_MIN) >= 0;
++  } catch {
++    return {
++      id: "opencode",
++      level: "warn",
++      summary: `opencode 版本 ${obs.version} 形态异常（无法核验 ≥${DOCTOR_OPENCODE_MIN}）`,
++      detail: { present: true, version: obs.version },
++    };
++  }
++  if (!meetsMin) {
++    return {
++      id: "opencode",
++      level: "warn",
++      summary: `opencode ${obs.version} 低于 V2 插件契约要求（≥${DOCTOR_OPENCODE_MIN}）`,
++      remediation: `升级 opencode 至 ≥${DOCTOR_OPENCODE_MIN}（V2 插件 API 为本插件硬性依赖）`,
++      detail: { present: true, version: obs.version },
++    };
++  }
++  return {
++    id: "opencode",
++    level: "ok",
++    summary: `opencode ${obs.version}（满足 V2 插件 ≥${DOCTOR_OPENCODE_MIN}）`,
++    detail: { present: true, version: obs.version },
++  };
++}
++
++/** ② bun：缺失 → fail（一切子命令的运行时）；在场 → ok。 */
++export function judgeBun(obs: BunObservation): DoctorCheck {
++  if (!obs.present) {
++    return {
++      id: "bun",
++      level: "fail",
++      summary: "bun 未检出（codearts-bridge 全部命令的运行时缺失）",
++      remediation: "curl -fsSL https://bun.sh/install | bash（安装到 ~/.bun 后重开 shell 或将其加入 PATH）",
++      detail: { present: false },
++    };
++  }
++  return {
++    id: "bun",
++    level: "ok",
++    summary: obs.version !== undefined ? `bun ${obs.version}` : "bun 在场（版本未解析）",
++    detail: { present: true, version: obs.version ?? null },
++  };
++}
++
++/** ③ codearts CLI：探测异常 → fail；未装 → warn；其余问题逐条汇总 → warn；健康 → ok。 */
++export function judgeCodeartsCli(obs: CodeartsObservation): DoctorCheck {
++  if (obs.error !== undefined) {
++    return {
++      id: "codearts-cli",
++      level: "fail",
++      summary: `codearts CLI 安装状态探测失败：${obs.error}`,
++      remediation: "按错误码排障（codearts_repair 可自愈多数损坏）；状态不明时不假装健康",
++      detail: { error: obs.error },
++    };
++  }
++  const st = obs.status;
++  if (st === undefined || !st.present) {
++    return {
++      id: "codearts-cli",
++      level: "warn",
++      summary: "codearts CLI 未安装（structured 传输与 codearts_* 安装管家不可用）",
++      remediation: "执行 codearts-bridge upgrade-cli 从官方渠道安装",
++      detail: { present: false },
++    };
++  }
++  const issues: string[] = [];
++  const fix: string[] = [];
++  if (st.version === undefined) issues.push("版本无法解析");
++  if (st.autoupdateFlag === true) {
++    issues.push("官方 autoupdate 开启（自动升级可能破坏钉定或遗留 .delete 残局）");
++    fix.push("以 codearts_repair（fixAutoupdate）关停自动升级");
++  }
++  if (st.pinState === "drift") {
++    issues.push("二进制与钉版记录漂移");
++    fix.push("codearts_repair 从备份恢复一致内容");
++  }
++  if (!st.backupValid) {
++    issues.push("备份缺失或失效（自愈能力受限）");
++    fix.push("codearts 管家可在二进制健康时刷新备份");
++  }
++  if (issues.length > 0) {
++    return {
++      id: "codearts-cli",
++      level: "warn",
++      summary: `codearts CLI ${st.version ?? "（版本未知）"}：${issues.join("；")}`,
++      remediation: fix.join("；"),
++      detail: {
++        present: true,
++        version: st.version ?? null,
++        pinState: st.pinState,
++        backupValid: st.backupValid,
++        autoupdateFlag: st.autoupdateFlag ?? null,
++      },
++    };
++  }
++  return {
++    id: "codearts-cli",
++    level: "ok",
++    summary: `codearts CLI ${st.version}（备份有效，钉定 ${st.pinState}）`,
++    detail: { present: true, version: st.version, pinState: st.pinState, backupValid: st.backupValid },
++  };
++}
++
++/** ④ 凭据：AK/SK 或 CLI 登录态任一在场 → ok；皆无 → warn；读取异常 → fail。 */
++export function judgeCredential(obs: CredentialObservation): DoctorCheck {
++  if (obs.error !== undefined) {
++    return {
++      id: "credential",
++      level: "fail",
++      summary: `凭据文件读取失败：${obs.error}`,
++      remediation: "修正 AK/SK env 文件或登录态文件后重试（凭据值绝不回显）",
++    };
++  }
++  const hasAksk = obs.aksk?.AK !== undefined && obs.aksk.AK !== "" && obs.aksk?.SK !== undefined && obs.aksk.SK !== "";
++  if (hasAksk && obs.authJsonExists) {
++    return { id: "credential", level: "ok", summary: "AK/SK 与 CLI 登录态均在场（structured 传输可用）", detail: { mode: "aksk+auth" } };
++  }
++  if (hasAksk) {
++    return { id: "credential", level: "ok", summary: "AK/SK 已配置（structured 传输可用）", detail: { mode: "aksk" } };
++  }
++  if (obs.authJsonExists) {
++    return { id: "credential", level: "ok", summary: "CLI 登录态在场（structured 传输可用）", detail: { mode: "auth" } };
++  }
++  return {
++    id: "credential",
++    level: "warn",
++    summary: "未配置 AK/SK 且无 CLI 登录态（structured 传输不可用；run 将显式 AKSK_MISSING 或退 PTY 形态）",
++    remediation: "codearts login 完成登录，或向 <stateDir>/config.env 写入 AK=/SK= 两行",
++    detail: { mode: "none" },
++  };
++}
++
++/** ⑤ systemd：非 systemd 环境/未安装/非 active → warn；三单元在场且 active → ok。 */
++export function judgeSystemd(obs: SystemdObservation): DoctorCheck {
++  if (obs.error !== undefined) {
++    return {
++      id: "systemd",
++      level: "fail",
++      summary: `systemd 单元状态核验失败：${obs.error}`,
++      detail: { error: obs.error },
++    };
++  }
++  if (!obs.systemctlAvailable) {
++    const unitsPresent = obs.units?.daemon === true;
++    return {
++      id: "systemd",
++      level: "warn",
++      summary: unitsPresent
++        ? "systemd 单元文件在场但 systemctl 不可用，无法核验运行状态"
++        : "systemctl 不可用（非 systemd 环境），守护需手动管理",
++      remediation: "前台启动：codearts-bridge daemon（SIGINT/SIGTERM 优雅停止）",
++      detail: { systemctlAvailable: false, units: obs.units ?? null },
++    };
++  }
++  const units = obs.units ?? { daemon: false, watchdogService: false, watchdogTimer: false };
++  if (!units.daemon) {
++    return {
++      id: "systemd",
++      level: "warn",
++      summary: "systemd 守护单元未安装（开机自启/崩溃自愈缺位）",
++      remediation: "执行 codearts-bridge service install（或重跑 install.sh）",
++      detail: { units },
++    };
++  }
++  const issues: string[] = [];
++  const fix: string[] = [];
++  if (!units.watchdogService || !units.watchdogTimer) {
++    issues.push("watchdog 单元缺失（挂起自愈看门缺位）");
++    fix.push("重跑 codearts-bridge service install 补齐");
++  }
++  if (obs.active !== undefined) {
++    if (!obs.active.daemon) {
++      issues.push(`守护单元非 active（${obs.active.daemon === false ? "inactive/failed" : "unknown"}）`);
++      fix.push("journalctl --user -t codearts-bridge 排查后 systemctl --user restart codearts-bridge");
++    }
++    if (!obs.active.watchdogTimer && units.watchdogTimer) {
++      issues.push("watchdog timer 非 active");
++      fix.push("systemctl --user start codearts-bridge-watchdog.timer");
++    }
++  }
++  if (issues.length > 0) {
++    return {
++      id: "systemd",
++      level: "warn",
++      summary: `systemd：${issues.join("；")}`,
++      remediation: fix.join("；"),
++      detail: { units, active: obs.active ?? null },
++    };
++  }
++  return {
++    id: "systemd",
++    level: "ok",
++    summary: "守护单元 active + watchdog timer active（崩溃/挂起双自愈在位）",
++    detail: { units, active: obs.active ?? null },
++  };
++}
++
++/** ⑥ 守护 /health：可达 → ok；不可达 → warn（不阻塞：守护按需启动）。 */
++export function judgeDaemonHealth(obs: DaemonHealthObservation): DoctorCheck {
++  if (obs.ok) {
++    return { id: "daemon", level: "ok", summary: "守护 /health 可达" };
++  }
++  return {
++    id: "daemon",
++    level: "warn",
++    summary: `守护不可达（${obs.reason ?? "unknown"}）`,
++    remediation: "codearts-bridge service install 启用常驻守护，或前台运行 codearts-bridge daemon",
++    detail: { reason: obs.reason ?? null },
++  };
++}
++
++/** ⑦ 磁盘占用：任一超阈值 → warn（附 hygiene 指引）；采集异常 → fail；否则 ok。 */
++export function judgeDisk(obs: DiskObservation): DoctorCheck {
++  if (obs.error !== undefined) {
++    return { id: "disk", level: "fail", summary: `磁盘占用采集失败：${obs.error}`, detail: { error: obs.error } };
++  }
++  const issues: string[] = [];
++  const fix: string[] = [];
++  if (obs.dumps.bytes > DOCTOR_DISK_DUMPS_WARN_BYTES) {
++    issues.push(`dump 堆快照 ${humanBytes(obs.dumps.bytes)}（${obs.dumps.files} 个）超 ${humanBytes(DOCTOR_DISK_DUMPS_WARN_BYTES)}`);
++    fix.push("codearts_hygiene purge-dumps 清理");
++  }
++  if (obs.walBytes > DOCTOR_DISK_WAL_WARN_BYTES) {
++    issues.push(`WAL ${humanBytes(obs.walBytes)} 超 ${humanBytes(DOCTOR_DISK_WAL_WARN_BYTES)}`);
++    fix.push("codearts_hygiene checkpoint-wal 收缩");
++  }
++  if (obs.logsBytes > DOCTOR_DISK_LOGS_WARN_BYTES) {
++    issues.push(`日志总量 ${humanBytes(obs.logsBytes)} 超 ${humanBytes(DOCTOR_DISK_LOGS_WARN_BYTES)}`);
++    fix.push("codearts_hygiene rotate-logs 轮转");
++  }
++  const detail: Record<string, unknown> = {
++    dbBytes: obs.dbBytes,
++    walBytes: obs.walBytes,
++    dumps: obs.dumps,
++    logsBytes: obs.logsBytes,
++  };
++  if (issues.length > 0) {
++    return { id: "disk", level: "warn", summary: `磁盘占用：${issues.join("；")}`, remediation: fix.join("；"), detail };
++  }
++  return {
++    id: "disk",
++    level: "ok",
++    summary: `磁盘占用正常（db ${humanBytes(obs.dbBytes)} / wal ${humanBytes(obs.walBytes)} / dumps ${humanBytes(obs.dumps.bytes)} / logs ${humanBytes(obs.logsBytes)}）`,
++    detail,
++  };
++}
++
++/** ⑧ 网络：任意 HTTP 应答即可达 → ok；不可达 → warn（仅升级/安装通道受影响）。 */
++export function judgeNetwork(obs: NetworkObservation): DoctorCheck {
++  if (obs.reachable) {
++    return { id: "network", level: "ok", summary: `官方 release-info 端点可达（HTTP ${obs.status}）`, detail: { status: obs.status ?? null } };
++  }
++  return {
++    id: "network",
++    level: "warn",
++    summary: `官方 release-info 端点不可达（${obs.reason ?? "unknown"}）——codearts CLI 升级/安装暂不可用（不影响既有功能）`,
++    remediation: "检查网络/代理后重试；官方入口：https://codearts.huaweicloud.com/portal/settings/cli-auth",
++    detail: { reason: obs.reason ?? null },
++  };
++}
++
++/* ───── 聚合 ───── */
++
++export interface DoctorSummary {
++  ok: number;
++  warn: number;
++  fail: number;
++  exitCode: 0 | 1;
++}
++
++/** 聚合：fail>0 → 退出码 1；warn 不影响退出码（任务书：网络等 ⚠ 不阻塞）。 */
++export function aggregate(checks: readonly DoctorCheck[]): DoctorSummary {
++  const ok = checks.filter((c) => c.level === "ok").length;
++  const warn = checks.filter((c) => c.level === "warn").length;
++  const fail = checks.filter((c) => c.level === "fail").length;
++  return { ok, warn, fail, exitCode: fail > 0 ? 1 : 0 };
++}
++
++/* ───── 采集器（IO 层：一切失败归一为观察值） ───── */
++
++/** ① opencode --version：spawn 失败 → 未检出；退出码非 0 → 在场但版本未知。 */
++export async function collectOpencode(exec: Exec): Promise<OpencodeObservation> {
++  let result;
++  try {
++    result = await exec.run(["opencode", "--version"]);
++  } catch {
++    return { present: false };
++  }
++  return { present: true, version: extractVersion(result.stdout, result.stderr) };
++}
++
++/**
++ * ② bun 探测：先 PATH `bun --version`；spawn 失败回落 `<homeDir>/.bun/bin/bun --version`
++ * （install.sh 的官方安装落点）；两路皆失败 → 未检出。
++ */
++export async function collectBun(homeDir: string, exec: Exec): Promise<BunObservation> {
++  try {
++    const r = await exec.run(["bun", "--version"]);
++    if (r.code === 0) return { present: true, version: extractVersion(r.stdout, r.stderr) };
++  } catch {
++    // PATH 探测失败 → 回落 canonical 路径（非静默：失败路径仍有第二探测）
++  }
++  const canonical = path.join(homeDir, ".bun", "bin", "bun");
++  try {
++    const r = await exec.run([canonical, "--version"]);
++    if (r.code === 0) return { present: true, version: extractVersion(r.stdout, r.stderr) };
++  } catch {
++    // 两路皆失败 → 未检出
++  }
++  return { present: false };
++}
++
++/** ③ probeInstall 只读快照；探测抛错（损坏态）归一为 error 观察。 */
++export async function collectCodeartsCli(cfg: BridgeConfig, exec: Exec): Promise<CodeartsObservation> {
++  try {
++    return { status: await probeInstall(cfg, { exec }) };
++  } catch (e) {
++    return {
++      error: e instanceof BridgeError ? `${e.code}: ${e.message}` : (e instanceof Error ? e.message : String(e)),
++    };
++  }
++}
++
++/** ④ 凭据观察：auth.json 存在性 + readAksk；损坏态归一为 error（值绝不回显）。 */
++export async function collectCredential(
++  cfg: BridgeConfig,
++  opts: { kernelDataDir?: string } = {},
++): Promise<CredentialObservation> {
++  const kernelDataDir = opts.kernelDataDir ?? path.join(homedir(), KERNEL_DATA_DIR_DEFAULT);
++  let authJsonExists = false;
++  try {
++    const st = await stat(path.join(kernelDataDir, "auth.json"));
++    authJsonExists = st.isFile();
++  } catch (e) {
++    if (errnoOf(e) !== "ENOENT") {
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      return { authJsonExists: false, error: `auth.json 不可读：path=${kernelDataDir} reason=${reason}` };
++    }
++  }
++  try {
++    return { authJsonExists, aksk: await readAksk(cfg.akskFile) };
++  } catch (e) {
++    return { authJsonExists, error: e instanceof Error ? e.message : String(e) };
++  }
++}
++
++/** ⑤ systemd 观察：单元在场性（stat）→ 在场才发 is-active（缺失时零 systemctl 调用）。 */
++export async function collectSystemd(unitDir: string, exec: Exec): Promise<SystemdObservation> {
++  const present = async (name: string): Promise<boolean> => {
++    try {
++      return (await stat(path.join(unitDir, name))).isFile();
++    } catch (e) {
++      if (errnoOf(e) === "ENOENT") return false;
++      throw e; // 非 ENOENT 的 stat 异常交由上层归一（不该被当"未安装"吞掉）
++    }
++  };
++  let units: SystemdObservation["units"];
++  try {
++    units = {
++      daemon: await present(SERVICE_UNIT_NAMES.daemon),
++      watchdogService: await present(SERVICE_UNIT_NAMES.watchdogService),
++      watchdogTimer: await present(SERVICE_UNIT_NAMES.watchdogTimer),
++    };
++  } catch (e) {
++    return { systemctlAvailable: false, error: e instanceof Error ? e.message : String(e) };
++  }
++  if (!units.daemon) {
++    return { systemctlAvailable: true, units }; // 未安装：不发起任何 systemctl 调用
++  }
++  const isActive = async (unit: string): Promise<boolean | undefined> => {
++    try {
++      return (await exec.run(["systemctl", "--user", "is-active", unit])).code === 0;
++    } catch {
++      return undefined; // spawn 层失败 → systemctl 不可用
++    }
++  };
++  const daemonActive = await isActive(SERVICE_UNIT_NAMES.daemon);
++  if (daemonActive === undefined) {
++    return { systemctlAvailable: false, units };
++  }
++  const timerActive = await isActive(SERVICE_UNIT_NAMES.watchdogTimer);
++  return {
++    systemctlAvailable: true,
++    units,
++    active: { daemon: daemonActive, watchdogTimer: timerActive === true },
++  };
++}
++
++/** ⑥ 守护 /health 探测（GET，3s 超时；只认 ok:true；一切失败归一 ok=false+reason）。 */
++export async function collectDaemonHealth(
++  daemonUrl: string,
++  fetchImpl: FetchLike,
++): Promise<DaemonHealthObservation> {
++  const url = new URL("/health", daemonUrl);
++  let res: Response;
++  try {
++    res = await fetchImpl(url, { signal: AbortSignal.timeout(DOCTOR_DAEMON_TIMEOUT_MS) });
++  } catch (e) {
++    const code = errnoOf(e);
++    const name = e instanceof Error ? e.name : "";
++    return { ok: false, reason: code ?? (name || "unknown") };
++  }
++  if (!res.ok) return { ok: false, reason: `http-${res.status}` };
++  try {
++    const body = (await res.json()) as Record<string, unknown>;
++    if (body["ok"] === true) return { ok: true };
++    return { ok: false, reason: "ok-mismatch" };
++  } catch {
++    return { ok: false, reason: "non-json" };
++  }
++}
++
++/** ⑦ 磁盘占用（复用 collectHealth 的 db/wal/dumps/logs 口径；异常归一为 error）。 */
++export async function collectDisk(cfg: BridgeConfig, kernelDataDir?: string): Promise<DiskObservation> {
++  try {
++    const snap = await collectHealth(cfg, kernelDataDir !== undefined ? { kernelDataDir } : {});
++    return {
++      dbBytes: snap.dbBytes,
++      walBytes: snap.walBytes,
++      dumps: snap.dumps,
++      logsBytes: snap.logs.bytes,
++    };
++  } catch (e) {
++    return {
++      dbBytes: 0,
++      walBytes: 0,
++      dumps: { files: 0, bytes: 0 },
++      logsBytes: 0,
++      error: e instanceof BridgeError ? `${e.code}: ${e.message}` : (e instanceof Error ? e.message : String(e)),
++    };
++  }
++}
++
++/** ⑧ 官方端点 HEAD 探活（5s 超时；任意 HTTP 应答即可达；失败归一 reachable=false）。 */
++export async function collectNetwork(fetchImpl: FetchLike): Promise<NetworkObservation> {
++  let res: Response;
++  try {
++    res = await fetchImpl(NETWORK_PROBE_URL, {
++      method: "HEAD",
++      signal: AbortSignal.timeout(DOCTOR_NETWORK_TIMEOUT_MS),
++    });
++  } catch (e) {
++    const code = errnoOf(e);
++    const name = e instanceof Error ? e.name : "";
++    return { reachable: false, reason: code ?? (name || "unknown") };
++  }
++  return { reachable: true, status: res.status };
++}
++
++/* ───── 汇总与命令 ───── */
++
++/** doctor 可注入依赖（缺省生产实现；测试全部注入）。 */
++export interface DoctorDeps {
++  /** 命令执行抽象（opencode/bun/systemctl 探测；缺省 createNodeExec）。 */
++  exec?: Exec;
++  /** HTTP 探测（守护 /health 与官方端点；缺省全局 fetch）。 */
++  fetchImpl?: FetchLike;
++  /** HOME 锚点（bun canonical 路径与 systemd user 单元目录派生；缺省 os.homedir()）。 */
++  homeDir?: string;
++  /** 内核数据目录（auth.json 与磁盘采样；缺省 ~/.codeartsdoer/cli-data）。 */
++  kernelDataDir?: string;
++}
++
++/** 按任务书 ①..⑧ 固定顺序执行八项采集+判定（不含输出）。 */
++export async function runDoctorChecks(cfg: BridgeConfig, deps: DoctorDeps = {}): Promise<DoctorCheck[]> {
++  const homeDir = deps.homeDir ?? homedir();
++  const exec = deps.exec ?? createNodeExec();
++  const fetchImpl = deps.fetchImpl ?? fetch;
++
++  const opencode = judgeOpencode(await collectOpencode(exec));
++  const bun = judgeBun(await collectBun(homeDir, exec));
++  const codeartsCli = judgeCodeartsCli(await collectCodeartsCli(cfg, exec));
++  const credential = judgeCredential(await collectCredential(cfg, { kernelDataDir: deps.kernelDataDir }));
++  const systemd = judgeSystemd(
++    await collectSystemd(path.join(homeDir, ".config", "systemd", "user"), exec),
++  );
++  const daemon = judgeDaemonHealth(await collectDaemonHealth(cfg.daemonUrl, fetchImpl));
++  const disk = judgeDisk(await collectDisk(cfg, deps.kernelDataDir));
++  const network = judgeNetwork(await collectNetwork(fetchImpl));
++
++  return [opencode, bun, codeartsCli, credential, systemd, daemon, disk, network];
++}
++
++const LEVEL_MARK: Record<CheckLevel, string> = { ok: "✓", warn: "⚠", fail: "✗" };
++
++/**
++ * doctor 命令：输出体检报告并返回聚合退出码。
++ * 默认双输出——人类可读行（stdout）+ 尾部单行结构化 JSON（前缀可辨识，供脚本
++ * 按行解析）；`--json` 时仅输出结构化 JSON（单行）。warn 不改变退出码。
++ */
++export async function doctorCommand(
++  cfg: BridgeConfig = loadConfig(),
++  deps: DoctorDeps = {},
++  opts: { json?: boolean } = {},
++): Promise<number> {
++  const checks = await runDoctorChecks(cfg, deps);
++  const summary = aggregate(checks);
++  const payload = JSON.stringify({ checks, summary });
++  if (opts.json === true) {
++    console.log(payload);
++    return summary.exitCode;
++  }
++  console.log("[codearts-bridge doctor] 环境体检报告");
++  for (const c of checks) {
++    const mark = LEVEL_MARK[c.level];
++    console.log(`${mark} [${c.id}] ${c.summary}`);
++    if (c.remediation !== undefined) console.log(`    ↳ 修复：${c.remediation}`);
++  }
++  console.log(
++    `结论：${summary.ok} ✓ / ${summary.warn} ⚠ / ${summary.fail} ✗（退出码 ${summary.exitCode}）`,
++  );
++  console.log(payload);
++  return summary.exitCode;
++}
+diff --git a/plugins/codearts-bridge/src/core/selfupgrade.ts b/plugins/codearts-bridge/src/core/selfupgrade.ts
+new file mode 100644
+index 0000000000..3fd817d192
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/selfupgrade.ts
+@@ -0,0 +1,394 @@
++/**
++ * codearts-bridge self-upgrade 自升级（T4-05，安全通道）。
++ *
++ * 职责：把 bridge 自身的升级做成"失败零损坏"的受控流程——本包即 git 检出，
++ * 升级 = 同仓库内的 `git reset --hard origin/<branch>`（同一工作树内 rename，
++ * 无跨设备问题），配以门禁与守护重启，失败自动回滚到备份提交。
++ *
++ * 流程（任务书 T4-05 §C）：
++ *   0. 前置：仓库形态核验（.git 在场）+ 脏工作树拒绝（reset --hard 会丢弃
++ *      未提交改动，零损坏纪律要求先显式拒绝而非静默覆盖）；
++ *   1. `git fetch origin`；
++ *   2. 比较 HEAD 与 origin/<branch>（缺省 main）→ 一致 → up-to-date 零写入退出；
++ *   3. 备份当前提交号到 <stateDir>/self-upgrade-backup.json（原子写）；
++ *   4. `git reset --hard origin/<branch>`；
++ *   5. bun.lock 内容变更 → `bun install`；
++ *   6. 质量门：typecheck（默认跑，可 --skip-typecheck）+ `bun test`（可 --skip-tests）；
++ *   7. 守护在运行（<stateDir>/daemon.pid + pid 存活）→ `systemctl --user restart
++ *      codearts-bridge` → 轮询 /health 直至 ok（有限次，间隔可注入）；
++ *   8. 成功 → 返回 updated 结果；
++ *      任何一步失败（步骤 4 之后）→ `git reset --hard <备份提交>` 回滚 + 守护
++ *      曾活跃则再次重启 + 显式抛原始错误（回滚失败 → SELF_UPGRADE_ROLLBACK_FAILED，
++ *      备份记录保留供人工恢复）。
++ *
++ * 零损坏矩阵：
++ * - fetch/比较/脏树拒绝阶段失败：工作树从未被改动，零损坏；
++ * - reset 后任何门失败：工作树回到备份提交（reset --hard 在干净树上幂等）；
++ * - 回滚 reset 自身失败：备份记录（提交号）保留于 stateDir，错误消息携带
++ *   人工恢复命令——绝不静默吞掉回滚失败。
++ *
++ * 可测试性：git/bun/systemctl 全部经注入 Exec（测试用脚本化 fake，绝不真跑）；
++ * /health 轮询经注入 fetch 与 sleep；pid 存活性经注入 pidAlive。生产缺省
++ * Exec 采用长超时（门禁 bun test 全量可达数十秒）与大输出上限。
++ */
++import { readFile, stat } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "./config";
++import type { BridgeConfig } from "./config";
++import { BridgeError } from "./errors";
++import { atomicWriteFile, errnoOf } from "./fsx";
++import type { Exec, ExecResult } from "./install";
++import { SERVICE_UNIT_NAMES } from "./service";
++
++/* ───── 常量（单一出口，cli.ts 与测试共用） ───── */
++
++/** 升级目标分支（任务书固定 origin/main）。 */
++export const SELF_UPGRADE_BRANCH = "main";
++
++/** 备份记录文件名（位于状态根）。 */
++export const SELF_UPGRADE_BACKUP_FILE = "self-upgrade-backup.json";
++
++/** daemon.pid 文件名（与 daemon.ts PID_FILE_NAME 同源；该常量未导出，避免 core→src 反向依赖）。 */
++const PID_FILE_NAME = "daemon.pid";
++
++/** /health 轮询参数：systemd restart 后守护就绪通常秒级；15s×1s 覆盖慢启动。 */
++export const SELF_UPGRADE_HEALTH_ATTEMPTS = 15;
++export const SELF_UPGRADE_HEALTH_INTERVAL_MS = 1_000;
++export const SELF_UPGRADE_HEALTH_TIMEOUT_MS = 3_000;
++
++/** 生产缺省 Exec 参数：门禁（bun test 全量）可达数十秒，输出含测试报告。 */
++export const SELF_UPGRADE_GATE_TIMEOUT_MS = 600_000;
++export const SELF_UPGRADE_GATE_MAX_OUTPUT_BYTES = 8 << 20; // 8 MiB
++
++/** 与 cli.ts FetchLike 同形（core 不反向依赖 cli；M78 双份同码先例）。 */
++export type FetchLike = (url: URL | string, init?: RequestInit) => Promise<Response>;
++
++/* ───── 结果模型 ───── */
++
++/** 备份记录（<stateDir>/self-upgrade-backup.json 内容；升级成功后保留供追溯）。 */
++export interface SelfUpgradeBackupRecord {
++  ts: string;
++  /** 升级前提交号（回滚目标）。 */
++  backupCommit: string;
++  /** 升级目标提交号。 */
++  targetCommit: string;
++  branch: string;
++}
++
++export type SelfUpgradeResult =
++  | { action: "up-to-date"; commit: string; branch: string }
++  | {
++      action: "updated";
++      from: string;
++      to: string;
++      /** 守护是否经历了重启+健康验证（未运行则 false，跳过重启）。 */
++      daemonRestarted: boolean;
++      /** 本轮是否真的跑了 bun test（--skip-tests 时 false，如实入账）。 */
++      testsRan: boolean;
++    };
++
++/* ───── 依赖注入 ───── */
++
++export interface SelfUpgradeDeps {
++  /** git/bun/systemctl 执行抽象（测试注入脚本化 fake；生产 createNodeExec 长超时）。 */
++  exec: Exec;
++  /** /health 轮询（缺省全局 fetch）。 */
++  fetchImpl?: FetchLike;
++  /** 仓库根（缺省 = 本包根，即 src/core 的上两级）。 */
++  repoRoot?: string;
++  /** pid 存活性（缺省 process.kill(pid,0)，EPERM 视为存活）。 */
++  pidAlive?: (pid: number) => boolean;
++  /** 轮询间隔睡眠（缺省真实 setTimeout；测试注入立即返回）。 */
++  sleep?: (ms: number) => Promise<void>;
++  /** 时钟（备份记录 ts；缺省 Date.now）。 */
++  nowMs?: () => number;
++}
++
++export interface SelfUpgradeOptions {
++  /** 跳过 bun test 快速门（任务书 --skip-tests）。 */
++  skipTests?: boolean;
++  /** 跳过 typecheck（默认执行；显式跳过属高级选项）。 */
++  skipTypecheck?: boolean;
++}
++
++/* ───── 内部原语 ───── */
++
++/** 生产缺省仓库根：src/core/selfupgrade.ts → 上两级 = 包根。 */
++function defaultRepoRoot(): string {
++  return path.resolve(import.meta.dir, "..", "..");
++}
++
++/** git -C <repoRoot> 执行；非零退出码或 spawn 失败 → BridgeError(code, 附 stderr 摘要)。 */
++async function execGit(
++  exec: Exec,
++  repoRoot: string,
++  args: string[],
++  code: string,
++  message: string,
++): Promise<ExecResult> {
++  let result: ExecResult;
++  try {
++    result = await exec.run(["git", "-C", repoRoot, ...args]);
++  } catch (e) {
++    throw new BridgeError(code, `${message}：git 执行失败：${e instanceof Error ? e.message : String(e)}`, {
++      cause: e,
++    });
++  }
++  if (result.code !== 0) {
++    const stderr = result.stderr.trim().slice(0, 400);
++    throw new BridgeError(code, `${message}：git ${args.join(" ")} 退出码 ${result.code}${stderr ? `：${stderr}` : ""}`);
++  }
++  return result;
++}
++
++/** 读文本；ENOENT → undefined；其他错误原样上抛（由调用方归一）。 */
++async function readTextOrEnoent(file: string): Promise<string | undefined> {
++  try {
++    return await readFile(file, "utf8");
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return undefined;
++    throw e;
++  }
++}
++
++/** 缺省 pid 存活判定：kill(pid,0)；ESRCH=死；EPERM=在但属他人（存活）。 */
++function defaultPidAlive(pid: number): boolean {
++  try {
++    process.kill(pid, 0);
++    return true;
++  } catch (e) {
++    return errnoOf(e) === "EPERM";
++  }
++}
++
++const sleepDefault = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
++
++/** 单次 /health 探测：只认 2xx + ok:true；一切失败 false。 */
++async function probeHealthOnce(fetchImpl: FetchLike, daemonUrl: string): Promise<boolean> {
++  try {
++    const res = await fetchImpl(new URL("/health", daemonUrl), {
++      signal: AbortSignal.timeout(SELF_UPGRADE_HEALTH_TIMEOUT_MS),
++    });
++    if (!res.ok) return false;
++    const body = (await res.json()) as Record<string, unknown>;
++    return body["ok"] === true;
++  } catch {
++    return false;
++  }
++}
++
++/* ───── selfUpgrade 主流程 ───── */
++
++/**
++ * 自升级受控流程（语义见文件头注）。
++ *
++ * 失败码：
++ * - SELF_UPGRADE_NOT_GIT_REPO / SELF_UPGRADE_DIRTY_TREE（零改动前置拒绝）
++ * - GIT_FETCH_FAILED / GIT_REV_FAILED / GIT_REF_MISSING（比较阶段，零改动）
++ * - BACKUP_WRITE_FAILED（备份原子写失败，工作树未动）
++ * - GIT_RESET_FAILED（reset 失败：工作树未变，无需回滚）
++ * - BUN_INSTALL_FAILED / TYPECHECK_FAILED / TESTS_FAILED（门失败 → 回滚）
++ * - SELF_UPGRADE_PIDFILE_INVALID（pidfile 损坏：禁猜，不重启守护；门已过 → 回滚）
++ * - DAEMON_RESTART_FAILED / DAEMON_HEALTH_FAILED（重启/健康失败 → 回滚）
++ * - SELF_UPGRADE_ROLLBACK_FAILED（回滚 reset 失败：备份记录保留，附人工恢复指引）
++ */
++export async function selfUpgrade(
++  cfg: BridgeConfig = loadConfig(),
++  deps: SelfUpgradeDeps,
++  opts: SelfUpgradeOptions = {},
++): Promise<SelfUpgradeResult> {
++  const repoRoot = deps.repoRoot ?? defaultRepoRoot();
++  const branch = SELF_UPGRADE_BRANCH;
++  const exec = deps.exec;
++  const fetchImpl = deps.fetchImpl ?? fetch;
++  const sleep = deps.sleep ?? sleepDefault;
++  const pidAlive = deps.pidAlive ?? defaultPidAlive;
++  const nowMs = deps.nowMs ?? Date.now;
++
++  // 0) 仓库形态核验：.git 在场（worktree 中 .git 为指针文件，stat 即可）
++  const gitStat = await stat(path.join(repoRoot, ".git")).catch((e: unknown) => {
++    if (errnoOf(e) === "ENOENT") return undefined;
++    throw new BridgeError("SELF_UPGRADE_NOT_GIT_REPO", `仓库形态核验失败：path=${repoRoot}`, { cause: e });
++  });
++  if (gitStat === undefined) {
++    throw new BridgeError(
++      "SELF_UPGRADE_NOT_GIT_REPO",
++      `self-upgrade 要求 git 检出形态：${repoRoot} 下无 .git`,
++      { remediation: "本命令只支持 git 检出（install.sh 的安装形态）；发布包/只读目录请重新 clone 后升级" },
++    );
++  }
++
++  // 1) fetch
++  await execGit(exec, repoRoot, ["fetch", "origin"], "GIT_FETCH_FAILED", "git fetch 失败（网络/远端不可达）");
++
++  // 2) 比较 HEAD 与 origin/<branch>
++  const headRev = await execGit(exec, repoRoot, ["rev-parse", "HEAD"], "GIT_REV_FAILED", "无法解析 HEAD 提交号");
++  const headSha = headRev.stdout.trim();
++  if (headSha.length === 0) {
++    throw new BridgeError("GIT_REV_FAILED", "git rev-parse HEAD 输出为空");
++  }
++  const remoteRev = await execGit(
++    exec,
++    repoRoot,
++    ["rev-parse", `origin/${branch}`],
++    "GIT_REF_MISSING",
++    `无法解析 origin/${branch}（分支不存在或未 fetch）`,
++  );
++  const remoteSha = remoteRev.stdout.trim();
++  if (remoteSha.length === 0) {
++    throw new BridgeError("GIT_REF_MISSING", `git rev-parse origin/${branch} 输出为空`);
++  }
++  if (headSha === remoteSha) {
++    return { action: "up-to-date", commit: headSha, branch };
++  }
++
++  // 3) 脏工作树拒绝（reset --hard 不可逆丢弃未提交改动——零损坏要求先显式拒绝）
++  const statusOut = await execGit(exec, repoRoot, ["status", "--porcelain"], "GIT_STATUS_FAILED", "git status 失败");
++  if (statusOut.stdout.trim().length > 0) {
++    throw new BridgeError(
++      "SELF_UPGRADE_DIRTY_TREE",
++      `工作树存在未提交改动，拒绝 reset --hard（改动会被不可逆丢弃）：repo=${repoRoot}`,
++      {
++        remediation:
++          "先提交或 stash 本地改动后重试；如需放弃改动请显式执行 git -C <repo> checkout -- . 并承担后果",
++      },
++    );
++  }
++
++  // 4) 备份当前提交号（原子写；先于任何破坏性动作）
++  const backupFile = path.join(cfg.stateDir, SELF_UPGRADE_BACKUP_FILE);
++  const record: SelfUpgradeBackupRecord = {
++    ts: new Date(nowMs()).toISOString(),
++    backupCommit: headSha,
++    targetCommit: remoteSha,
++    branch,
++  };
++  try {
++    await atomicWriteFile(backupFile, `${JSON.stringify(record, null, 2)}\n`, 0o644);
++  } catch (e) {
++    throw new BridgeError("BACKUP_WRITE_FAILED", `备份记录写入失败：path=${backupFile}`, { cause: e });
++  }
++
++  // 5) 锁基线（reset 可能带来 bun.lock 变更）
++  const lockFile = path.join(repoRoot, "bun.lock");
++  const lockBefore = await readTextOrEnoent(lockFile);
++
++  // 可变阶段：从 reset 起任何失败都要回滚
++  const resetTo = async (commit: string): Promise<void> => {
++    await execGit(exec, repoRoot, ["reset", "--hard", commit], "GIT_RESET_FAILED", `git reset --hard ${commit} 失败`);
++  };
++  const runGate = async (cmd: string[], code: string, label: string): Promise<void> => {
++    let result: ExecResult;
++    try {
++      result = await exec.run(cmd);
++    } catch (e) {
++      throw new BridgeError(code, `${label}执行失败：${e instanceof Error ? e.message : String(e)}`, { cause: e });
++    }
++    if (result.code !== 0) {
++      const stderr = result.stderr.trim().slice(0, 400);
++      throw new BridgeError(code, `${label}未通过（退出码 ${result.code}）${stderr ? `：${stderr}` : ""}`);
++    }
++  };
++
++  // 守护状态采集（回滚时需要知道是否要再重启）
++  const pidPath = path.join(cfg.stateDir, PID_FILE_NAME);
++  const readDaemonPid = async (): Promise<number | undefined> => {
++    const raw = (await readTextOrEnoent(pidPath))?.trim();
++    if (raw === undefined || raw.length === 0) return undefined;
++    if (!/^\d+$/.test(raw)) {
++      throw new BridgeError(
++        "SELF_UPGRADE_PIDFILE_INVALID",
++        `daemon.pid 内容非法（拒绝猜测进程状态）：path=${pidPath}`,
++        { remediation: "核查守护进程实际状态后删除或修复该文件再重试" },
++      );
++    }
++    return Number(raw);
++  };
++
++  try {
++    await resetTo(remoteSha);
++
++    // 6) 锁变更 → bun install
++    const lockAfter = await readTextOrEnoent(lockFile);
++    if (lockAfter !== lockBefore) {
++      await runGate(["bun", "--cwd", repoRoot, "install"], "BUN_INSTALL_FAILED", "bun install");
++    }
++
++    // 7) 质量门
++    if (opts.skipTypecheck !== true) {
++      await runGate(["bun", "--cwd", repoRoot, "run", "typecheck"], "TYPECHECK_FAILED", "typecheck");
++    }
++    if (opts.skipTests !== true) {
++      await runGate(["bun", "--cwd", repoRoot, "test"], "TESTS_FAILED", "bun test");
++    }
++
++    // 8) 守护重启 + 健康验证（未运行则跳过——不对"守护本来就没开"升级失败负责）
++    const pid = await readDaemonPid();
++    if (pid === undefined || !pidAlive(pid)) {
++      return { action: "updated", from: headSha, to: remoteSha, daemonRestarted: false, testsRan: opts.skipTests !== true };
++    }
++    await runGate(
++      ["systemctl", "--user", "restart", SERVICE_UNIT_NAMES.daemon],
++      "DAEMON_RESTART_FAILED",
++      "systemctl restart 守护",
++    );
++    let healthy = false;
++    for (let i = 0; i < SELF_UPGRADE_HEALTH_ATTEMPTS; i++) {
++      if (i > 0) await sleep(SELF_UPGRADE_HEALTH_INTERVAL_MS);
++      if (await probeHealthOnce(fetchImpl, cfg.daemonUrl)) {
++        healthy = true;
++        break;
++      }
++    }
++    if (!healthy) {
++      throw new BridgeError(
++        "DAEMON_HEALTH_FAILED",
++        `守护重启后 /health 在 ${SELF_UPGRADE_HEALTH_ATTEMPTS} 次探测内未恢复 ok`,
++        { remediation: "journalctl --user -t codearts-bridge 排查；回滚将自动执行" },
++      );
++    }
++    return {
++      action: "updated",
++      from: headSha,
++      to: remoteSha,
++      daemonRestarted: true,
++      testsRan: opts.skipTests !== true,
++    };
++  } catch (e) {
++    // 回滚：reset 到备份提交；守护曾活跃（pidfile 可读且存活）则再次重启。
++    // 回滚失败 → SELF_UPGRADE_ROLLBACK_FAILED（原错误挂 cause，备份记录保留供人工恢复）。
++    let rollbackNote: string;
++    try {
++      await resetTo(headSha);
++      rollbackNote = `已回滚到备份提交 ${headSha}`;
++    } catch (rbErr) {
++      throw new BridgeError(
++        "SELF_UPGRADE_ROLLBACK_FAILED",
++        `升级失败且自动回滚失败：原始错误=${e instanceof Error ? e.message : String(e)}；` +
++          `回滚错误=${rbErr instanceof Error ? rbErr.message : String(rbErr)}；` +
++          `备份记录（含人工恢复命令）保留于 ${backupFile}`,
++        {
++          remediation: `人工恢复：git -C ${repoRoot} reset --hard ${headSha}（备份记录：${backupFile}）`,
++          cause: e,
++        },
++      );
++    }
++    // 回滚 reset 成功：尽力重启守护（曾活跃时）；重启失败仅追加说明，不掩盖原始错误
++    let restartNote = "";
++    try {
++      const pid = await readDaemonPid();
++      if (pid !== undefined && pidAlive(pid)) {
++        await exec.run(["systemctl", "--user", "restart", SERVICE_UNIT_NAMES.daemon]);
++        restartNote = "；守护已随回滚重启";
++      }
++    } catch (re) {
++      restartNote = `；⚠ 回滚后守护重启失败（需人工 systemctl --user restart ${SERVICE_UNIT_NAMES.daemon}）：${re instanceof Error ? re.message : String(re)}`;
++    }
++    const be = e instanceof BridgeError ? e : undefined;
++    throw new BridgeError(
++      be?.code ?? "SELF_UPGRADE_FAILED",
++      `${be?.message ?? (e instanceof Error ? e.message : String(e))}（${rollbackNote}${restartNote}）`,
++      { remediation: be?.remediation, cause: be?.cause ?? e },
++    );
++  }
++}
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-script.ts b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+index c4ebf4ee38..ee1361116c 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-script.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+@@ -68,35 +68,37 @@
+  * 语义裁决（显式报错，禁静默兜底；与 FakeTransport 对齐项注明）：
+  * - 未知 ref：inject/observe/stop/snapshot 抛 SESSION_UNKNOWN（与 Fake 同）；
+  *   alive 返回 false、start 采纳重建（修复环④③裁定，见上）；
+  * - 对非存活会话 inject：抛 SESSION_NOT_ALIVE（与 Fake 同）；等待 120ms 提交
+  *   窗口期间会话死亡：同样显式抛出，不向死进程写字节；
+  * - 同一 ref 并发第二个 observe：抛 OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
+  * - start 带 ref 复用：存活会话幂等返回同 ref；已亡/未知 → 同名重建（③）；
+  * - 进程自然退出：observe 产出一次性 done 信号（接口未携带退出码，text 省略）
+  *   后迭代正常结束；stop() 终止则不产 done、观察直接终止（与 Fake 同态）；
+  * - snapshot.raw = PTY 输出缓冲（全部 chunk 解码按序累积，模拟终端缓冲区，
+- *   与是否被 observe 消费无关）；日志源信号不进 raw（raw 仅 PTY 输出）。
++ *   与是否被 observe 消费无关；F1 终审修复波起封顶——只保留最新
++ *   SESSION_RAW_CAP_BYTES（512KB）尾部，丢弃量见 meta.rawDroppedBytes）；
++ *   日志源信号不进 raw（raw 仅 PTY 输出）。
+  *   meta.log = { available, file, serviceLines }：available = 观察进行中且正在
+  *   tail 某 kernel-*.log；file = 当前 tail 的文件名（basename）；serviceLines =
+  *   日志源产出的信号累计数（跨观察累计，留痕不丢）。
+  * - R-tm5 共享提取（T2-03 起）：日志 tailer/shQuote/lookPath/时钟类型已提取至
+  *   shared.ts（唯一真相源），本文件 import 复用并 re-export shQuote/PtyClock
+  *   保持既有导入面不变；行为与测试零改动。观察循环骨架（本文件与 pty-tmux
+  *   各自实现）因生产/探测机制差异不做提取（见 shared.ts 头注）。
+  */
+ 
+ import { spawn } from "node:child_process";
+ import { existsSync } from "node:fs";
+ import * as path from "node:path";
+ import { StringDecoder } from "node:string_decoder";
+-import { armLogTailer, lookPath, shQuote, type PtyClock } from "./shared";
++import { armLogTailer, CappedTailBuffer, lookPath, shQuote, type PtyClock } from "./shared";
+ import type { BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+ import type {
+   CodeartsTransport,
+   ObserveOptions,
+   SessionRef,
+   Signal,
+   TransportKind,
+ } from "./types";
+ 
+@@ -218,22 +220,24 @@ export function nodeScriptSpawnPty(args: string[], env: NodeJS.ProcessEnv): PtyC
+     },
+   };
+ }
+ 
+ /* ───── 会话状态与日志 tailer ───── */
+ 
+ /** 单个 script PTY 会话的全部可变状态（经 ref.id 寻址）。 */
+ interface PtySession {
+   ref: SessionRef;
+   child: PtyChild;
+-  /** PTY 输出缓冲：全部 chunk 解码按序累积（snapshot.raw，与消费无关）。 */
+-  raw: string;
++  /** PTY 输出缓冲（F1 封顶尾缓冲）：全部 chunk 解码按序累积（snapshot.raw，与
++   * 消费无关）；只保留最新 SESSION_RAW_CAP_BYTES 尾部，丢弃量经 rawDroppedBytes
++   * 暴露（snapshot.meta，审计可见非静默）。 */
++  rawBuf: CappedTailBuffer;
+   /** 待消费信号队列（PTY chunk / 日志 service 行 / done）。 */
+   queue: Signal[];
+   /** observe 挂起等待者（wakeAll 唤醒后自旋复查状态）。 */
+   waiters: Array<() => void>;
+   /** 当前活跃观察者标记（单观察者模型；null = 无）。 */
+   observer: symbol | null;
+   /** stop 置位：观察迭代终止条件之一。 */
+   closed: boolean;
+   /** 进程死亡 done 信号是否已产出（只产一次）。 */
+   exitHandled: boolean;
+@@ -317,32 +321,32 @@ export function createScriptTransport(
+           "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
+       });
+     }
+     const cmd = shQuote(wrapper);
+     // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
+     const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
+     const created: SessionRef = { kind, id };
+     const s: PtySession = {
+       ref: created,
+       child,
+-      raw: "",
++      rawBuf: new CappedTailBuffer(),
+       queue: [],
+       waiters: [],
+       observer: null,
+       closed: false,
+       exitHandled: false,
+       // 日志账目对象继承（I1 原地变更语义，与 tmux 同名重建同口径）
+       log: prev?.log ?? { available: false, file: null, serviceLines: 0 },
+     };
+-    // onData 单播：start 时接线一次，输出持续入 raw + 队列（与是否观察无关）
++    // onData 单播：start 时接线一次，输出持续入 rawBuf + 队列（与是否观察无关）
+     child.onData((chunk) => {
+-      s.raw += chunk;
++      s.rawBuf.append(chunk);
+       s.queue.push({ t: "output", at: Date.now(), text: chunk });
+       wakeAll(s);
+     });
+     // ③ 自检：回传的 ref 必须满足 alive(ref)=true（spawn 后即刻死亡 = 启动
+     // 即崩，显式报错；禁回传死 ref 制造 restart→tick-failed 重启风暴）
+     if (!child.alive()) {
+       throw new BridgeError("PTY_START_FAILED", `会话进程启动即死，重建失败：id=${id}`, {
+         remediation: "检查官方 wrapper 与目标 TUI 可执行性（journal 可能有启动错误输出）。",
+       });
+     }
+@@ -486,28 +490,30 @@ export function createScriptTransport(
+       if (!s.closed) {
+         s.closed = true;
+         if (s.child.alive()) s.child.kill(); // R-p4：组杀 + SIGHUP 级联两级终止（机理见文件头 R-p4）
+       }
+       wakeAll(s);
+     },
+ 
+     async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
+       const s = requireSession(ref);
+       return {
+-        raw: s.raw,
++        // F1 封顶：只保留最新 512KB 尾部，丢弃量见 meta.rawDroppedBytes
++        raw: s.rawBuf.value(),
+         meta: {
+           id: s.ref.id,
+           kind: s.ref.kind,
+           host: "script",
+           pid: s.child.pid,
+           alive: !s.closed && s.child.alive(),
+           closed: s.closed,
++          rawDroppedBytes: s.rawBuf.droppedBytes,
+           log: { ...s.log },
+         },
+       };
+     },
+   };
+ 
+   return transport;
+ }
+ 
+ /** 空信号迭代（observe 收到已 abort 的 signal 时返回；不占观察者、不装配 tailer）。 */
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+index f20c5d375e..8cf6ffffd6 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+@@ -65,41 +65,44 @@
+  *   I1）。日志可用性在新旧对象间显式同步：两对象共享同一 log 状态对象且
+  *   shared.ts 全部原地变更（见 shared.ts I1 注），旧观察者结束（close→不可用
+  *   态）对新对象的 snapshot 立即可见，不产生分叉的陈旧 meta。
+  * - observe = 生成器体内轮询 `capture-pane -p`（注入时钟，POLL_MS）：基线在
+  *   首轮捕获确定（基线前内容不交付，与日志 tailer statSync 基线同理）；差分
+  *   规则：新内容前缀演进 → 交付增量；非前缀演进（TUI 重绘）→ 全量如实转达。
+  *   生产者仅在生成器体内运行（与 script 的 onData 独立生产者不同），残存保留
+  *   语义由会话队列跨观察持久承担（测试钉死）。pane 捕获在 observe() 返回后
+  *   才异步进行（tmux 探测为异步），故存活校验发生在首次 next（显式
+  *   SESSION_NOT_ALIVE，与 script 的同步抛错时点差异已注明）。
+- * - snapshot.raw = 即时 capture-pane 输出；会话亡故 → raw=""（无 pane 可捕获）。
++ * - snapshot.raw = 即时 capture-pane 输出（F1 终审修复波：桥接侧快照按
++ *   SESSION_RAW_CAP_BYTES（512KB）尾保留，丢弃量见 meta.rawDroppedBytes——pane
++ *   全量仍由 tmux history 自身持有，本封顶只收口桥接侧内存）；会话亡故 →
++ *   raw=""（无 pane 可捕获）。
+  * - 一次性 done 语义：observe 期间会话外部消亡 → 产一次 done 后迭代结束
+  *   （对齐 script 进程自然退出）；本传输 stop() 终止则不产 done（与 Fake 同态）。
+  *
+  * 语义裁决（显式报错，禁静默兜底；与 Fake/script 对齐项注明）：
+  * - 未知 ref（未注册/非法 kind/空 id）：SESSION_UNKNOWN（与 Fake 同）；
+  * - 对非存活会话 inject：SESSION_NOT_ALIVE（与 Fake 同）；send-keys 失败时
+  *   复查存活——亡 → SESSION_NOT_ALIVE，活 → PTY_INJECT_FAILED（带 stderr）；
+  * - 同一 ref 并发第二个 observe：OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
+  * - kill-session 失败且会话仍在：PTY_STOP_FAILED；capture-pane 失败且会话在：
+  *   PTY_CAPTURE_FAILED；new-session 失败：PTY_START_FAILED——均显式抛出。
+  */
+ 
+ import { spawn } from "node:child_process";
+ import { createHash } from "node:crypto";
+ import { existsSync } from "node:fs";
+ import * as path from "node:path";
+ import { StringDecoder } from "node:string_decoder";
+ import type { BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+-import { armLogTailer, lookPath, shQuote, type PtyClock } from "./shared";
++import { armLogTailer, capRawTail, lookPath, shQuote, type PtyClock } from "./shared";
+ import type {
+   CodeartsTransport,
+   ObserveOptions,
+   SessionRef,
+   Signal,
+   TransportKind,
+ } from "./types";
+ 
+ /** 观察空闲轮询周期毫秒（会话存活探测/capture-pane 差分/日志 tail 兜底）。 */
+ const POLL_MS = 200;
+@@ -517,38 +520,45 @@ export function createTmuxTransport(
+         );
+       }
+       s.closed = true;
+       wakeAll(s);
+     },
+ 
+     async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
+       const s = requireSession(ref);
+       const alive = !s.closed && (await hasSessionName(s.target));
+       let raw = "";
++      let rawDroppedBytes = 0;
+       if (alive) {
+         const r = await exec.run(["capture-pane", "-p", "-t", s.target]); // R-tm4
+         if (r.exitCode !== 0) {
+           throw new BridgeError(
+             "PTY_CAPTURE_FAILED",
+             `capture-pane 失败（退出码 ${r.exitCode}）：${r.stderr.trim()}`,
+           );
+         }
+-        raw = r.stdout;
++        // F1（终审修复波）：桥接侧快照封顶尾保留（tmux history 仍持全量，非静默——
++        // 丢弃量如实入 meta）
++        const capped = capRawTail(r.stdout);
++        raw = capped.raw;
++        rawDroppedBytes = capped.droppedBytes;
+       }
+       return {
+-        // raw = 即时 capture；会话亡故无 pane 可捕获 → 空串（meta.alive 如实标注）
++        // raw = 即时 capture（512KB 尾封顶）；会话亡故无 pane 可捕获 → 空串
++        //（meta.alive 如实标注）
+         raw,
+         meta: {
+           id: s.ref.id,
+           kind: s.ref.kind,
+           host: "tmux",
+           target: s.target,
+           alive,
+           closed: s.closed,
++          rawDroppedBytes,
+           log: { ...s.log },
+         },
+       };
+     },
+   };
+ 
+   return transport;
+ }
+diff --git a/plugins/codearts-bridge/src/core/transport/shared.ts b/plugins/codearts-bridge/src/core/transport/shared.ts
+index afd76b8841..ec84dd41db 100644
+--- a/plugins/codearts-bridge/src/core/transport/shared.ts
++++ b/plugins/codearts-bridge/src/core/transport/shared.ts
+@@ -13,20 +13,25 @@
+  * I1（评审修复，2026-10-31）：log 状态在本文件内一律**原地变更**（不整体替换
+  * s.log 引用）。原因：tmux 同名重建（T2-03 start(ref) 对账语义）时新旧会话
+  * 状态对象共享同一 log 对象，若以引用替换方式更新可用性，旧观察者结束时的
+  * close 只替换到旧对象，新对象读到的 snapshot.meta.log 将永久滞留陈旧值
+  * （分叉）；原地变更使可用性/文件名/计数对所有持有时显式同步。
+  *
+  * 观察循环骨架（队列排空/closed/单观察者/abort 对齐）各宿主差异较大
+  * （script 为同步 child.alive() + onData 独立生产者；tmux 为异步 has-session
+  * 探测 + 生成器体内轮询 capture-pane 生产者），**不做**提取——按 R-tm5 的
+  * "否则最小重复实现"处理，两宿主各自实现并互相标注来源。
++ *
++ * 终审修复波 F1（2026-10-31）：新增会话 raw 封顶尾缓冲（CappedTailBuffer /
++ * SESSION_RAW_CAP_BYTES / capRawTail）——三传输（structured/script/tmux）共享
++ * 的桥接侧内存收口（内存要求③），三宿主一致语义：raw 只保留最新 512KB 尾部，
++ * 丢弃量以 rawDroppedBytes 计数暴露于 snapshot().meta（审计可见，非静默）。
+  */
+ 
+ import { accessSync, constants, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
+ import { open } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import * as path from "node:path";
+ import { StringDecoder } from "node:string_decoder";
+ import type { Signal } from "./types";
+ 
+ /** 可注入时钟（R-p1/R-tm6）：返回在 ms 毫秒后落定的 Promise。 */
+@@ -257,10 +262,100 @@ export function armLogTailer(
+       dirWatcher?.close();
+       dirWatcher = null;
+     });
+   } catch {
+     markUnavailable(); // 目录缺失等（R-p2：不报错）
+   }
+   if (current !== null) rearmFileWatcher(current);
+ 
+   return tailer;
+ }
++
++/* ───── 会话 raw 封顶尾缓冲（终审修复波 F1，2026-10-31） ───── */
++
++/**
++ * 会话 raw 缓冲字节上限（512KB）。守护长驻下会话 raw 若无限累积，桥接侧 RSS
++ * 单调增长（终审实证 raw 无消费者、仅调试快照用）；封顶后最坏占用恒为 cap。
++ */
++export const SESSION_RAW_CAP_BYTES = 512 * 1024;
++
++/**
++ * 封顶尾缓冲（F1 唯一真相源）：按追加序累积文本，总量（UTF-8 字节）超过
++ * cap 时丢弃**最旧**字节、保留最新 ≤cap 字节（尾滚动）；累计丢弃字节数经
++ * droppedBytes 暴露（snapshot.meta.rawDroppedBytes，审计可见非静默）。
++ *
++ * 实现纪律：
++ * - 块列表累积（追加 O(1)）；裁剪先整块丢弃、边界块内按**码点**粒度裁剪——
++ *   永不劈开代理对/多字节字符（slice 落在码点边界，UTF-8 重编码无损）；
++ * - 字节口径统一 Buffer.byteLength(·, "utf8")（与"512KB 内存"的语义一致，
++ *   非 UTF-16 code unit 数）；
++ * - 本类不做任何兜底/吞错：纯内存结构，无失败路径。
++ */
++export class CappedTailBuffer {
++  readonly #cap: number;
++  #chunks: string[] = [];
++  #bytes = 0;
++  #dropped = 0;
++
++  constructor(cap: number = SESSION_RAW_CAP_BYTES) {
++    this.#cap = cap;
++  }
++
++  /** 追加一段输出（空串为无操作）；超限即时裁剪，#bytes 恒 ≤ max(cap, 单块字节)。 */
++  append(text: string): void {
++    if (text === "") return;
++    this.#chunks.push(text);
++    this.#bytes += Buffer.byteLength(text, "utf8");
++    this.#trim();
++  }
++
++  /** 当前保留的尾部内容（拼接一次；≤ cap 字节）。 */
++  value(): string {
++    return this.#chunks.join("");
++  }
++
++  /** 累计丢弃的最旧字节数（snapshot.meta.rawDroppedBytes）。 */
++  get droppedBytes(): number {
++    return this.#dropped;
++  }
++
++  /** 超限裁剪：先整块丢（不改边界），末块码点粒度精确裁到 cap。 */
++  #trim(): void {
++    while (this.#bytes > this.#cap) {
++      const head = this.#chunks[0]!;
++      const headBytes = Buffer.byteLength(head, "utf8");
++      if (this.#chunks.length > 1 && this.#bytes - headBytes >= this.#cap) {
++        // 整块丢弃后仍 ≥ cap：安全整丢（不触码点边界）
++        this.#chunks.shift();
++        this.#bytes -= headBytes;
++        this.#dropped += headBytes;
++        continue;
++      }
++      // 边界块（或单块超限）：只丢超出部分，码点对齐防劈开字符
++      const excess = this.#bytes - this.#cap;
++      let removed = 0;
++      let cut = 0;
++      for (const ch of head) {
++        if (removed >= excess) break;
++        removed += Buffer.byteLength(ch, "utf8");
++        cut += ch.length;
++      }
++      this.#chunks[0] = head.slice(cut);
++      this.#bytes -= removed;
++      this.#dropped += removed;
++    }
++  }
++}
++
++/**
++ * 一次性封顶（无状态场景：tmux capture-pane 快照等非累积 raw）：返回按
++ * SESSION_RAW_CAP_BYTES 尾保留的内容与本次丢弃字节数。语义与 CappedTailBuffer
++ * 单次 append 逐字一致（同一实现路径，无第二真相源）。
++ */
++export function capRawTail(
++  text: string,
++  cap: number = SESSION_RAW_CAP_BYTES,
++): { raw: string; droppedBytes: number } {
++  const buf = new CappedTailBuffer(cap);
++  buf.append(text);
++  return { raw: buf.value(), droppedBytes: buf.droppedBytes };
++}
+diff --git a/plugins/codearts-bridge/src/core/transport/structured.ts b/plugins/codearts-bridge/src/core/transport/structured.ts
+index fa39bde99a..f240fedef0 100644
+--- a/plugins/codearts-bridge/src/core/transport/structured.ts
++++ b/plugins/codearts-bridge/src/core/transport/structured.ts
+@@ -1,18 +1,20 @@
+ /**
+  * codearts-bridge structured 传输（T2-04）—— `codearts run --format json` 驱动。
+  *
+  * 职责：CodeartsTransport 的结构化通道实现——**每回合 = 一个独立
+  * `<installDir>/bin/codearts run <prompt> --format json --print-logs` 进程**
+- * （回合进程退出即回合结束，内核内存每回合归零——痛点②治理主路径；会话连续性
+- * 经 `--session <id>` 续接）。契约唯一真相源为 types.ts；本文件实现其全部六方法，
+- * 并对齐 T2-01 FakeTransport 的可观测语义（T3-03 监督状态机可迁移基准）。
++ * （回合进程退出即回合结束，**codearts 内核**内存每回合归零——回合=独立进程，
++ * 痛点②治理主路径；桥接侧会话缓冲另有 512KB 封顶与丢弃计数，见 F1/rawBuf；
++ * 会话连续性经 `--session <id>` 续接）。契约唯一真相源为 types.ts；本文件实现
++ * 其全部六方法，并对齐 T2-01 FakeTransport 的可观测语义（T3-03 监督状态机
++ * 可迁移基准）。
+  *
+  * 主控裁定对照（2026-10-31，逐条落实）：
+  * - R-s1 回合=进程：inject(ref, prompt) 即发起新回合——spawn argv 一律数组传递
+  *   （禁 shell 字符串拼接，prompt 为单个 argv 元素，空格/特殊字符不被拆词解释）；
+  *   `--session <id>` 续接（会话 id 已捕获时）。session id 从事件行宽容提取：
+  *   任意 JSON 对象行的 `sessionID` / `session_id` 字符串字段，**首现即捕获、
+  *   后续不改写**；非 JSON 行保留原文为 output 信号（宽容解析，不静默丢弃）。
+  * - R-s2 AK/SK 前置：每次 start 均执行 readAksk(cfg.akskFile)（非缓存）；缺失
+  *  （文件不存在 / AK、SK 任一为空）→ BridgeError(AKSK_MISSING)，remediation 含
+  *   官方配置入口与 config.env 说明；**不静默转 PTY**。读取错误（EACCES 等）
+@@ -38,20 +40,24 @@
+  *   │ 非 JSON 行（日志噪声/横幅）         │ output（原文整行，宽容不丢弃）        │
+  *   │ 任意 JSON 对象含 sessionID/        │ 捕获会话 id（首现优先，不改写）       │
+  *   │ session_id 字符串字段              │ （与上述映射叠加，不互斥）            │
+  *   │ 进程退出 code=0                   │ done（一次性，无 text，随后迭代结束） │
+  *   │ 进程退出 code≠0                   │ error（一次性，text=退出码详情，       │
+  *   │                                  │  无 done；随后迭代结束）              │
+  *   └──────────────────────────────────┴─────────────────────────────────────┘
+  *   classifyError(line)：ECONNRESET / timeout / 429 / 503 → "retryable"；
+  *   认证失败 → "fatal"（**优先于 retryable**——凭据缺失重试无意义，须人工配置）；
+  *   其余 → undefined。子串宽容匹配（面向 T3 重试策略的分类线索，非解析器）。
++ * - F1（终审修复波 2026-10-31）会话 raw 封顶：rawBuf 只保留最新
++ *   SESSION_RAW_CAP_BYTES（512KB）尾部（尾滚动），丢弃量以 meta.rawDroppedBytes
++ *   如实计数（审计可见，非静默）；按"会话"累计口径不变——跨回合不重置、
++ *   stop 重建留痕不丢，仅在会话生命期内封顶（shared.ts CappedTailBuffer）。
+  *
+  * 设计裁决（实现者决策，供评审）：
+  * - 签名：`createStructuredTransport(exec)`——plan 卡写 `(cfg, exec, aksk?)`，
+  *   但 types.ts（T2-01 唯一真相源）以 start(cfg) 逐次交付配置、aksk 经
+  *   readAksk(cfg.akskFile) 在 start 内前置读取（R-s2），为避免 installDir/凭据
+  *   双真相源并对齐 T2-02/T2-03 先例，取 (exec) 单参（本传输无轮询时钟需求：
+  *   全事件驱动，行回调/退出回调直接驱动，无需注入 clock）。
+  * - 语义映射：inject = 发起新回合（text 即本轮 prompt；接口注"注入一段文本
+  *  （如续跑指令）"的 structured 对应物）；prompt 允许多行/任意字符（argv 元素
+  *   直传，无 PTY 两段式提交问题，故无 INJECT_TEXT_MULTILINE 检查）；空串 prompt
+@@ -81,21 +87,21 @@
+  * - spawn 失败（bin 缺失/不可执行，lookPath 预检）：STRUCTURED_SPAWN_FAILED
+  *  （remediation 指向 codearts_status/repair）；组杀失败（非 ESRCH）：
+  *   STRUCTURED_STOP_FAILED——均显式抛出。
+  */
+ 
+ import { spawn } from "node:child_process";
+ import * as path from "node:path";
+ import { StringDecoder } from "node:string_decoder";
+ import { readAksk, type Aksk, type BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+-import { lookPath } from "./shared";
++import { CappedTailBuffer, lookPath } from "./shared";
+ import type {
+   CodeartsTransport,
+   ObserveOptions,
+   SessionRef,
+   Signal,
+   TransportKind,
+ } from "./types";
+ 
+ /** 回合进程退出信息（code=null 表示 spawn 本身失败，signal 携带原因码）。 */
+ export interface ProcExit {
+@@ -263,22 +269,26 @@ interface StructSession {
+   /** 最近一次成功 start 前置读取的凭据（回合 env 装配用；R-s2 注）。 */
+   aksk: Aksk;
+   /** 已捕获的 codearts 会话 id（null = 尚未建立；首现捕获后不改写）。 */
+   codeartsSessionId: string | null;
+   /** 当前回合（null = 从未发起/已被新一轮覆盖）。 */
+   round: RoundState | null;
+   /** 已发起回合总数（snapshot.meta.rounds）。 */
+   roundSeq: number;
+   /** 最近一次回合退出信息（snapshot.meta.lastExit）。 */
+   lastExit: ProcExit | null;
+-  /** raw 缓冲：output/error 信号 text 按序累积（每条后接 \n；与消费无关）。 */
+-  raw: string;
++  /**
++   * raw 缓冲（F1 封顶尾缓冲）：output/error 信号 text 按序累积（每条后接 \n；
++   * 与消费无关）；只保留最新 SESSION_RAW_CAP_BYTES 尾部，丢弃量见 rawDroppedBytes
++   * （snapshot.meta），丢弃不静默。
++   */
++  rawBuf: CappedTailBuffer;
+   /** 待消费信号队列（事件行 / 回合终局信号）。 */
+   queue: Signal[];
+   /** observe 挂起等待者（wakeAll 唤醒后自旋复查状态）。 */
+   waiters: Array<() => void>;
+   /** 当前活跃观察者标记（单观察者模型；null = 无）。 */
+   observer: symbol | null;
+   /** stop 置位：会话终态（观察终止、注入拒绝）。 */
+   closed: boolean;
+ }
+ 
+@@ -342,35 +352,35 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+         wakeAll(s);
+         return;
+       }
+       if (type === "message.part") {
+         const part = ev.part;
+         const partText =
+           typeof part === "object" && part !== null && typeof (part as Record<string, unknown>).text === "string"
+             ? ((part as Record<string, unknown>).text as string)
+             : null;
+         const text = partText ?? (typeof ev.text === "string" ? ev.text : line);
+-        s.raw += `${text}\n`;
++        s.rawBuf.append(`${text}\n`);
+         s.queue.push({ t: "output", at: Date.now(), text });
+         wakeAll(s);
+         return;
+       }
+       if (type === "error") {
+         const text = typeof ev.message === "string" ? ev.message : line;
+-        s.raw += `${text}\n`;
++        s.rawBuf.append(`${text}\n`);
+         s.queue.push({ t: "error", at: Date.now(), text });
+         wakeAll(s);
+         return;
+       }
+       // 其余 JSON 对象：落到下方原文 output（宽容不丢弃）
+     }
+-    s.raw += `${line}\n`;
++    s.rawBuf.append(`${line}\n`);
+     s.queue.push({ t: "output", at: Date.now(), text: line });
+     wakeAll(s);
+   }
+ 
+   const transport: CodeartsTransport = {
+     kind,
+ 
+     async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
+       // R-s2：AK/SK 前置检查——每次 start 都执行（非缓存）；readAksk 的非 ENOENT
+       // 错误原样向上传播（显式不吞）。
+@@ -411,21 +421,21 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+       const id = `structured-${++idNext}`;
+       const created: SessionRef = { kind, id };
+       sessions.set(id, {
+         ref: created,
+         cfg,
+         aksk,
+         codeartsSessionId: null,
+         round: null,
+         roundSeq: 0,
+         lastExit: null,
+-        raw: "",
++        rawBuf: new CappedTailBuffer(),
+         queue: [],
+         waiters: [],
+         observer: null,
+         closed: false,
+       });
+       return { ...created };
+     },
+ 
+     async inject(ref: SessionRef, text: string): Promise<void> {
+       const s = requireSession(ref);
+@@ -470,21 +480,21 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+         s.lastExit = exit;
+         if (round.exitSignalEnqueued) return; // 只产一次（防御重复回调）
+         round.exitSignalEnqueued = true;
+         // 注：stop() 组杀触发的退出同样如实入账（error 信号入队）——会话已
+         // closed，该信号随终态保留在队列（记录事实），不向已终止的观察补投 done。
+         if (exit.code === 0) {
+           s.queue.push({ t: "done", at: Date.now() }); // R-s5：退出码 0 → done（无 text）
+         } else {
+           // 回合失败：error 信号（会话不死亡——可续接新回合，见 alive() 语义注）
+           const detail = `回合进程异常退出：code=${exit.code} signal=${exit.signal ?? "null"}`;
+-          s.raw += `${detail}\n`;
++          s.rawBuf.append(`${detail}\n`);
+           s.queue.push({ t: "error", at: Date.now(), text: detail });
+         }
+         wakeAll(s);
+       });
+     },
+ 
+     observe(ref: SessionRef, observeOpts?: ObserveOptions): AsyncIterable<Signal> {
+       const s = requireSession(ref);
+       if (s.observer !== null) {
+         throw new BridgeError("OBSERVER_ACTIVE", `会话已有活跃观察者（单观察者模型）：id=${ref.id}`, {
+@@ -564,30 +574,32 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
+       // R-s4：直接杀进程+进程组（detached+负 PID；ESRCH=已达成，见生产实现注）
+       if (s.round !== null && !s.round.exitSeen && s.round.child.alive()) {
+         s.round.child.kill();
+       }
+       wakeAll(s);
+     },
+ 
+     async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
+       const s = requireSession(ref);
+       return {
+-        // raw = output/error 信号文本按序累积（每条后接 \n）；step/done 不入 raw
+-        raw: s.raw,
++        // raw = output/error 信号文本按序累积（每条后接 \n；step/done 不入 raw）；
++        // F1 封顶：只保留最新 512KB 尾部，丢弃量见 meta.rawDroppedBytes
++        raw: s.rawBuf.value(),
+         meta: {
+           id: s.ref.id,
+           kind: s.ref.kind,
+           host: "structured",
+           codeartsSessionId: s.codeartsSessionId,
+           activeRound: s.round !== null && !s.round.exitSeen,
+           rounds: s.roundSeq,
+           lastExit: s.lastExit === null ? null : { ...s.lastExit },
++          rawDroppedBytes: s.rawBuf.droppedBytes,
+           alive: !s.closed,
+           closed: s.closed,
+         },
+       };
+     },
+   };
+ 
+   return transport;
+ }
+ 
+diff --git a/plugins/codearts-bridge/src/core/uninstaller.ts b/plugins/codearts-bridge/src/core/uninstaller.ts
+new file mode 100644
+index 0000000000..d16bf68317
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/uninstaller.ts
+@@ -0,0 +1,234 @@
++/**
++ * codearts-bridge uninstall 卸载（T4-05）。
++ *
++ * 职责：一键卸载 bridge 对用户环境的全部接线，默认**保留用户数据**：
++ * - 移除 opencode 自动加载入口 ~/.config/opencode/plugins/codearts-bridge.ts
++ *  （先备份 .bak-<时间戳> 再删——与 install.sh 写入对称，误卸载可手工还原）；
++ * - 卸载 systemd 三单元（经注入 serviceUninstall——cli.ts 的 serviceUninstallCommand，
++ *   core 层不反向依赖 cli；systemctl 不可用时显式留痕并**保留单元文件**——禁静默）；
++ * - 默认保留 ~/.codearts-bridge 状态目录与 codearts CLI 安装（后者根本不在
++ *   卸载范围——它是独立产品，bridge 只是管家）；--purge 才清状态目录。
++ *
++ * 确认语义（任务书 §E）：交互终端下先确认（默认 N，拒绝即零改动退出码 1）；
++ * 非交互（管道/CI）必须显式 --yes，否则 UNINSTALL_CONFIRM_REQUIRED 拒绝——
++ * 卸载是破坏性动作，静默执行违背仓库铁律。
++ *
++ * 可测试性：exec/homeDir/unitDir/isTTY/confirm/nowMs/serviceUninstall 全部注入；
++ * FS 落点由注入 homeDir 派生，测试绝不触碰真实 HOME、绝不真调 systemctl。
++ */
++import { copyFile, rm, unlink } from "node:fs/promises";
++import { homedir } from "node:os";
++import * as path from "node:path";
++import { loadConfig } from "./config";
++import type { BridgeConfig } from "./config";
++import { BridgeError } from "./errors";
++import { createNodeExec, statOrEnoent } from "./install";
++import type { Exec } from "./install";
++import { SERVICE_UNIT_NAMES } from "./service";
++
++/* ───── 常量 ───── */
++
++/** opencode 自动加载入口文件相对路径（与 install.sh 写入目标一致）。 */
++export const UNINSTALL_AUTOLOAD_REL = path.join(".config", "opencode", "plugins", "codearts-bridge.ts");
++
++/** purge 目标最小深度守卫：stateDir 至少为 <root>/<seg> 两段（拒绝根与一级目录）。 */
++const PURGE_MIN_SEGMENTS = 2;
++
++/* ───── 依赖注入 ───── */
++
++/** systemd 单元卸载实现形态（= cli.ts serviceUninstallCommand 的签名子集）。 */
++export type ServiceUninstallFn = (
++  cfg: BridgeConfig,
++  deps: { exec: Exec; unitDir: string },
++) => Promise<number>;
++
++export interface UninstallDeps {
++  /** systemctl 可用性探测与 serviceUninstall 执行（缺省 createNodeExec）。 */
++  exec?: Exec;
++  /** HOME 锚点（autoload 与 systemd user 单元目录派生；缺省 os.homedir()）。 */
++  homeDir?: string;
++  /** systemd user 单元目录（缺省 <homeDir>/.config/systemd/user）。 */
++  unitDir?: string;
++  /** 交互终端标记（缺省 process.stdin.isTTY === true）。 */
++  isTTY?: boolean;
++  /** 确认函数（缺省 readline 询问 y/N；测试注入确定性答案）。 */
++  confirm?: (question: string) => Promise<boolean>;
++  /** 时间戳源（备份文件名；缺省 Date.now）。 */
++  nowMs?: () => number;
++  /** systemd 卸载实现（cli.ts 注入 serviceUninstallCommand；缺省未注入遇单元在场时显式报错）。 */
++  serviceUninstall?: ServiceUninstallFn;
++}
++
++export interface UninstallOptions {
++  /** 跳过确认（非交互环境必需）。 */
++  yes?: boolean;
++  /** 连状态目录一并清除（默认保留）。 */
++  purge?: boolean;
++}
++
++/* ───── 内部步骤 ───── */
++
++/** 步骤 1：autoload 入口先备份后删；不在场 → null（跳过）。 */
++async function removeAutoload(homeDir: string, nowMs: () => number): Promise<{ removed: string; backup?: string } | null> {
++  const target = path.join(homeDir, UNINSTALL_AUTOLOAD_REL);
++  const st = await statOrEnoent(target);
++  if (st === undefined) return null;
++  if (!st.isFile()) {
++    throw new BridgeError("UNINSTALL_AUTOLOAD_INVALID", `自动加载入口不是常规文件，拒绝删除：path=${target}`);
++  }
++  const backup = `${target}.bak-${new Date(nowMs()).toISOString().replace(/[:.]/g, "-")}`;
++  await copyFile(target, backup);
++  await unlink(target);
++  return { removed: target, backup };
++}
++
++/** 步骤 2 前置：systemctl 是否可执行（spawn 成功即视为可用）。 */
++async function systemctlAvailable(exec: Exec): Promise<boolean> {
++  try {
++    await exec.run(["systemctl", "--user", "--version"]);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** 步骤 3 守卫：purge 目标合法性（禁 HOME/根/过浅路径——rm -rf 的最后防线）。 */
++function assertPurgeable(stateDir: string, homeDir: string): void {
++  const resolved = path.resolve(stateDir);
++  const homeResolved = path.resolve(homeDir);
++  if (resolved === homeResolved || resolved === path.parse(resolved).root) {
++    throw new BridgeError(
++      "PURGE_TARGET_INVALID",
++      `--purge 目标非法（拒绝清除 HOME 或文件系统根）：stateDir=${stateDir}`,
++      { remediation: "核查 CODEARTS_BRIDGE_STATE_DIR 配置；正常状态根形如 ~/.codearts-bridge" },
++    );
++  }
++  const rel = path.relative(path.parse(resolved).root, resolved);
++  if (rel.split(path.sep).filter((s) => s.length > 0).length < PURGE_MIN_SEGMENTS) {
++    throw new BridgeError(
++      "PURGE_TARGET_INVALID",
++      `--purge 目标路径过浅（守卫要求至少 ${PURGE_MIN_SEGMENTS} 层目录）：stateDir=${stateDir}`,
++    );
++  }
++}
++
++/** 缺省确认：readline y/N（大小写不敏感；其余一律视为拒绝）。 */
++async function defaultConfirm(question: string): Promise<boolean> {
++  const { createInterface } = await import("node:readline/promises");
++  const rl = createInterface({ input: process.stdin, output: process.stdout });
++  try {
++    const answer = await rl.question(`${question} [y/N] `);
++    return /^y(es)?$/i.test(answer.trim());
++  } finally {
++    rl.close();
++  }
++}
++
++/* ───── uninstallCommand ───── */
++
++/**
++ * 卸载命令（返回退出码）。输出逐步骤人类可读行；破坏性动作前有确认门。
++ * - rc 0 = 卸载完成（含"无物可卸"的幂等形态）；
++ * - rc 1 = 用户拒绝确认 / 结构化错误（UNINSTALL_CONFIRM_REQUIRED、
++ *   PURGE_TARGET_INVALID、UNINSTALL_AUTOLOAD_INVALID 等，经 stderr JSON 输出）。
++ */
++export async function uninstallCommand(
++  cfg: BridgeConfig = loadConfig(),
++  deps: UninstallDeps = {},
++  opts: UninstallOptions = {},
++): Promise<number> {
++  const homeDir = deps.homeDir ?? homedir();
++  const unitDir = deps.unitDir ?? path.join(homeDir, ".config", "systemd", "user");
++  const nowMs = deps.nowMs ?? Date.now;
++  const printError = (code: string, message: string): void => {
++    console.error(JSON.stringify({ error: { code, message } }, null, 2));
++  };
++
++  // 0) 确认门：非交互必须 --yes；交互默认 N（拒绝=零改动退出 1）
++  if (opts.yes !== true) {
++    const interactive = deps.isTTY ?? process.stdin.isTTY === true;
++    if (!interactive) {
++      printError(
++        "UNINSTALL_CONFIRM_REQUIRED",
++        "非交互环境下卸载必须显式 --yes 确认（破坏性动作禁止静默执行）",
++      );
++      return 1;
++    }
++    const confirmed = await (deps.confirm ?? defaultConfirm)(
++      "确认卸载 codearts-bridge？（状态数据与 codearts CLI 将保留；--purge 才清状态目录）",
++    );
++    if (!confirmed) {
++      console.log("已取消（未做任何变更）");
++      return 1;
++    }
++  }
++
++  console.log("[codearts-bridge uninstall] 开始卸载");
++
++  // 1) opencode 自动加载入口（先备份后删）
++  try {
++    const removed = await removeAutoload(homeDir, nowMs);
++    if (removed === null) {
++      console.log(`· opencode 自动加载入口不在场，跳过：${path.join(homeDir, UNINSTALL_AUTOLOAD_REL)}`);
++    } else {
++      console.log(`✓ 已移除 opencode 自动加载入口：${removed.removed}（备份：${removed.backup}）`);
++    }
++  } catch (e) {
++    printError(
++      e instanceof BridgeError ? e.code : "UNINSTALL_FAILED",
++      e instanceof Error ? e.message : String(e),
++    );
++    return 1;
++  }
++
++  // 2) systemd 三单元（经注入 serviceUninstall；systemctl 缺失 → 显式留痕保留文件）
++  const allNames = [SERVICE_UNIT_NAMES.daemon, SERVICE_UNIT_NAMES.watchdogService, SERVICE_UNIT_NAMES.watchdogTimer];
++  const present: string[] = [];
++  for (const name of allNames) {
++    if ((await statOrEnoent(path.join(unitDir, name))) !== undefined) present.push(name);
++  }
++  if (present.length === 0) {
++    console.log(`· systemd 单元不在场，跳过：${unitDir}`);
++  } else {
++    const exec = deps.exec ?? createNodeExec();
++    if (!(await systemctlAvailable(exec))) {
++      console.log(
++        `⚠ systemctl 不可用（非 systemd 环境）：${present.length} 个单元文件保留，请手工删除：${unitDir}`,
++      );
++    } else if (deps.serviceUninstall === undefined) {
++      throw new BridgeError(
++        "UNINSTALL_SERVICE_DEPS_MISSING",
++        "systemd 单元在场但未注入卸载实现（编程缺陷，拒绝半卸载）",
++        { remediation: "经 CLI 入口调用（cli.ts 注入 serviceUninstallCommand），勿直调核心层" },
++      );
++    } else {
++      console.log("… 正在卸载 systemd 单元（disable --now + 删自家单元 + daemon-reload）");
++      const rc = await deps.serviceUninstall(cfg, { exec, unitDir });
++      if (rc !== 0) {
++        console.log(`⚠ systemd 单元卸载未完全成功（rc=${rc}），详见上方结构化输出；继续后续步骤`);
++      } else {
++        console.log(`✓ systemd 单元已卸载：${present.join("、")}`);
++      }
++    }
++  }
++
++  // 3) 状态目录：默认保留；--purge 才清（守卫后删）
++  if (opts.purge === true) {
++    try {
++      assertPurgeable(cfg.stateDir, homeDir);
++      await rm(cfg.stateDir, { recursive: true, force: true });
++      console.log(`✓ 已清除状态目录（--purge）：${cfg.stateDir}`);
++    } catch (e) {
++      printError(
++        e instanceof BridgeError ? e.code : "UNINSTALL_FAILED",
++        e instanceof Error ? e.message : String(e),
++      );
++      return 1;
++    }
++  } else {
++    console.log(`· 保留状态目录（数据与审计台账）：${cfg.stateDir}（--purge 才清除）`);
++  }
++  console.log("· 保留 codearts CLI 安装（独立产品，不在卸载范围）");
++  console.log("[codearts-bridge uninstall] 卸载完成");
++  return 0;
++}
+diff --git a/plugins/codearts-bridge/src/core/upgrade.ts b/plugins/codearts-bridge/src/core/upgrade.ts
+index 4701102003..ccfd9fd603 100644
+--- a/plugins/codearts-bridge/src/core/upgrade.ts
++++ b/plugins/codearts-bridge/src/core/upgrade.ts
+@@ -52,20 +52,21 @@ import { Readable } from "node:stream";
+ import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
+ import * as path from "node:path";
+ import type { BridgeConfig } from "./config";
+ import { ensureStateDirs } from "./config";
+ import { BridgeError } from "./errors";
+ import { copyDeploy, errnoOf, fsyncDir, sameDevice, sha256File } from "./fsx";
+ import {
+   appendInstallAudit,
+   binPathOf,
+   detectVersion,
++  probeInstall,
+   statOrEnoent,
+   type Exec,
+   type ExecResult,
+ } from "./install";
+ 
+ /* ───── Release 与 Fetcher（R-up7） ───── */
+ 
+ /** 官方 release-info 接口字段（R-up7）。 */
+ export interface Release {
+   version: string;
+@@ -608,10 +609,39 @@ export async function upgradeInstall(
+     }).catch(() => undefined);
+     throw e;
+   } finally {
+     upgradeInFlight = false; // R-up4：成功失败都释放（finally 保证）
+     if (ownsStaging) {
+       // 暂存尽力回收（R-up3 临时件清理；T1-04 cleanupTmp 同纪律：清理失败不掩盖主错误）
+       await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+     }
+   }
+ }
++
++/* ───── upgradeCli（T4-05：受控升级的"开箱"封装） ───── */
++
++/** upgradeCli 结果：无更新（already-latest）或完整受控升级结果（语义继承 UpgradeResult）。 */
++export type UpgradeCliResult =
++  | { action: "already-latest"; version: string }
++  | ({ action: "upgraded" } & UpgradeResult);
++
++/**
++ * codearts CLI 受控升级封装（T4-05 §D 薄封装）：
++ * 1. probeInstall 探测当前安装（只读快照）；
++ * 2. fetcher.latest() 取官方清单；
++ * 3. 当前版本与清单一致（在场且可解析）→ already-latest，零下载零部署；
++ * 4. 否则 → upgradeInstall 受控升级（锚定同一清单版本，防两次调用间清单漂移；
++ *    失败零损坏语义——下载/校验/解压/自检任何失败都不触碰现有安装——完整继承）。
++ *
++ * 未安装（present=false）不属"无更新"：直接走受控升级完成首次安装（开箱形态）。
++ * 审计由 upgradeInstall 内部落账（install.jsonl 单一审计流），本封装零额外审计。
++ */
++export async function upgradeCli(cfg: BridgeConfig, deps: UpgradeDeps): Promise<UpgradeCliResult> {
++  const status = await probeInstall(cfg, { exec: deps.exec });
++  const fetcher = deps.fetcher ?? httpFetcher;
++  const release = await fetcher.latest();
++  if (status.present && status.version !== undefined && status.version === release.version) {
++    return { action: "already-latest", version: release.version };
++  }
++  const result = await upgradeInstall(cfg, deps, { version: release.version });
++  return { action: "upgraded", ...result };
++}
+diff --git a/plugins/codearts-bridge/src/goal-tools.ts b/plugins/codearts-bridge/src/goal-tools.ts
+index 35fa1cac5c..62aa481155 100644
+--- a/plugins/codearts-bridge/src/goal-tools.ts
++++ b/plugins/codearts-bridge/src/goal-tools.ts
+@@ -55,24 +55,26 @@ import { daemonTokenPath } from "./daemon";
+ import type { ToolCtxLike, BridgeToolDef } from "./server";
+ 
+ /* ───── 守护 HTTP 薄代理（R-g1/R-g2） ───── */
+ 
+ /** 守护调用超时（毫秒）：本机回环 + 本守护，10s 足够容忍 logs 大页；超时按 R-g2 显式不可用。 */
+ export const DAEMON_HTTP_TIMEOUT_MS = 10_000;
+ 
+ /** 目标回呼轮询周期（R-g3 固定 30s；导出供测试钉死唯一真相）。 */
+ export const GOAL_POLL_INTERVAL_MS = 30_000;
+ 
+-/** R-g2 启动指引（remediation 固定文案；CLI daemon 命令见 src/cli.ts）。 */
++/** R-g2 启动指引（remediation 固定文案；CLI daemon 命令见 src/cli.ts）。
++ * 终审修复波 F2（2026-10-31）：生产常驻指引改为指向已交付能力（T3-07
++ * `service install`：systemd user service + 每分钟 watchdog），不再称"后续任务交付"。 */
+ export const DAEMON_START_REMEDIATION =
+   "先启动守护进程再重试：bun <本插件包>/src/cli.ts daemon（全局安装可用 codearts-bridge daemon）；" +
+-  "生产常驻（systemd 服务自启）由后续任务交付。";
++  "生产常驻请执行 `codearts-bridge service install`（systemd user service + 每分钟 watchdog）。";
+ 
+ /** 守护 HTTP 响应的最小结构面（与全局 fetch 的 Response 结构兼容）。 */
+ export interface DaemonHttpResponse {
+   status: number;
+   json(): Promise<unknown>;
+ }
+ 
+ /** 守护 HTTP 请求 init（fetch(RequestInit) 的结构子集；测试 fake 按此实现）。 */
+ export interface DaemonRequestInit {
+   method: string;
+@@ -464,21 +466,27 @@ const GOAL_START_INPUT_SCHEMA = {
+       type: "string",
+       minLength: 1,
+       description: "目标描述（非空；由守护监督的 AI 会话负责跑到底）",
+     },
+     verify: {
+       type: "array",
+       items: { type: "string" },
+       description: "独立验收命令清单（每条须独立执行并通过；缺省无）",
+     },
+     workdir: { type: "string", description: "目标工作目录（绝对路径；缺省随守护）" },
+-    maxRounds: { type: "integer", minimum: 1, description: "注入轮次上限（缺省守护默认）" },
++    // F3（终审修复波 2026-10-31）：如实表述——当前守护只持久化记录该值，轮次
++    // 上限的消费（到轮强制停止）为路线图项，不夸大为已生效的强制上限。
++    maxRounds: {
++      type: "integer",
++      minimum: 1,
++      description: "目标轮次上限（持久化记录；守护消费为路线图项）",
++    },
+     autoNudge: { type: "boolean", description: "逐目标自动续跑覆盖（缺省随宿主配置）" },
+   },
+   required: ["objective"],
+   additionalProperties: false,
+ } as const;
+ 
+ const GOAL_ID_INPUT_SCHEMA = {
+   type: "object",
+   properties: {
+     goalId: { type: "string", minLength: 1, description: "目标 id（codearts_goal_start 返回）" },
+diff --git a/plugins/codearts-bridge/test/doctor.test.ts b/plugins/codearts-bridge/test/doctor.test.ts
+new file mode 100644
+index 0000000000..e8b1c5cb53
+--- /dev/null
++++ b/plugins/codearts-bridge/test/doctor.test.ts
+@@ -0,0 +1,665 @@
++/**
++ * T4-05 doctor 环境体检测试（bun:test）。
++ *
++ * 覆盖：
++ * - 纯判定函数（judgeXxx / compareVersions / aggregate / humanBytes）：
++ *   观察值 → CheckResult 的全部业务分支（✓/⚠/✗ 与修复指引）；
++ * - IO 采集器（collectXxx）：注入 fake exec/fetch 与临时目录 FS，
++ *   绝不触碰真实 HOME、绝不真实联网、绝不调用真实 systemctl；
++ * - doctorCommand 聚合：人类可读 + 结构化 JSON 双输出、聚合退出码。
++ *
++ * 隔离纪律（与 service.test.ts 同）：exec/fetch/homeDir/kernelDataDir 全部注入；
++ * FS 落点全部在 .tmp/doctor-test/ 临时目录（afterAll 清理）。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { mkdir, rm, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import {
++  DOCTOR_CHECK_IDS,
++  DOCTOR_DISK_DUMPS_WARN_BYTES,
++  DOCTOR_DISK_LOGS_WARN_BYTES,
++  DOCTOR_DISK_WAL_WARN_BYTES,
++  aggregate,
++  collectBun,
++  collectCodeartsCli,
++  collectCredential,
++  collectDaemonHealth,
++  collectDisk,
++  collectNetwork,
++  collectOpencode,
++  collectSystemd,
++  compareVersions,
++  doctorCommand,
++  humanBytes,
++  judgeBun,
++  judgeCodeartsCli,
++  judgeCredential,
++  judgeDaemonHealth,
++  judgeDisk,
++  judgeNetwork,
++  judgeOpencode,
++  judgeSystemd,
++  runDoctorChecks,
++} from "../src/core/doctor";
++import type {
++  CodeartsObservation,
++  CredentialObservation,
++  DaemonHealthObservation,
++  DiskObservation,
++  DoctorCheck,
++  DoctorDeps,
++  NetworkObservation,
++} from "../src/core/doctor";
++import { fakeExec, makeInstallFixture } from "./fixtures/install-fixtures";
++import type { Exec } from "../src/core/install";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "doctor-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 捕获 console 输出执行 fn（finally 必然还原，防污染其他用例输出）。 */
++async function captureConsole<T>(
++  fn: () => Promise<T>,
++): Promise<{ result: T; logs: string[]; errors: string[] }> {
++  const logs: string[] = [];
++  const errors: string[] = [];
++  const origLog = console.log;
++  const origError = console.error;
++  console.log = (...args: unknown[]) => {
++    logs.push(args.map((a) => String(a)).join(" "));
++  };
++  console.error = (...args: unknown[]) => {
++    errors.push(args.map((a) => String(a)).join(" "));
++  };
++  try {
++    const result = await fn();
++    return { result, logs, errors };
++  } finally {
++    console.log = origLog;
++    console.error = origError;
++  }
++}
++
++/* ───── compareVersions / humanBytes 纯函数 ───── */
++
++describe("compareVersions 语义化版本比较", () => {
++  it("逐段数值比较：小于/等于/大于", () => {
++    expect(compareVersions("2.0.28", "2.1.0")).toBe(-1);
++    expect(compareVersions("2.1.0", "2.1.0")).toBe(0);
++    expect(compareVersions("2.2.5", "2.1.0")).toBe(1);
++    expect(compareVersions("10.0.0", "9.99.99")).toBe(1); // 数值而非字典序
++  });
++
++  it("非法形态显式抛 BridgeError（禁静默钳位）", () => {
++    expect(() => compareVersions("dev", "2.1.0")).toThrow(BridgeError);
++    expect(() => compareVersions("2.1", "2.1.0")).toThrow(BridgeError);
++    expect(() => compareVersions("2.1.0", "")).toThrow(BridgeError);
++  });
++});
++
++describe("humanBytes 字节人类可读格式", () => {
++  it("B/KB/MB/GB 换算", () => {
++    expect(humanBytes(0)).toBe("0B");
++    expect(humanBytes(512)).toBe("512B");
++    expect(humanBytes(1024)).toBe("1.0KB");
++    expect(humanBytes(500 * 1024 * 1024)).toBe("500.0MB");
++    expect(humanBytes(2 * 1024 * 1024 * 1024)).toBe("2.0GB");
++  });
++});
++
++/* ───── 判定函数（纯逻辑） ───── */
++
++describe("judgeOpencode ① 插件宿主判定", () => {
++  it("未检出 → warn（宿主缺失不阻塞桥接核心，但插件无法加载）", () => {
++    const c = judgeOpencode({ present: false });
++    expect(c.level).toBe("warn");
++    expect(c.remediation).toContain("opencode");
++    expect(c.remediation).toContain("2.1");
++  });
++
++  it("版本 ≥2.1 → ok", () => {
++    const c = judgeOpencode({ present: true, version: "2.2.5" });
++    expect(c.level).toBe("ok");
++    expect(c.summary).toContain("2.2.5");
++  });
++
++  it("版本 <2.1 → warn（V2 插件契约不满足）", () => {
++    const c = judgeOpencode({ present: true, version: "2.0.28" });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("2.0.28");
++    expect(c.remediation).toContain("2.1");
++  });
++
++  it("版本无法解析 → warn（如实呈现，禁假定满足）", () => {
++    const c = judgeOpencode({ present: true, version: undefined });
++    expect(c.level).toBe("warn");
++  });
++});
++
++describe("judgeBun ② 运行时判定", () => {
++  it("未检出 → fail（一切子命令依赖 bun）", () => {
++    const c = judgeBun({ present: false });
++    expect(c.level).toBe("fail");
++    expect(c.remediation).toContain("bun.sh/install");
++  });
++
++  it("在场含版本 → ok；在场无版本 → ok（版本信息性）", () => {
++    expect(judgeBun({ present: true, version: "1.4.2" }).level).toBe("ok");
++    expect(judgeBun({ present: true, version: undefined }).level).toBe("ok");
++  });
++});
++
++describe("judgeCodeartsCli ③ 安装管家判定", () => {
++  it("探测异常 → fail（状态损坏需处理，禁当作正常）", () => {
++    const c = judgeCodeartsCli({ error: "AUTOUPDATE_INVALID: 解析失败" });
++    expect(c.level).toBe("fail");
++    expect(c.summary).toContain("AUTOUPDATE_INVALID");
++  });
++
++  it("未安装 → warn（structured 传输不可用，指引升级命令安装）", () => {
++    const c = judgeCodeartsCli({});
++    expect(c.level).toBe("warn");
++    expect(c.remediation).toContain("upgrade-cli");
++  });
++
++  it("健康安装 → ok", () => {
++    const c = judgeCodeartsCli({
++      status: {
++        path: "/x/bin/codearts",
++        present: true,
++        version: "26.10.9",
++        sha256: "a".repeat(64),
++        backupPath: "/x/bin/codearts.bak-26.10.9",
++        backupValid: true,
++        autoupdateFlag: false,
++        pinState: "consistent",
++        drift: false,
++      },
++    });
++    expect(c.level).toBe("ok");
++    expect(c.summary).toContain("26.10.9");
++  });
++
++  it("autoupdate 开启 → warn（指引关停）", () => {
++    const c = judgeCodeartsCli({
++      status: {
++        path: "/x/bin/codearts",
++        present: true,
++        version: "26.10.9",
++        backupPath: "/x/bin/codearts.bak-26.10.9",
++        backupValid: true,
++        autoupdateFlag: true,
++        pinState: "consistent",
++        drift: false,
++      },
++    });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("autoupdate");
++  });
++
++  it("钉版漂移 + 备份失效 → warn 汇总两条问题", () => {
++    const c = judgeCodeartsCli({
++      status: {
++        path: "/x/bin/codearts",
++        present: true,
++        version: "26.10.9",
++        backupPath: "/x/bin/codearts.bak-26.10.9",
++        backupValid: false,
++        autoupdateFlag: false,
++        pinState: "drift",
++        drift: true,
++      },
++    });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("漂移");
++    expect(c.summary).toContain("备份");
++  });
++});
++
++describe("judgeCredential ④ 凭据判定", () => {
++  it("AK/SK 配置 → ok（structured 可用）", () => {
++    const c = judgeCredential({ authJsonExists: false, aksk: { AK: "a", SK: "s" } });
++    expect(c.level).toBe("ok");
++    expect(c.detail?.["mode"]).toBe("aksk");
++  });
++
++  it("仅 CLI 登录态 → ok（mode=auth）", () => {
++    const c = judgeCredential({ authJsonExists: true });
++    expect(c.level).toBe("ok");
++    expect(c.detail?.["mode"]).toBe("auth");
++  });
++
++  it("两者皆无 → warn（structured 不可用，指引配置）", () => {
++    const c = judgeCredential({ authJsonExists: false });
++    expect(c.level).toBe("warn");
++    expect(c.remediation).toContain("AK");
++  });
++
++  it("凭据文件读取异常 → fail（损坏需显式处理）", () => {
++    const c = judgeCredential({ authJsonExists: false, error: "格式错误 line=2" });
++    expect(c.level).toBe("fail");
++  });
++});
++
++describe("judgeSystemd ⑤ 单元状态判定", () => {
++  const fullUnits = { daemon: true, watchdogService: true, watchdogTimer: true };
++
++  it("systemctl 不可用 → warn（非 systemd 环境）", () => {
++    const c = judgeSystemd({ systemctlAvailable: false });
++    expect(c.level).toBe("warn");
++    expect(c.remediation).toContain("daemon");
++  });
++
++  it("单元未安装 → warn（指引 service install）", () => {
++    const c = judgeSystemd({
++      systemctlAvailable: true,
++      units: { daemon: false, watchdogService: false, watchdogTimer: false },
++    });
++    expect(c.level).toBe("warn");
++    expect(c.remediation).toContain("service install");
++  });
++
++  it("三单元在场且 active → ok", () => {
++    const c = judgeSystemd({
++      systemctlAvailable: true,
++      units: fullUnits,
++      active: { daemon: true, watchdogTimer: true },
++    });
++    expect(c.level).toBe("ok");
++  });
++
++  it("单元在场但守护非 active → warn（含 journal 排查指引）", () => {
++    const c = judgeSystemd({
++      systemctlAvailable: true,
++      units: fullUnits,
++      active: { daemon: false, watchdogTimer: true },
++    });
++    expect(c.level).toBe("warn");
++    expect(c.remediation).toContain("journalctl");
++  });
++
++  it("watchdog timer 非 active → warn（守护自愈看门缺位）", () => {
++    const c = judgeSystemd({
++      systemctlAvailable: true,
++      units: fullUnits,
++      active: { daemon: true, watchdogTimer: false },
++    });
++    expect(c.level).toBe("warn");
++  });
++
++  it("守护单元在场但 watchdog 单元缺失 → warn", () => {
++    const c = judgeSystemd({
++      systemctlAvailable: true,
++      units: { daemon: true, watchdogService: false, watchdogTimer: false },
++    });
++    expect(c.level).toBe("warn");
++  });
++});
++
++describe("judgeDaemonHealth ⑥ 守护健康判定", () => {
++  it("可达 → ok；不可达 → warn（附启动指引）", () => {
++    expect(judgeDaemonHealth({ ok: true }).level).toBe("ok");
++    const c = judgeDaemonHealth({ ok: false, reason: "ECONNREFUSED" });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("ECONNREFUSED");
++    expect(c.remediation).toContain("daemon");
++  });
++});
++
++describe("judgeDisk ⑦ 磁盘占用判定", () => {
++  const base: DiskObservation = {
++    dbBytes: 10 * 1024 * 1024,
++    walBytes: 1024,
++    dumps: { files: 0, bytes: 0 },
++    logsBytes: 5 * 1024 * 1024,
++  };
++
++  it("占用低于阈值 → ok", () => {
++    expect(judgeDisk(base).level).toBe("ok");
++  });
++
++  it("dump 堆快照超阈值 → warn（建议 hygiene 清理）", () => {
++    const c = judgeDisk({ ...base, dumps: { files: 3, bytes: DOCTOR_DISK_DUMPS_WARN_BYTES + 1 } });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("dump");
++    expect(c.remediation).toContain("hygiene");
++  });
++
++  it("WAL 超阈值 → warn（建议 checkpoint）", () => {
++    const c = judgeDisk({ ...base, walBytes: DOCTOR_DISK_WAL_WARN_BYTES + 1 });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("WAL");
++  });
++
++  it("日志超阈值 → warn", () => {
++    const c = judgeDisk({ ...base, logsBytes: DOCTOR_DISK_LOGS_WARN_BYTES + 1 });
++    expect(c.level).toBe("warn");
++  });
++
++  it("采集异常 → fail", () => {
++    expect(judgeDisk({ ...base, error: "FS_STAT_FAILED" }).level).toBe("fail");
++  });
++});
++
++describe("judgeNetwork ⑧ 网络可达性判定", () => {
++  it("可达（任意 HTTP 应答）→ ok", () => {
++    expect(judgeNetwork({ reachable: true, status: 200 }).level).toBe("ok");
++    expect(judgeNetwork({ reachable: true, status: 403 }).level).toBe("ok");
++  });
++
++  it("不可达 → warn（不阻塞：仅升级/安装通道受影响）", () => {
++    const c: DoctorCheck = judgeNetwork({ reachable: false, reason: "timeout" });
++    expect(c.level).toBe("warn");
++    expect(c.summary).toContain("timeout");
++  });
++});
++
++describe("aggregate 聚合判定", () => {
++  it("混合作业：fail>0 → 退出码 1；仅 warn → 退出码 0", () => {
++    const mk = (id: string, level: DoctorCheck["level"]): DoctorCheck => ({ id, level, summary: id });
++    const onlyWarn = aggregate([mk("a", "ok"), mk("b", "warn")]);
++    expect(onlyWarn.exitCode).toBe(0);
++    expect(onlyWarn.warn).toBe(1);
++    const withFail = aggregate([mk("a", "ok"), mk("b", "warn"), mk("c", "fail")]);
++    expect(withFail.exitCode).toBe(1);
++    expect(withFail.fail).toBe(1);
++  });
++});
++
++/* ───── IO 采集器（注入 fake） ───── */
++
++describe("collectOpencode 采集", () => {
++  it("正常解析 stdout 版本", async () => {
++    const obs = await collectOpencode(fakeExec({ stdout: "2.2.5\n" }, []));
++    expect(obs).toEqual({ present: true, version: "2.2.5" });
++  });
++
++  it("spawn 失败（ENOENT）→ present=false", async () => {
++    const obs = await collectOpencode({ run: async () => Promise.reject(Object.assign(new Error("x"), { code: "ENOENT" })) });
++    expect(obs.present).toBe(false);
++  });
++
++  it("退出码非 0 → 在场但版本未知（如实呈现）", async () => {
++    const obs = await collectOpencode(fakeExec({ code: 1, stderr: "boom" }, []));
++    expect(obs.present).toBe(true);
++    expect(obs.version).toBeUndefined();
++  });
++});
++
++describe("collectBun 采集", () => {
++  it("PATH 探测成功", async () => {
++    const obs = await collectBun(TEST_ROOT, fakeExec({ stdout: "1.4.2\n" }, []));
++    expect(obs).toEqual({ present: true, version: "1.4.2" });
++  });
++
++  it("PATH 失败 → 回落 ~/.bun/bin/bun 探测", async () => {
++    const bunBin = path.join(TEST_ROOT, ".bun", "bin", "bun");
++    await mkdir(path.dirname(bunBin), { recursive: true });
++    await writeFile(bunBin, "#!/bin/sh\necho 1.4.2\n");
++    let calls = 0;
++    const exec: Exec = {
++      run: async (cmd) => {
++        calls++;
++        if (cmd[0] === "bun") throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
++        expect(cmd[0]).toBe(bunBin);
++        return { code: 0, stdout: "1.4.2\n", stderr: "" };
++      },
++    };
++    const obs = await collectBun(TEST_ROOT, exec);
++    expect(obs).toEqual({ present: true, version: "1.4.2" });
++    expect(calls).toBe(2);
++  });
++
++  it("两路皆失败 → present=false", async () => {
++    const obs = await collectBun(TEST_ROOT, {
++      run: async () => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
++    });
++    expect(obs).toEqual({ present: false });
++  });
++});
++
++describe("collectCodeartsCli 采集", () => {
++  it("健康 fixture → status 在场", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "ca-healthy"), "healthy");
++    const cfg = loadConfig({ installDir: fx.installDir, stateDir: fx.stateDir }, {});
++    const obs: CodeartsObservation = await collectCodeartsCli(cfg, fx.exec);
++    expect(obs.status?.present).toBe(true);
++    expect(obs.status?.version).toBe("26.10.9");
++    expect(obs.error).toBeUndefined();
++  });
++
++  it("损坏配置（autoupdate 非布尔）→ error 观察", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "ca-bad"), "healthy");
++    await writeFile(fx.cliPath, JSON.stringify({ autoupdate: "yes" }), "utf8");
++    const cfg = loadConfig({ installDir: fx.installDir, stateDir: fx.stateDir }, {});
++    const obs = await collectCodeartsCli(cfg, fx.exec);
++    expect(obs.status).toBeUndefined();
++    expect(obs.error).toContain("AUTOUPDATE_INVALID");
++  });
++});
++
++describe("collectCredential 采集", () => {
++  it("auth.json 在场 → authJsonExists=true", async () => {
++    const kd = path.join(TEST_ROOT, "cli-data");
++    await mkdir(kd, { recursive: true });
++    await writeFile(path.join(kd, "auth.json"), "{}", "utf8");
++    const cfg = loadConfig({ stateDir: path.join(TEST_ROOT, "state") }, {});
++    const obs: CredentialObservation = await collectCredential(cfg, { kernelDataDir: kd });
++    expect(obs.authJsonExists).toBe(true);
++    expect(obs.aksk).toBeUndefined();
++  });
++
++  it("AK/SK 文件在场 → 解析成功（值不进观察结果，防泄漏）", async () => {
++    const stateDir = path.join(TEST_ROOT, "state-aksk");
++    await mkdir(stateDir, { recursive: true });
++    await writeFile(path.join(stateDir, "config.env"), "AK=abc\nSK=xyz\n", "utf8");
++    const cfg = loadConfig({ stateDir }, {});
++    const obs = await collectCredential(cfg, { kernelDataDir: path.join(TEST_ROOT, "no-kd") });
++    expect(obs.aksk).toEqual({ AK: "abc", SK: "xyz" });
++  });
++
++  it("AK/SK 文件损坏 → error（含行号，不含值）", async () => {
++    const stateDir = path.join(TEST_ROOT, "state-bad");
++    await mkdir(stateDir, { recursive: true });
++    await writeFile(path.join(stateDir, "config.env"), "BROKEN LINE\n", "utf8");
++    const cfg = loadConfig({ stateDir }, {});
++    const obs = await collectCredential(cfg, { kernelDataDir: path.join(TEST_ROOT, "no-kd") });
++    expect(obs.error).toContain("line=1");
++    expect(obs.error).not.toContain("BROKEN LINE"); // 值/行内容绝不回显
++  });
++});
++
++describe("collectSystemd 采集", () => {
++  const UNIT_NAMES = ["codearts-bridge.service", "codearts-bridge-watchdog.service", "codearts-bridge-watchdog.timer"];
++
++  it("单元缺失 → units 全 false 且零 systemctl 调用（沙箱安全）", async () => {
++    const unitDir = path.join(TEST_ROOT, "units-empty");
++    const calls: string[][] = [];
++    const obs = await collectSystemd(unitDir, fakeExec({}, calls));
++    expect(obs.units).toEqual({ daemon: false, watchdogService: false, watchdogTimer: false });
++    expect(calls).toEqual([]);
++  });
++
++  it("单元在场 + is-active 0/0 → active 双真", async () => {
++    const unitDir = path.join(TEST_ROOT, "units-full");
++    await mkdir(unitDir, { recursive: true });
++    for (const n of UNIT_NAMES) await writeFile(path.join(unitDir, n), "[Unit]\n", "utf8");
++    const calls: string[][] = [];
++    const exec: Exec = {
++      run: async (cmd) => {
++        calls.push(cmd);
++        return { code: 0, stdout: "active\n", stderr: "" };
++      },
++    };
++    const obs = await collectSystemd(unitDir, exec);
++    expect(obs.units?.daemon).toBe(true);
++    expect(obs.active).toEqual({ daemon: true, watchdogTimer: true });
++    expect(calls.length).toBe(2); // 守护 + timer 两次 is-active
++    for (const c of calls) expect(c.slice(0, 3)).toEqual(["systemctl", "--user", "is-active"]);
++  });
++
++  it("systemctl spawn 失败 → systemctlAvailable=false（单元在场信息保留）", async () => {
++    const unitDir = path.join(TEST_ROOT, "units-nosystemd");
++    await mkdir(unitDir, { recursive: true });
++    await writeFile(path.join(unitDir, UNIT_NAMES[0]!), "[Unit]\n", "utf8");
++    const obs = await collectSystemd(unitDir, {
++      run: async () => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
++    });
++    expect(obs.systemctlAvailable).toBe(false);
++    expect(obs.units?.daemon).toBe(true);
++  });
++});
++
++describe("collectDaemonHealth / collectNetwork 采集", () => {
++  it("守护 /health ok:true → ok 观察", async () => {
++    const fetchImpl = async () =>
++      new Response(JSON.stringify({ ok: true }), { status: 200 });
++    const obs: DaemonHealthObservation = await collectDaemonHealth(
++      "http://127.0.0.1:4577",
++      fetchImpl,
++    );
++    expect(obs.ok).toBe(true);
++  });
++
++  it("守护非 200 / 非 JSON / fetch 抛错 → ok=false + reason", async () => {
++    const obs1 = await collectDaemonHealth("http://x", async () => new Response("no", { status: 500 }));
++    expect(obs1.ok).toBe(false);
++    const obs2 = await collectDaemonHealth("http://x", async () => new Response("not-json", { status: 200 }));
++    expect(obs2.ok).toBe(false);
++    const obs3 = await collectDaemonHealth("http://x", async () => {
++      throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
++    });
++    expect(obs3.ok).toBe(false);
++    expect(obs3.reason).toContain("ECONNREFUSED");
++  });
++
++  it("网络 HEAD 任意应答 → reachable；抛错 → reason", async () => {
++    const ok: NetworkObservation = await collectNetwork(async () => new Response(null, { status: 200 }));
++    expect(ok).toEqual({ reachable: true, status: 200 });
++    const bad = await collectNetwork(async () => {
++      const e = new Error("boom");
++      e.name = "TimeoutError";
++      throw e;
++    });
++    expect(bad.reachable).toBe(false);
++    expect(bad.reason).toContain("TimeoutError");
++  });
++});
++
++describe("collectDisk 采集", () => {
++  it("空数据目录 → 全零观察（不抛错）", async () => {
++    const cfg = loadConfig({ stateDir: path.join(TEST_ROOT, "state-disk") }, {});
++    const obs = await collectDisk(cfg, path.join(TEST_ROOT, "kd-empty"));
++    expect(obs.dbBytes).toBe(0);
++    expect(obs.walBytes).toBe(0);
++    expect(obs.dumps).toEqual({ files: 0, bytes: 0 });
++    expect(obs.logsBytes).toBe(0);
++  });
++});
++
++/* ───── 聚合命令 ───── */
++
++describe("runDoctorChecks 全量八项", () => {
++  it("按固定顺序产出八项检查（id 顺序稳定）", async () => {
++    const homeDir = path.join(TEST_ROOT, "home-run");
++    await mkdir(homeDir, { recursive: true });
++    const cfg = loadConfig(
++      { installDir: path.join(TEST_ROOT, "ca-run"), stateDir: path.join(TEST_ROOT, "state-run") },
++      {},
++    );
++    const deps: DoctorDeps = {
++      exec: fakeExec({ stdout: "1.4.2\n" }, []), // bun --version ok；opencode 同 fake（版本低→warn 即可）
++      fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
++      homeDir,
++      kernelDataDir: path.join(TEST_ROOT, "kd-run"),
++    };
++    const checks = await runDoctorChecks(cfg, deps);
++    expect(checks.map((c) => c.id)).toEqual([...DOCTOR_CHECK_IDS]);
++    expect(checks.length).toBe(8);
++    for (const c of checks) expect(["ok", "warn", "fail"]).toContain(c.level);
++  });
++});
++
++describe("doctorCommand 输出与退出码", () => {
++  /** 全部 FS 落点锁进临时目录（installDir/stateDir/homeDir/kernelDataDir 注入，绝不触碰真实 HOME）。 */
++  function tmpCfg(name: string): BridgeConfig {
++    return loadConfig(
++      { installDir: path.join(TEST_ROOT, `ca-${name}`), stateDir: path.join(TEST_ROOT, `st-${name}`) },
++      {},
++    );
++  }
++
++  function baseDeps(homeDir: string, overrides: Partial<DoctorDeps> = {}): DoctorDeps {
++    return {
++      exec: fakeExec({ stdout: "1.4.2\n" }, []),
++      fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
++      homeDir,
++      kernelDataDir: path.join(homeDir, "kd"),
++      ...overrides,
++    };
++  }
++
++  it("典型注入（6 ok / 2 warn）→ 退出码 0；人类可读行含 ✓；尾部 JSON 可解析且含 checks", async () => {
++    const homeDir = path.join(TEST_ROOT, "home-ok");
++    const kd = path.join(homeDir, "kd");
++    await mkdir(kd, { recursive: true });
++    await writeFile(path.join(kd, "auth.json"), "{}", "utf8"); // baseDeps 的 kernelDataDir=homeDir/kd
++    // bun/opencode 版本探测按 cmd[0] 分流：bun→1.4.2；opencode→2.2.5
++    const exec: Exec = {
++      run: async (cmd) =>
++        cmd[0] === "opencode"
++          ? { code: 0, stdout: "2.2.5\n", stderr: "" }
++          : { code: 0, stdout: "1.4.2\n", stderr: "" },
++    };
++    const { result, logs } = await captureConsole(() =>
++      doctorCommand(tmpCfg("ok"), baseDeps(homeDir, { exec }), {}),
++    );
++    expect(result).toBe(0);
++    const text = logs.join("\n");
++    expect(text).toContain("✓");
++    expect(text).toContain("⚠"); // codearts CLI 未安装 + systemd 单元未安装
++    const jsonLine = logs.find((l) => l.startsWith("{\"checks\""));
++    expect(jsonLine).toBeDefined();
++    const parsed = JSON.parse(jsonLine!) as {
++      checks: DoctorCheck[];
++      summary: { ok: number; warn: number; fail: number; exitCode: number };
++    };
++    expect(parsed.checks.length).toBe(8);
++    expect(parsed.summary).toEqual({ ok: 6, warn: 2, fail: 0, exitCode: 0 });
++  });
++
++  it("bun 两路皆缺（exec 全抛 + canonical 缺失）→ 退出码 1；✗ 行可见", async () => {
++    const homeDir = path.join(TEST_ROOT, "home-fail");
++    await mkdir(homeDir, { recursive: true });
++    const exec: Exec = {
++      run: async () => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
++    };
++    const { result, logs } = await captureConsole(() =>
++      doctorCommand(tmpCfg("fail"), baseDeps(homeDir, { exec }), {}),
++    );
++    expect(result).toBe(1);
++    expect(logs.join("\n")).toContain("✗");
++  });
++
++  it("--json 仅输出结构化 JSON（单行可解析，无人类可读行）", async () => {
++    const homeDir = path.join(TEST_ROOT, "home-json");
++    await mkdir(homeDir, { recursive: true });
++    const { logs } = await captureConsole(() =>
++      doctorCommand(tmpCfg("json"), baseDeps(homeDir), { json: true }),
++    );
++    expect(logs.length).toBe(1);
++    const parsed = JSON.parse(logs[0]!) as { checks: unknown };
++    expect(Array.isArray(parsed.checks)).toBe(true);
++  });
++});
+diff --git a/plugins/codearts-bridge/test/installer.test.ts b/plugins/codearts-bridge/test/installer.test.ts
+new file mode 100644
+index 0000000000..ccf53b88e7
+--- /dev/null
++++ b/plugins/codearts-bridge/test/installer.test.ts
+@@ -0,0 +1,586 @@
++/**
++ * T4-05 安装包与组件升级测试（bun:test）。
++ *
++ * 覆盖：
++ * - install.sh / uninstall.sh 语法门（bash -n）与参数面（--help / 未知参数显式报错）；
++ * - install.sh 沙箱集成：HOME/STATE_DIR 全部注入临时目录（绝不触碰真实 HOME），
++ *   断言 opencode 接线文件内容与幂等语义（等价跳过 / 先备份后写）；
++ * - selfUpgrade 纯逻辑：git/fetch/pidAlive/sleep 全注入，无更新/更新成功/失败回滚
++ *   三分支 + 脏树拒绝 + 回滚失败显式报错；
++ * - upgradeCli 薄封装：无更新/升级成功/哈希失败零损坏 三分支；
++ * - uninstallCommand：autoload 备份移除 / systemd 单元卸载 / 默认保留 / --purge
++ *   才清状态目录 / 确认提示（--yes 跳过、非交互拒绝）。
++ *
++ * 隔离纪律（与 service.test.ts 同）：exec/fetch/homeDir 全部注入；FS 落点全部在
++ * .tmp/installer-test/ 临时目录（afterAll 清理）；绝不真装 systemd 单元、绝不联网。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { upgradeCli } from "../src/core/upgrade";
++import { selfUpgrade } from "../src/core/selfupgrade";
++import type { SelfUpgradeDeps } from "../src/core/selfupgrade";
++import { uninstallCommand } from "../src/core/uninstaller";
++import type { UninstallDeps } from "../src/core/uninstaller";
++import { serviceUninstallCommand } from "../src/cli";
++import type { Exec } from "../src/core/install";
++import {
++  DEFAULT_LAYOUT,
++  NEW_ELF_CONTENT,
++  NEW_VERSION,
++  OLD_ELF_CONTENT,
++  OLD_VERSION,
++  PACKAGE_BYTES,
++  contentVersionExec,
++  copyExtract,
++  makeFakeFetcher,
++  sha256Oracle,
++} from "./fixtures/fake-release";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const INSTALL_SH = path.join(PLUGIN_ROOT, "install.sh");
++const UNINSTALL_SH = path.join(PLUGIN_ROOT, "uninstall.sh");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "installer-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/* ───── install.sh / uninstall.sh 语法与参数面 ───── */
++
++describe("install.sh / uninstall.sh 语法门（bash -n）", () => {
++  it("install.sh bash -n 通过", () => {
++    const p = Bun.spawnSync(["bash", "-n", INSTALL_SH], { cwd: PLUGIN_ROOT });
++    expect(p.exitCode).toBe(0);
++  });
++
++  it("uninstall.sh bash -n 通过", () => {
++    const p = Bun.spawnSync(["bash", "-n", UNINSTALL_SH], { cwd: PLUGIN_ROOT });
++    expect(p.exitCode).toBe(0);
++  });
++});
++
++describe("install.sh 参数面", () => {
++  it("--help 退出码 0 且输出用法（含 --no-daemon/--state-dir）", () => {
++    const p = Bun.spawnSync(["bash", INSTALL_SH, "--help"], { cwd: PLUGIN_ROOT });
++    expect(p.exitCode).toBe(0);
++    const text = `${p.stdout.toString()}${p.stderr.toString()}`;
++    expect(text).toContain("--no-daemon");
++    expect(text).toContain("--state-dir");
++  });
++
++  it("未知参数显式报错退出非 0（禁静默忽略）", () => {
++    const p = Bun.spawnSync(["bash", INSTALL_SH, "--no-such-flag"], { cwd: PLUGIN_ROOT });
++    expect(p.exitCode).not.toBe(0);
++    expect(p.stderr.toString()).toContain("--no-such-flag");
++  });
++});
++
++describe("install.sh 沙箱集成（HOME 注入临时目录）", () => {
++  function sandboxEnv(homeDir: string): Record<string, string> {
++    return {
++      ...process.env,
++      HOME: homeDir,
++      PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}`,
++    } as Record<string, string>;
++  }
++
++  it("全流程 --no-daemon --state-dir --skip-gate：退出码 0 + 接线文件指向本仓库 index.ts", async () => {
++    const homeDir = path.join(TEST_ROOT, "sb-home");
++    const stateDir = path.join(TEST_ROOT, "sb-state");
++    await mkdir(homeDir, { recursive: true });
++    const p = Bun.spawnSync(
++      ["bash", INSTALL_SH, "--no-daemon", "--state-dir", stateDir, "--skip-gate"],
++      { cwd: PLUGIN_ROOT, env: sandboxEnv(homeDir) },
++    );
++    expect(p.exitCode).toBe(0);
++    const wired = await readFile(
++      path.join(homeDir, ".config", "opencode", "plugins", "codearts-bridge.ts"),
++      "utf8",
++    );
++    expect(wired).toContain(`export { default } from "${PLUGIN_ROOT}/index.ts";`);
++    expect(p.stdout.toString()).toContain("安装完成");
++  }, 120_000);
++
++  it("幂等重跑：接线等价 → 跳过且不产生 .bak 备份", async () => {
++    const homeDir = path.join(TEST_ROOT, "sb-idem");
++    const stateDir = path.join(TEST_ROOT, "sb-idem-state");
++    await mkdir(homeDir, { recursive: true });
++    const pluginDir = path.join(homeDir, ".config", "opencode", "plugins");
++    const args = ["bash", INSTALL_SH, "--no-daemon", "--state-dir", stateDir, "--skip-gate"];
++    const env = sandboxEnv(homeDir);
++    expect(Bun.spawnSync(args, { cwd: PLUGIN_ROOT, env }).exitCode).toBe(0);
++    expect(Bun.spawnSync(args, { cwd: PLUGIN_ROOT, env }).exitCode).toBe(0);
++    const files = await readdir(pluginDir);
++    expect(files).toEqual(["codearts-bridge.ts"]); // 无 .bak-* 残留
++  }, 120_000);
++
++  it("接线被外部改动 → 先备份（.bak-时间戳）后重写等价内容", async () => {
++    const homeDir = path.join(TEST_ROOT, "sb-backup");
++    const stateDir = path.join(TEST_ROOT, "sb-backup-state");
++    await mkdir(homeDir, { recursive: true });
++    const pluginDir = path.join(homeDir, ".config", "opencode", "plugins");
++    const target = path.join(pluginDir, "codearts-bridge.ts");
++    const args = ["bash", INSTALL_SH, "--no-daemon", "--state-dir", stateDir, "--skip-gate"];
++    const env = sandboxEnv(homeDir);
++    expect(Bun.spawnSync(args, { cwd: PLUGIN_ROOT, env }).exitCode).toBe(0);
++    await writeFile(target, "// 手工改动\n", "utf8");
++    expect(Bun.spawnSync(args, { cwd: PLUGIN_ROOT, env }).exitCode).toBe(0);
++    const files = await readdir(pluginDir);
++    expect(files.some((f) => f.startsWith("codearts-bridge.ts.bak-"))).toBe(true);
++    expect(await readFile(target, "utf8")).toContain(`export { default } from "${PLUGIN_ROOT}/index.ts";`);
++  }, 120_000);
++});
++
++/* ───── selfUpgrade（git/fetch/pidAlive/sleep 全注入） ───── */
++
++/** selfUpgrade 假系统：按 argv 分派 git/bun/systemctl 行为，记录全部调用。 */
++interface FakeGitSystem {
++  calls: string[][];
++  resetCalls: string[][];
++  headSha: string;
++  remoteSha: string;
++  remoteMissing?: boolean;
++  fetchFails?: boolean;
++  resetFails?: boolean;
++  statusOut?: string;
++  lockChangesOnReset?: boolean;
++  gateFail?: "install" | "typecheck" | "test" | undefined;
++  systemctlFails?: boolean;
++}
++
++function makeFakeGitSystem(root: string, p: FakeGitSystem): Exec {
++  return {
++    run: async (cmd) => {
++      p.calls.push(cmd);
++      const bin = cmd[0];
++      if (bin === "git") {
++        // selfUpgrade 以 `git -C <root> <sub> ...` 调用；fake 按 -C 偏移取子命令与参数
++        const off = cmd[1] === "-C" ? 2 : 0;
++        const sub = cmd[1 + off];
++        if (sub === "fetch") {
++          if (p.fetchFails) return { code: 128, stdout: "", stderr: "network unreachable" };
++          return { code: 0, stdout: "", stderr: "" };
++        }
++        if (sub === "rev-parse") {
++          const target = cmd[2 + off];
++          if (target === "HEAD") return { code: 0, stdout: `${p.headSha}\n`, stderr: "" };
++          if (target === "origin/main") {
++            if (p.remoteMissing) return { code: 128, stdout: "", stderr: "unknown revision" };
++            return { code: 0, stdout: `${p.remoteSha}\n`, stderr: "" };
++          }
++          return { code: 128, stdout: "", stderr: "unknown revision" };
++        }
++        if (sub === "status") return { code: 0, stdout: p.statusOut ?? "", stderr: "" };
++        if (sub === "reset") {
++          p.resetCalls.push(cmd);
++          if (p.resetFails) return { code: 128, stdout: "", stderr: "reset failed" };
++          if (p.lockChangesOnReset) {
++            await writeFile(path.join(root, "bun.lock"), "v2-changed", "utf8");
++          }
++          return { code: 0, stdout: "", stderr: "" };
++        }
++        return { code: 129, stdout: "", stderr: `unknown git sub ${sub}` };
++      }
++      if (bin === "bun") {
++        const verb = cmd[3]; // bun --cwd <dir> <install|run|test>
++        if (p.gateFail !== undefined && (verb === p.gateFail || (p.gateFail === "typecheck" && verb === "run" && cmd[4] === "typecheck"))) {
++          return { code: 1, stdout: "", stderr: `${verb} failed` };
++        }
++        return { code: 0, stdout: "", stderr: "" };
++      }
++      if (bin === "systemctl") {
++        if (p.systemctlFails) return { code: 1, stdout: "", stderr: "restart failed" };
++        return { code: 0, stdout: "", stderr: "" };
++      }
++      return { code: 127, stdout: "", stderr: `unknown bin ${bin}` };
++    },
++  };
++}
++
++/** 搭建 selfUpgrade 临时仓库 fixture（.git 标记 + bun.lock v1）。 */
++async function makeRepoFixture(name: string): Promise<{ root: string; stateDir: string; cfg: BridgeConfig }> {
++  const root = path.join(TEST_ROOT, name);
++  const stateDir = path.join(TEST_ROOT, `${name}-state`);
++  await mkdir(path.join(root), { recursive: true });
++  await writeFile(path.join(root, ".git"), "gitdir: fake\n", "utf8");
++  await writeFile(path.join(root, "bun.lock"), "v1", "utf8");
++  await mkdir(stateDir, { recursive: true });
++  const cfg = loadConfig({ stateDir }, {});
++  return { root, stateDir, cfg };
++}
++
++function selfUpgradeDeps(root: string, sys: FakeGitSystem, extra: Partial<SelfUpgradeDeps> = {}): SelfUpgradeDeps {
++  return {
++    exec: makeFakeGitSystem(root, sys),
++    fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
++    repoRoot: root,
++    pidAlive: () => false,
++    sleep: async () => undefined,
++    ...extra,
++  };
++}
++
++describe("selfUpgrade 三分支与安全门", () => {
++  it("非 git 仓库 → SELF_UPGRADE_NOT_GIT_REPO（无任何 git 调用）", async () => {
++    const root = path.join(TEST_ROOT, "su-nogit");
++    await mkdir(root, { recursive: true });
++    const cfg = loadConfig({ stateDir: path.join(TEST_ROOT, "su-nogit-state") }, {});
++    const calls: string[][] = [];
++    const sys: FakeGitSystem = { calls, resetCalls: [], headSha: "a", remoteSha: "b" };
++    await expect(
++      selfUpgrade(cfg, { exec: makeFakeGitSystem(root, sys), repoRoot: root }, { skipTests: true, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "SELF_UPGRADE_NOT_GIT_REPO" });
++    expect(calls).toEqual([]);
++  });
++
++  it("git fetch 失败 → GIT_FETCH_FAILED（零写入）", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-fetch");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", fetchFails: true };
++    await expect(
++      selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "GIT_FETCH_FAILED" });
++    expect(await stat(path.join(stateDir, "self-upgrade-backup.json")).catch(() => undefined)).toBeUndefined();
++  });
++
++  it("脏工作树 → SELF_UPGRADE_DIRTY_TREE（reset 前拒绝，零改动）", async () => {
++    const { root, cfg } = await makeRepoFixture("su-dirty");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", statusOut: " M x.ts\n" };
++    await expect(
++      selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "SELF_UPGRADE_DIRTY_TREE" });
++    expect(sys.resetCalls).toEqual([]);
++  });
++
++  it("无更新（HEAD==origin/main）→ up-to-date，零写入零 reset", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-uptodate");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "cafe01", remoteSha: "cafe01" };
++    const result = await selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: true });
++    expect(result).toEqual({ action: "up-to-date", commit: "cafe01", branch: "main" });
++    expect(sys.resetCalls).toEqual([]);
++    expect(await stat(path.join(stateDir, "self-upgrade-backup.json")).catch(() => undefined)).toBeUndefined();
++  });
++
++  it("更新成功（无锁变更/守护未运行/门全跳）→ updated + 备份记录落盘", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-ok");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa111", remoteSha: "bbb222" };
++    const result = await selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: true });
++    expect(result).toEqual({ action: "updated", from: "aaa111", to: "bbb222", daemonRestarted: false, testsRan: false });
++    expect(sys.resetCalls).toEqual([["git", "-C", root, "reset", "--hard", "bbb222"]]);
++    const record = JSON.parse(await readFile(path.join(stateDir, "self-upgrade-backup.json"), "utf8")) as {
++      backupCommit: string;
++      targetCommit: string;
++    };
++    expect(record.backupCommit).toBe("aaa111");
++    expect(record.targetCommit).toBe("bbb222");
++    // 锁未变更 → 不该有 bun install 调用
++    expect(sys.calls.some((c) => c[0] === "bun" && c[3] === "install")).toBe(false);
++  });
++
++  it("锁变更 → 触发 bun install（恰好一次）", async () => {
++    const { root, cfg } = await makeRepoFixture("su-lock");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", lockChangesOnReset: true };
++    const result = await selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: true });
++    expect(result).toMatchObject({ action: "updated" });
++    expect(sys.calls.filter((c) => c[0] === "bun" && c[3] === "install").length).toBe(1);
++  });
++
++  it("bun test 门失败 → TESTS_FAILED + 回滚到备份提交", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-testfail");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", gateFail: "test" };
++    await expect(
++      selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: false, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "TESTS_FAILED" });
++    // 最后一次 reset 必须是回滚到备份提交
++    expect(sys.resetCalls[sys.resetCalls.length - 1]).toEqual(["git", "-C", root, "reset", "--hard", "aaa"]);
++    // 备份记录保留（供人工对账）
++    const record = JSON.parse(await readFile(path.join(stateDir, "self-upgrade-backup.json"), "utf8")) as {
++      backupCommit: string;
++    };
++    expect(record.backupCommit).toBe("aaa");
++  });
++
++  it("typecheck 门失败 → TYPECHECK_FAILED + 回滚", async () => {
++    const { root, cfg } = await makeRepoFixture("su-tcfail");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", gateFail: "typecheck" };
++    await expect(
++      selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: false }),
++    ).rejects.toMatchObject({ code: "TYPECHECK_FAILED" });
++    expect(sys.resetCalls[sys.resetCalls.length - 1]).toEqual(["git", "-C", root, "reset", "--hard", "aaa"]);
++  });
++
++  it("回滚 reset 自身失败 → SELF_UPGRADE_ROLLBACK_FAILED（含备份指引）", async () => {
++    const { root, cfg } = await makeRepoFixture("su-rbfail");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", gateFail: "test" };
++    // 首次 reset（升级）成功；回滚 reset 失败：以 resetFails 动态翻转模拟
++    const execCalls: string[][] = [];
++    let resetCount = 0;
++    const exec: Exec = {
++      run: async (cmd) => {
++        execCalls.push(cmd);
++        if (cmd[0] === "git" && cmd.includes("reset")) {
++          resetCount++;
++          if (resetCount >= 2) return { code: 128, stdout: "", stderr: "rollback broken" };
++          return { code: 0, stdout: "", stderr: "" };
++        }
++        return makeFakeGitSystem(root, sys).run(cmd);
++      },
++    };
++    await expect(
++      selfUpgrade(cfg, { exec, fetchImpl: async () => new Response("{}", { status: 200 }), repoRoot: root, pidAlive: () => false, sleep: async () => undefined }, { skipTests: false, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "SELF_UPGRADE_ROLLBACK_FAILED" });
++  });
++
++  it("守护活跃（pidfile+pidAlive）→ systemctl restart + /health 验证 → daemonRestarted=true", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-daemon");
++    await writeFile(path.join(stateDir, "daemon.pid"), "4242\n", "utf8");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb" };
++    const result = await selfUpgrade(cfg, selfUpgradeDeps(root, sys, { pidAlive: () => true }), { skipTests: true, skipTypecheck: true });
++    expect(result).toMatchObject({ action: "updated", daemonRestarted: true });
++    expect(sys.calls.some((c) => c[0] === "systemctl" && c.includes("restart"))).toBe(true);
++  });
++
++  it("重启后 /health 不可达 → DAEMON_HEALTH_FAILED + 回滚 + 回滚重启", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-healthfail");
++    await writeFile(path.join(stateDir, "daemon.pid"), "4242\n", "utf8");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb" };
++    await expect(
++      selfUpgrade(
++        cfg,
++        selfUpgradeDeps(root, sys, {
++          pidAlive: () => true,
++          fetchImpl: async () => new Response(JSON.stringify({ ok: false }), { status: 500 }),
++        }),
++        { skipTests: true, skipTypecheck: true },
++      ),
++    ).rejects.toMatchObject({ code: "DAEMON_HEALTH_FAILED" });
++    expect(sys.resetCalls[sys.resetCalls.length - 1]).toEqual(["git", "-C", root, "reset", "--hard", "aaa"]);
++    // 回滚路径同样重启守护（两次 restart：升级后 + 回滚后）
++    const restarts = sys.calls.filter((c) => c[0] === "systemctl" && c.includes("restart"));
++    expect(restarts.length).toBe(2);
++  });
++
++  it("systemctl restart 失败 → DAEMON_RESTART_FAILED + 回滚", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-restartfail");
++    await writeFile(path.join(stateDir, "daemon.pid"), "4242\n", "utf8");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb", systemctlFails: true };
++    await expect(
++      selfUpgrade(cfg, selfUpgradeDeps(root, sys, { pidAlive: () => true }), { skipTests: true, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "DAEMON_RESTART_FAILED" });
++    expect(sys.resetCalls[sys.resetCalls.length - 1]).toEqual(["git", "-C", root, "reset", "--hard", "aaa"]);
++  });
++
++  it("pidfile 内容非法 → SELF_UPGRADE_PIDFILE_INVALID（禁猜）", async () => {
++    const { root, stateDir, cfg } = await makeRepoFixture("su-badpid");
++    await writeFile(path.join(stateDir, "daemon.pid"), "not-a-pid\n", "utf8");
++    const sys: FakeGitSystem = { calls: [], resetCalls: [], headSha: "aaa", remoteSha: "bbb" };
++    await expect(
++      selfUpgrade(cfg, selfUpgradeDeps(root, sys), { skipTests: true, skipTypecheck: true }),
++    ).rejects.toMatchObject({ code: "SELF_UPGRADE_PIDFILE_INVALID" });
++  });
++});
++
++/* ───── upgradeCli 薄封装三分支 ───── */
++
++/** 搭建 upgradeCli fixture：旧版二进制（OLD_ELF，content-driven exec 可读版本）。 */
++async function makeUpgradeCliFixture(name: string): Promise<{ installDir: string; stateDir: string; cfg: BridgeConfig; binPath: string; exec: Exec }> {
++  const installDir = path.join(TEST_ROOT, name, "installers");
++  const stateDir = path.join(TEST_ROOT, name, "state");
++  const binDir = path.join(installDir, "bin");
++  const binPath = path.join(binDir, "codearts");
++  await mkdir(binDir, { recursive: true });
++  await mkdir(stateDir, { recursive: true });
++  await writeFile(binPath, OLD_ELF_CONTENT, "utf8");
++  await writeFile(path.join(installDir, "codearts_cli.json"), JSON.stringify({ autoupdate: false }), "utf8");
++  const calls: string[][] = [];
++  return { installDir, stateDir, cfg: loadConfig({ installDir, stateDir }, {}), binPath, exec: contentVersionExec(calls) };
++}
++
++describe("upgradeCli 受控升级封装", () => {
++  it("无更新（当前==latest）→ already-latest，零下载零部署", async () => {
++    const fx = await makeUpgradeCliFixture("uc-same");
++    const fetcher = makeFakeFetcher({ version: OLD_VERSION });
++    const downloads: { url: string; dest: string }[] = [];
++    const probed = makeFakeFetcher({ version: OLD_VERSION }, downloads);
++    const result = await upgradeCli(fx.cfg, { exec: fx.exec, fetcher: probed });
++    expect(result).toEqual({ action: "already-latest", version: OLD_VERSION });
++    expect(downloads).toEqual([]);
++    expect(await readFile(fx.binPath, "utf8")).toBe(OLD_ELF_CONTENT);
++  });
++
++  it("有更新 → upgraded：二进制替换为新内容，审计落盘", async () => {
++    const fx = await makeUpgradeCliFixture("uc-up");
++    const fetcher = makeFakeFetcher({ version: NEW_VERSION });
++    const result = await upgradeCli(fx.cfg, {
++      exec: fx.exec,
++      fetcher,
++      extract: copyExtract(DEFAULT_LAYOUT),
++    });
++    expect(result).toMatchObject({ action: "upgraded", from: OLD_VERSION, to: NEW_VERSION });
++    expect(await readFile(fx.binPath, "utf8")).toBe(NEW_ELF_CONTENT);
++    // 审计（T1-05 语义继承）：install.jsonl 含 upgrade.done
++    const audit = await readFile(path.join(fx.stateDir, "audit", "install.jsonl"), "utf8");
++    expect(audit).toContain("upgrade.done");
++  });
++
++  it("哈希失败零损坏 → HASH_MISMATCH 且旧二进制逐字节原位", async () => {
++    const fx = await makeUpgradeCliFixture("uc-hash");
++    const fetcher = makeFakeFetcher({ version: NEW_VERSION, hash: "0".repeat(64), bytes: PACKAGE_BYTES });
++    await expect(
++      upgradeCli(fx.cfg, { exec: fx.exec, fetcher, extract: copyExtract(DEFAULT_LAYOUT) }),
++    ).rejects.toMatchObject({ code: "HASH_MISMATCH" });
++    expect(await readFile(fx.binPath, "utf8")).toBe(OLD_ELF_CONTENT);
++    expect(await readFile(fx.binPath, "utf8")).not.toBe(NEW_ELF_CONTENT);
++    // 哈希基线核对：现文件仍是旧内容
++    expect(sha256Oracle(OLD_ELF_CONTENT)).toBeDefined();
++  });
++});
++
++/* ───── uninstallCommand ───── */
++
++describe("uninstallCommand 卸载语义", () => {
++  const UNIT_NAMES = ["codearts-bridge.service", "codearts-bridge-watchdog.service", "codearts-bridge-watchdog.timer"];
++
++  async function captureConsole<T>(fn: () => Promise<T>): Promise<{ result: T; logs: string[]; errors: string[] }> {
++    const logs: string[] = [];
++    const errors: string[] = [];
++    const origLog = console.log;
++    const origError = console.error;
++    console.log = (...args: unknown[]) => {
++      logs.push(args.map((a) => String(a)).join(" "));
++    };
++    console.error = (...args: unknown[]) => {
++      errors.push(args.map((a) => String(a)).join(" "));
++    };
++    try {
++      return { result: await fn(), logs, errors };
++    } finally {
++      console.log = origLog;
++      console.error = origError;
++    }
++  }
++
++  function cfgOf(name: string): BridgeConfig {
++    return loadConfig(
++      { installDir: path.join(TEST_ROOT, "un-ca", name), stateDir: path.join(TEST_ROOT, "un-st", name) },
++      {},
++    );
++  }
++
++  function baseDeps(homeDir: string, overrides: Partial<UninstallDeps> = {}): UninstallDeps {
++    return {
++      exec: { run: async () => ({ code: 0, stdout: "systemd 255\n", stderr: "" }) },
++      homeDir,
++      isTTY: true,
++      confirm: async () => true,
++      nowMs: () => 1_700_000_000_000,
++      serviceUninstall: serviceUninstallCommand, // 真实实现（exec 注入 → tmp 文件真删，绝不真调 systemctl）
++      ...overrides,
++    };
++  }
++
++  it("非交互且无 --yes → UNINSTALL_CONFIRM_REQUIRED，零改动", async () => {
++    const homeDir = path.join(TEST_ROOT, "un-noninteractive");
++    await mkdir(homeDir, { recursive: true });
++    const { result, errors } = await captureConsole(() =>
++      uninstallCommand(cfgOf("ni"), baseDeps(homeDir, { isTTY: false }), { yes: false }),
++    );
++    expect(result).toBe(1);
++    expect(errors.join("\n")).toContain("UNINSTALL_CONFIRM_REQUIRED");
++    // 状态目录仍在（默认保留语义未被破坏）
++    expect(await stat(cfgOf("ni").stateDir).catch(() => undefined)).toBeUndefined();
++  });
++
++  it("交互确认拒绝 → 退出码 1，零改动", async () => {
++    const homeDir = path.join(TEST_ROOT, "un-decline");
++    await mkdir(homeDir, { recursive: true });
++    const { result } = await captureConsole(() =>
++      uninstallCommand(cfgOf("dec"), baseDeps(homeDir, { confirm: async () => false }), {}),
++    );
++    expect(result).toBe(1);
++  });
++
++  it("--yes 全流程：autoload 备份后移除、systemd 单元卸载、默认保留状态目录与 codearts CLI", async () => {
++    const homeDir = path.join(TEST_ROOT, "un-yes");
++    const cfg = cfgOf("yes");
++    await mkdir(path.join(homeDir, ".config", "opencode", "plugins"), { recursive: true });
++    const autoload = path.join(homeDir, ".config", "opencode", "plugins", "codearts-bridge.ts");
++    await writeFile(autoload, `export { default } from "/x/index.ts";\n`, "utf8");
++    const unitDir = path.join(homeDir, ".config", "systemd", "user");
++    await mkdir(unitDir, { recursive: true });
++    for (const n of UNIT_NAMES) await writeFile(path.join(unitDir, n), "[Unit]\n", "utf8");
++    await mkdir(cfg.stateDir, { recursive: true });
++
++    const { result, logs } = await captureConsole(() =>
++      uninstallCommand(cfg, baseDeps(homeDir), { yes: true }),
++    );
++    expect(result).toBe(0);
++    // autoload：原件已删、备份在场
++    expect(await stat(autoload).catch(() => undefined)).toBeUndefined();
++    const pluginFiles = await readdir(path.dirname(autoload));
++    expect(pluginFiles.some((f) => f.startsWith("codearts-bridge.ts.bak-"))).toBe(true);
++    // 单元文件已删（serviceUninstallCommand 经注入 exec 真删 tmp 文件）
++    for (const n of UNIT_NAMES) {
++      expect(await stat(path.join(unitDir, n)).catch(() => undefined)).toBeUndefined();
++    }
++    // 默认保留状态目录
++    expect(await stat(cfg.stateDir).catch(() => undefined)).toBeDefined();
++    const text = logs.join("\n");
++    expect(text).toContain("保留");
++    expect(text).toContain("codearts CLI");
++  });
++
++  it("autoload 不在场 → 跳过且不报错", async () => {
++    const homeDir = path.join(TEST_ROOT, "un-noautoload");
++    await mkdir(homeDir, { recursive: true });
++    const { result, logs } = await captureConsole(() =>
++      uninstallCommand(cfgOf("noauto"), baseDeps(homeDir), { yes: true }),
++    );
++    expect(result).toBe(0);
++    expect(logs.join("\n")).toContain("跳过");
++  });
++
++  it("单元在场但 systemctl 不可用 → 显式留痕且文件保留（禁静默）", async () => {
++    const homeDir = path.join(TEST_ROOT, "un-nosystemd");
++    const unitDir = path.join(homeDir, ".config", "systemd", "user");
++    await mkdir(unitDir, { recursive: true });
++    for (const n of UNIT_NAMES) await writeFile(path.join(unitDir, n), "[Unit]\n", "utf8");
++    const { result, logs } = await captureConsole(() =>
++      uninstallCommand(cfgOf("nosd"), baseDeps(homeDir, {
++        exec: { run: async () => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })) },
++      }), { yes: true }),
++    );
++    expect(result).toBe(0);
++    expect(logs.join("\n")).toContain("systemctl");
++    for (const n of UNIT_NAMES) {
++      expect(await stat(path.join(unitDir, n)).catch(() => undefined)).toBeDefined(); // 保留
++    }
++  });
++
++  it("--purge 清除状态目录；purge 目标=HOME → PURGE_TARGET_INVALID 拒绝", async () => {
++    const homeDir = path.join(TEST_ROOT, "un-purge");
++    const cfg = cfgOf("purge");
++    await mkdir(homeDir, { recursive: true });
++    await mkdir(cfg.stateDir, { recursive: true });
++    const { result } = await captureConsole(() =>
++      uninstallCommand(cfg, baseDeps(homeDir), { yes: true, purge: true }),
++    );
++    expect(result).toBe(0);
++    expect(await stat(cfg.stateDir).catch(() => undefined)).toBeUndefined();
++
++    // purge=HOME 守卫
++    const homeCfg = loadConfig({ stateDir: homeDir, installDir: path.join(TEST_ROOT, "un-ca", "home") }, {});
++    const { result: rc2, errors } = await captureConsole(() =>
++      uninstallCommand(homeCfg, baseDeps(homeDir), { yes: true, purge: true }),
++    );
++    expect(rc2).toBe(1);
++    expect(errors.join("\n")).toContain("PURGE_TARGET_INVALID");
++  });
++});
+diff --git a/plugins/codearts-bridge/test/transport-script.test.ts b/plugins/codearts-bridge/test/transport-script.test.ts
+index 82308b25e2..24428af1e9 100644
+--- a/plugins/codearts-bridge/test/transport-script.test.ts
++++ b/plugins/codearts-bridge/test/transport-script.test.ts
+@@ -672,20 +672,33 @@ describe("snapshot / alive", () => {
+       kind: "pty",
+       host: "script",
+       pid: 424242,
+       alive: true,
+       closed: false,
+       log: { available: false, file: null, serviceLines: 0 },
+     });
+     expect(await t.alive(ref)).toBe(true);
+   });
+ 
++  it("raw 封顶（终审修复波 F1）：超限 PTY 输出丢弃最旧字节保留最新 512KB 尾部；meta.rawDroppedBytes 如实计数", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    child.emit("y".repeat(600 * 1024));
++    child.emit("TAIL-MARK");
++    const snap = await t.snapshot(ref);
++    expect(Buffer.byteLength(snap.raw, "utf8")).toBeLessThanOrEqual(512 * 1024);
++    expect(snap.raw.endsWith("TAIL-MARK")).toBe(true); // 以尾部内容结尾（尾滚动）
++    // 精确对账：累积总量（600K + 9B 尾标）− cap = 丢弃量
++    expect(snap.meta.rawDroppedBytes).toBe(600 * 1024 + 9 - 512 * 1024);
++  });
++
+   it("serviceLines 计数与 log 可用性在观察后如实反映", async () => {
+     const { exec } = realExec("stall");
+     const t = makeTransport(exec);
+     const ref = await t.start(CFG);
+     const kdir = makeKernelDir("meta-");
+     const logDir = path.join(kdir, "log");
+     mkdirSync(logDir, { recursive: true });
+     const logFile = path.join(logDir, "kernel-m.log");
+     writeFileSync(logFile, "base\n");
+     cleanups.push(async () => {
+diff --git a/plugins/codearts-bridge/test/transport-structured.test.ts b/plugins/codearts-bridge/test/transport-structured.test.ts
+index fb1da28ea9..db44eb632c 100644
+--- a/plugins/codearts-bridge/test/transport-structured.test.ts
++++ b/plugins/codearts-bridge/test/transport-structured.test.ts
+@@ -476,20 +476,38 @@ describe("R-s5 事件→信号映射", () => {
+     p.exit(0, null);
+     await collectUntil(iterOf(t.observe(ref)), (sig) => sig.t === "done");
+     const snap = await t.snapshot(ref);
+     expect(snap.raw).toBe("甲\n乙\n");
+     expect(snap.meta.host).toBe("structured");
+     expect(snap.meta.codeartsSessionId).toBe("ses-r");
+     expect(snap.meta.rounds).toBe(1);
+     expect(snap.meta.alive).toBe(true); // 回合结束 ≠ 会话死亡（可续接新回合）
+     expect(snap.meta.lastExit).toEqual({ code: 0, signal: null });
+   });
++
++  it("raw 封顶（终审修复波 F1）：超限输出丢弃最旧字节保留最新 512KB 尾部；meta.rawDroppedBytes 如实计数（审计可见，非静默）", async () => {
++    const ctx = makeCtx();
++    const fake = makeFakeExec();
++    const t = createStructuredTransport(fake.exec);
++    const ref = await t.start(ctx.cfg);
++    await t.inject(ref, "p");
++    const p = fake.procs[0]!;
++    const big = "x".repeat(600 * 1024);
++    p.emitLine(JSON.stringify({ type: "message.part", part: { text: big } }));
++    p.emitLine('{"type":"message.part","part":{"text":"TAIL-MARK"}}');
++    p.exit(0, null);
++    const snap = await t.snapshot(ref);
++    expect(Buffer.byteLength(snap.raw, "utf8")).toBeLessThanOrEqual(512 * 1024);
++    expect(snap.raw.endsWith("TAIL-MARK\n")).toBe(true); // 以尾部内容结尾（尾滚动）
++    // 精确对账：累积总量（600K 文本 + 每条 \n + 10B 尾标）− cap = 丢弃量
++    expect(snap.meta.rawDroppedBytes).toBe(600 * 1024 + 1 + 10 - 512 * 1024);
++  });
+ });
+ 
+ /* ═══════ classifyError（R-s5 纯函数） ═══════ */
+ 
+ describe("classifyError（R-s5 错误分级）", () => {
+   it("ECONNRESET / timeout / 429 / 503 → retryable（大小写不敏感、行内子串命中）", () => {
+     expect(classifyError("read ECONNRESET connection broken")).toBe("retryable");
+     expect(classifyError("Request TIMEOUT after 30s")).toBe("retryable");
+     expect(classifyError("HTTP 429 Too Many Requests")).toBe("retryable");
+     expect(classifyError("upstream 503 Service Unavailable")).toBe("retryable");
+diff --git a/plugins/codearts-bridge/test/transport-tmux.test.ts b/plugins/codearts-bridge/test/transport-tmux.test.ts
+index edc448f9c5..9c8654ebcf 100644
+--- a/plugins/codearts-bridge/test/transport-tmux.test.ts
++++ b/plugins/codearts-bridge/test/transport-tmux.test.ts
+@@ -448,20 +448,32 @@ describe("R-tm4 stop / alive / snapshot", () => {
+       target: ref.id,
+       alive: true,
+       closed: false,
+       log: { available: false, file: null, serviceLines: 0 },
+     });
+     fake.setExists(false);
+     const dead = await t.snapshot(ref);
+     expect(dead.raw).toBe("");
+     expect(dead.meta).toMatchObject({ alive: false });
+   });
++
++  it("snapshot raw 封顶（终审修复波 F1）：capture 超 512KB 保留最新尾部；meta.rawDroppedBytes 如实计数（pane 全量仍由 tmux history 持有）", async () => {
++    const fake = makeFakeTmux();
++    const t = createTmuxTransport(fake.exec);
++    const ref = await t.start(CFG);
++    fake.setPane("z".repeat(600 * 1024) + "TAIL-MARK\n");
++    const snap = await t.snapshot(ref);
++    expect(Buffer.byteLength(snap.raw, "utf8")).toBeLessThanOrEqual(512 * 1024);
++    expect(snap.raw.endsWith("TAIL-MARK\n")).toBe(true); // 以尾部内容结尾（尾滚动）
++    // 精确对账：capture 总量（600K + 10B 尾标）− cap = 本次捕获丢弃量
++    expect(snap.meta.rawDroppedBytes).toBe(600 * 1024 + 10 - 512 * 1024);
++  });
+ });
+ 
+ describe("observe：pane 增量信号（gated clock 确定性）", () => {
+   it("基线确定性：observe 前已有 pane 内容不产信号；observe 后增量 → output 信号", async () => {
+     const g = makeGatedClock();
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec, { clock: g.clock });
+     const ref = await t.start(CFG);
+     fake.setPane("old-content");
+     const iter = t.observe(ref)[Symbol.asyncIterator]();
+diff --git a/plugins/codearts-bridge/uninstall.sh b/plugins/codearts-bridge/uninstall.sh
+new file mode 100755
+index 0000000000..43137e09d2
+--- /dev/null
++++ b/plugins/codearts-bridge/uninstall.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++#
++# codearts-bridge 卸载引导脚本（T4-05）——转调 codearts-bridge uninstall 子命令。
++#
++# 默认保留 ~/.codearts-bridge 状态数据与 codearts CLI；--purge 才清状态目录。
++# 非交互环境必须带 --yes（卸载子命令的确认门）。
++#
++# 用法：bash uninstall.sh [--yes] [--purge] [codearts-bridge uninstall 其余参数]
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++die() { echo "[uninstall] ✗ $*" >&2; exit 1; }
++
++if command -v bun >/dev/null 2>&1; then
++  BUN="$(command -v bun)"
++elif [ -x "$HOME/.bun/bin/bun" ]; then
++  BUN="$HOME/.bun/bin/bun"
++  export PATH="$HOME/.bun/bin:$PATH"
++else
++  die "bun 未检出（卸载命令需要运行 bun）：请安装 bun 或将其加入 PATH 后重试"
++fi
++
++exec "$BUN" "$REPO_ROOT/src/cli.ts" uninstall "$@"

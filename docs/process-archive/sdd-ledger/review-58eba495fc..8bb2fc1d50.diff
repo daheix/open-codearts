@@ -1,0 +1,163 @@
+# Review package: 58eba495fc..8bb2fc1d50
+
+## Commits
+8bb2fc1d50 codearts-bridge(T1-01): 修复评审发现 — 不兼容宿主改为显式 throw（补覆盖测试）、bunfig 豁免并入计划修订 — I1/I2
+
+## Files changed
+ ...dearts-integration-opencode-implementation-plan.md |  2 +-
+ plugins/codearts-bridge/README.md                     |  6 ++++--
+ plugins/codearts-bridge/src/server.ts                 | 18 +++++++++---------
+ plugins/codearts-bridge/test/server.test.ts           | 19 +++++++++++++++++++
+ 4 files changed, 33 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/docs/superpowers/plans/2026-10-31-codearts-integration-opencode-implementation-plan.md b/docs/superpowers/plans/2026-10-31-codearts-integration-opencode-implementation-plan.md
+index 251150ce65..30eee27243 100644
+--- a/docs/superpowers/plans/2026-10-31-codearts-integration-opencode-implementation-plan.md
++++ b/docs/superpowers/plans/2026-10-31-codearts-integration-opencode-implementation-plan.md
+@@ -70,21 +70,21 @@ plugins/codearts-bridge/
+         └── ...
+ ```
+ 
+ ---
+ 
+ ## M1 · 基础器
+ 
+ ### Task 1: 包骨架与加载验证（T1-01）
+ 
+ **Files:**
+-- Create: `plugins/codearts-bridge/package.json`、`tsconfig.json`、`bunfig.toml`（限 test 配置）、`.gitignore`（忽略 `.tmp/`、`node_modules/`）、`src/server.ts`、`src/core/config.ts`（仅常量占位）、`test/server.test.ts`
++- Create: `plugins/codearts-bridge/package.json`、`tsconfig.json`、`bunfig.toml`（可选）、`.gitignore`（忽略 `.tmp/`、`node_modules/`）、`src/server.ts`、`src/core/config.ts`（仅常量占位）、`test/server.test.ts`（bunfig.toml 可选：无 test 配置需求；2026-10-31 Ruling 豁免，见 SDD ledger）
+ 
+ **Interfaces:**
+ - Produces: 模块 `src/server.ts` 默认导出 `Plugin.define({ id: "codearts-bridge", setup })`；常量 `PLUGIN_ID = "codearts-bridge"`；工具命名空间 `codearts`。
+ 
+ - [ ] **Step 1: 写失败测试** `test/server.test.ts`：
+   - `default export is a plugin definition with id "codearts-bridge"`（断言导出对象非空且 id 正确，通过 `@opencode/plugin` 的 `Plugin.define` 形状检查）
+   - `setup registers exactly one smoke tool named codearts_status`（用 fake ctx：`{ tool: { transform: async (cb) => { const ed = captureEditor(); cb(ed); } } }`，断言 `ed.add` 收到 `name === "status"`、`options.namespace === "codearts"`）
+ - [ ] **Step 2: 跑测试确认失败**：`bun test test/server.test.ts` → FAIL（模块不存在）
+ - [ ] **Step 3: 实现**
+   - `package.json`：`name: codearts-bridge`、`type: module`、`exports: { "./server": "./src/server.ts" }`、`bin: { "codearts-bridge": "./src/cli.ts" }`、dependency `"@opencode/plugin": "2.2.3"`；devDependencies `typescript`；scripts：`test: bun test`、`typecheck: tsc --noEmit`
+diff --git a/plugins/codearts-bridge/README.md b/plugins/codearts-bridge/README.md
+index 55d2e19cec..5b7a24c580 100644
+--- a/plugins/codearts-bridge/README.md
++++ b/plugins/codearts-bridge/README.md
+@@ -26,22 +26,24 @@ plugins/codearts-bridge/
+ bun install          # 安装依赖（@opencode/plugin 2.2.3 钉版）
+ bun test             # 单元测试
+ bun run typecheck    # tsc --noEmit
+ ```
+ 
+ ## 插件契约
+ 
+ - 默认导出：`Plugin.define({ id: "codearts-bridge", setup })`（`@opencode/plugin` 2.2.3）。
+ - 注册唯一冒烟工具：命名空间内名 `status` + `options.namespace = "codearts"`
+   ⇒ 对外有效名 `codearts_status`；`execute` 返回 `{ ok: true, version }`。
+-- setup 含健壮性守卫：宿主上下文缺少 `tool.transform` 时显式 `console.error`
+-  告警并跳过注册（不抛异常污染共享服务，也不静默掩盖——仓库铁律：错误就地报告）。
++- setup 含不兼容守卫（依 SDD 台账 Ruling（2026-10-31，修复环 I1））：
++  宿主上下文缺少 `tool.transform` 时**显式 throw**（错误消息含插件 id、缺失项与
++  期望契约 opencode V2 插件 API），由宿主以 `failed to load plugin` 记录——
++  仓库铁律：出错即显式报错，禁止静默退化。
+ 
+ ## 加载方式（实测）
+ 
+ > 实测环境：opencode **2.1.4** 后台服务（`~/.config/ai.opencode.desktop/cli/2.1.4-x64/opencode-cli`，
+ > pid 随启动变化；CLI `~/.opencode/bin/opencode` 为 2.0.28，仅用于 `api`/`plugin list` 观测）。
+ > 实测日期：2026-10-31。方法：热重载观察 + 日志取证（`~/.local/share/opencode/log/opencode.log`），
+ > 全程未重启/未杀死任何 opencode 进程，试验配置均备份还原并 diff 校验一致。
+ 
+ **结论（可直接用于 T4-01 正式接入）：**
+ 
+diff --git a/plugins/codearts-bridge/src/server.ts b/plugins/codearts-bridge/src/server.ts
+index 638ccd9f17..7a9f7411e7 100644
+--- a/plugins/codearts-bridge/src/server.ts
++++ b/plugins/codearts-bridge/src/server.ts
+@@ -25,34 +25,34 @@ const STATUS_OUTPUT_SCHEMA = {
+     ok: { type: "boolean", description: "插件是否正常加载并响应" },
+     version: { type: "string", description: "codearts-bridge 插件版本" },
+   },
+   required: ["ok", "version"],
+ } as const;
+ 
+ export default Plugin.define({
+   id: PLUGIN_ID,
+   setup: async (context) => {
+     /**
+-     * 运行时健壮性守卫（预检裁决 3：本任务 setup 不得向宿主抛异常）：
++     * 运行时不兼容守卫（依 SDD 台账 Ruling（2026-10-31，修复环 I1））：
+      * 若宿主注入的上下文不含 tool.transform（如旧版 opencode 的插件契约），
+-     * 显式告警并跳过注册——不抛异常污染共享服务进程，也绝不静默掩盖
+-     * （错误就地报告，符合仓库"禁止兜底/禁止吞错"铁律；此处不是降级路径，
+-     * 而是阻止在错误前提下继续注册，并留下结构化错误输出供定位）。
++     * 显式 throw 拒绝加载——宿主会以 "failed to load plugin" 记录，可见性远优于
++     * console.error 后静默跳过；同时把 opencode 2.1.4 的兼容性不确定性转化为
++     * 响亮信号。仓库铁律：出错即显式报错，禁止任何形式的静默退化。
+      */
+     const transform = context.tool?.transform;
+     if (typeof transform !== "function") {
+-      console.error(
+-        `[codearts-bridge] 插件上下文不兼容：缺少 tool.transform` +
+-          `（期待 @opencode/plugin 2.x 宿主契约），已跳过工具注册。` +
+-          ` plugin=${PLUGIN_ID}`,
++      throw new Error(
++        `[codearts-bridge] 插件上下文不兼容：缺少 context.tool.transform` +
++          `（插件 id=${PLUGIN_ID}）。期望契约：opencode V2 插件 API` +
++          `（@opencode/plugin 2.x）注入的 setup(context) 须提供 context.tool.transform；` +
++          `当前宿主版本过旧或插件加载路径错误，拒绝注册工具。`,
+       );
+-      return;
+     }
+ 
+     const registration = await transform((editor) => {
+       editor.add({
+         name: SMOKE_TOOL_NAME,
+         description:
+           "codearts-bridge 冒烟工具：返回插件存活状态（T1-01 骨架验证）",
+         input: { type: "object", properties: {} },
+         output: STATUS_OUTPUT_SCHEMA,
+         options: { namespace: TOOL_NAMESPACE },
+diff --git a/plugins/codearts-bridge/test/server.test.ts b/plugins/codearts-bridge/test/server.test.ts
+index 22a354d2d4..26f8a7d4b2 100644
+--- a/plugins/codearts-bridge/test/server.test.ts
++++ b/plugins/codearts-bridge/test/server.test.ts
+@@ -64,20 +64,39 @@ describe("codearts-bridge 插件骨架", () => {
+ 
+     // 恰好注册一个工具
+     expect(added).toHaveLength(1);
+     const tool = added[0]!;
+     // 命名空间内名 "status" + 命名空间 "codearts" => 对外有效名 codearts_status
+     expect(tool.name).toBe(SMOKE_TOOL_NAME);
+     expect(tool.options?.namespace).toBe(TOOL_NAMESPACE);
+     expect(`${tool.options?.namespace}_${tool.name}`).toBe("codearts_status");
+   });
+ 
++  it("setup 在宿主上下文缺 tool.transform 时抛出含契约信息的错误（修复环 I1）", async () => {
++    // 不兼容宿主的两类形态：完全缺 tool 字段 / tool 存在但缺 transform
++    for (const badCtx of [{}, { tool: {} }]) {
++      let caught: unknown;
++      try {
++        await plugin.setup(asHostContext(badCtx));
++      } catch (e) {
++        caught = e;
++      }
++      // 出错即显式报错：必须抛出，禁止 console.error 后静默跳过
++      expect(caught).toBeInstanceOf(Error);
++      const message = (caught as Error).message;
++      // 错误消息须含：插件 id、缺失项、期望契约（opencode V2 插件 API）
++      expect(message).toContain(PLUGIN_ID);
++      expect(message).toContain("tool.transform");
++      expect(message).toContain("opencode V2");
++    }
++  });
++
+   it("smoke tool execute returns { ok: true, version }", async () => {
+     const { ctx, added } = makeFakeContext();
+     await plugin.setup(asHostContext(ctx));
+ 
+     const tool = added[0]!;
+     const result = (await tool.execute({}, {})) as {
+       output?: { ok?: boolean; version?: string };
+     };
+     expect(result.output?.ok).toBe(true);
+     expect(result.output?.version).toBe(PLUGIN_VERSION);

@@ -1,0 +1,44 @@
+=== 演练 A 18:21:17 kill -9 TUI ===
+TUI 进程已清空
+  File "<string>", line 1
+    import json,sys; d=json.load(sys.stdin); print(d[\"phase\"], \"rounds\",d[\"rounds\"], \"strikes\",d[\"strikes\"], \"session\",d[\"session\"])
+                                                      ^
+SyntaxError: unexpected character after line continuation character
+t+5s: 
+  File "<string>", line 1
+    import json,sys; d=json.load(sys.stdin); print(d[\"phase\"], \"rounds\",d[\"rounds\"], \"strikes\",d[\"strikes\"], \"session\",d[\"session\"])
+                                                      ^
+SyntaxError: unexpected character after line continuation character
+t+10s: 
+  File "<string>", line 1
+    import json,sys; d=json.load(sys.stdin); print(d[\"phase\"], \"rounds\",d[\"rounds\"], \"strikes\",d[\"strikes\"], \"session\",d[\"session\"])
+                                                      ^
+SyntaxError: unexpected character after line continuation character
+t+15s: 
+  File "<string>", line 1
+    import json,sys; d=json.load(sys.stdin); print(d[\"phase\"], \"rounds\",d[\"rounds\"], \"strikes\",d[\"strikes\"], \"session\",d[\"session\"])
+                                                      ^
+SyntaxError: unexpected character after line continuation character
+t+20s: 
+  File "<string>", line 1
+    import json,sys; d=json.load(sys.stdin); print(d[\"phase\"], \"rounds\",d[\"rounds\"], \"strikes\",d[\"strikes\"], \"session\",d[\"session\"])
+                                                      ^
+SyntaxError: unexpected character after line continuation character
+t+25s: 
+  File "<string>", line 1
+    import json,sys; d=json.load(sys.stdin); print(d[\"phase\"], \"rounds\",d[\"rounds\"], \"strikes\",d[\"strikes\"], \"session\",d[\"session\"])
+                                                      ^
+SyntaxError: unexpected character after line continuation character
+t+30s: 
+--- 新 TUI 进程 ---
+602838 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+602839 /home/wsc/.codeartsdoer/installers/bin/codearts
+--- 审计尾 8 条 ---
+gmvw930qa-b7fa087c-193 goal.warning   reason=consecutive-errors
+gmvw930qa-b7fa087c-194 goal.retry server  reason=
+gmvw930qa-b7fa087c-195 goal.warning   reason=consecutive-errors
+gmvw930qa-b7fa087c-196 goal.retry server  reason=
+gmvw930qa-b7fa087c-197 goal.warning   reason=consecutive-errors
+gmvw930qa-b7fa087c-198 goal.retry server  reason=
+gmvw930qa-b7fa087c-199 goal.warning   reason=consecutive-errors
+gmvw930qa-b7fa087c-200 goal.retry server  reason=

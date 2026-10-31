@@ -1,0 +1,874 @@
+# Review package: 700a241e..53c10ed60d
+
+## Commits
+53c10ed60d codearts-bridge(T3-01): 守护骨架 — 令牌鉴权/健康端点/CLI 前台模式 — createDaemon(cfg)（R-d1~R-d4）：仅绑 127.0.0.1（硬编码网络面）、端口唯一来源=daemonUrl 端口段（默认 4577、0=随机且经 start 返回实际端口）；daemon-token 首启 randomBytes(32).hex 原子写入（atomicWriteFile 0600 umask 无关）、重启复用并 chmod 收紧、空令牌显式 DAEMON_TOKEN_INVALID（禁静默重生成）、鉴权 timingSafeEqual 常量时间比较；GET /health 免鉴权（R-d3 探活零依赖防 watchdog 死锁，裁定依据入头注）→ {ok,version,uptime}，未知路由 404 NOT_FOUND 结构化，非 GET /health 一律先鉴权；start 幂等复用（同 Promise 去重）、stop 先斩 keep-alive 连接再 close（Bun 实证 closeAllConnections 已停监听→按 listening 分态，防 ERR_SERVER_NOT_RUNNING 与测试悬挂），stop 后可重启。CLI（R-d5）：daemon 前台命令——信号处理器先于 start 注册（修复"打印就绪行→注册"窗口期竞态：管道写同步返回后父进程可先 kill 致信号默认处置杀进程绕过优雅停止，实测 143 复现率约 50%，根因修复后 SIGINT 真进程用例 6/6 确定性通过），SIGINT/SIGTERM 优雅 stop exit 0、stop 失败结构化 DAEMON_STOP_FAILED exit 1；status 命令——fetch daemonUrl/health 3s 超时，成功 stdout 健康 JSON exit 0，不可达/非 200/非 JSON/ok≠true → stderr 结构化（DAEMON_UNAVAILABLE/HEALTH_INVALID/HEALTH_MISMATCH）+ 非零退出。16 新测试（health 免鉴权两态/token 生成 0600 与重启复用/401·404 结构化/Bearer 方案与 POST /health 鉴权序/start 幂等与显式端口/stop 幂等可重启/status 在场与不可达/真进程 SIGINT 全链路含端口释放复核），全量 296 计数（295 pass+1 skip+0 fail）、typecheck 零错误、单文件 ≤276 行
+
+## Files changed
+ plugins/codearts-bridge/src/cli.ts          | 155 ++++++++++-
+ plugins/codearts-bridge/src/daemon.ts       | 276 ++++++++++++++++++++
+ plugins/codearts-bridge/test/daemon.test.ts | 386 ++++++++++++++++++++++++++++
+ 3 files changed, 810 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/cli.ts b/plugins/codearts-bridge/src/cli.ts
+index cc70cc942f..f35582b781 100644
+--- a/plugins/codearts-bridge/src/cli.ts
++++ b/plugins/codearts-bridge/src/cli.ts
+@@ -1,35 +1,176 @@
+ /**
+- * codearts-bridge CLI（T1-01 最小骨架）。
++ * codearts-bridge CLI（T1-01 最小骨架 + T3-01 daemon/status，R-d5）。
+  *
+- * 仅承载包清单 bin 契约与最基本的自描述命令；
+- * status/goal/service/upgrade/daemon 等子命令由后续任务卡按 TDD 落地。
++ * 命令分派：version/help（T1-01 原样保留）、daemon（前台守护）、status（健康探测）；
++ * goal/service/upgrade 等子命令由后续任务卡按 TDD 落地。
+  * 约定：未知用法显式报错并以非零码退出（禁止静默兜底）。
++ *
++ * R-d5 落点（主控裁定 2026-10-31）：
++ * - daemon：前台启动守护进程（createDaemon + start），SIGINT/SIGTERM 优雅 stop
++ *   后以退出码 0 结束（stop 失败 → stderr 结构化信息 + 退出码 1，不静默）。
++ *   进程退出码由 main() 统一 process.exit，命令函数只返回码（可测试性：测试在
++ *   进程内直调命令函数，不触发 exit）。
++ * - status：fetch <daemonUrl>/health（GET，免鉴权——R-d3 探活零依赖），3s 超时；
++ *   成功 → stdout 打印健康 JSON、退出码 0；不可达/非 200/非本守护响应 → stderr
++ *   结构化摘要（error.code=DAEMON_UNAVAILABLE 等）+ 非零退出码。
++ *
++ * 可测试性设计：daemonCommand/statusCommand 接收显式 cfg（缺省 loadConfig() 生产
++ * 口径），返回退出码而非直接 process.exit；daemonCommand 另设 hooks.onReady
++ * （start 完成且信号处理器就位后回调）供测试确定性驱动 SIGINT，生产不传即无感。
+  */
+-import { PLUGIN_ID, PLUGIN_VERSION } from "./core/config.ts";
++import type { BridgeConfig } from "./core/config";
++import { PLUGIN_ID, PLUGIN_VERSION, loadConfig } from "./core/config";
++import { createDaemon } from "./daemon";
+ 
+ const USAGE = `用法: codearts-bridge <命令>
+ 
+ 命令:
+   version   打印插件版本
++  status    探测守护进程健康（GET <daemonUrl>/health，3s 超时；不可达→非零退出）
++  daemon    前台启动守护进程（SIGINT/SIGTERM 优雅停止）
+   help      打印本帮助
+ 
+-说明: 完整 CLI（status/goal/service/upgrade/daemon）在后续任务卡交付。`;
++说明: goal/service/upgrade 等子命令在后续任务卡交付。`;
++
++/** status 命令的探活超时（R-d5 固定 3s；导出供测试引用同一真相）。 */
++export const STATUS_TIMEOUT_MS = 3000;
++
++/** stderr 结构化错误出口（CLI 侧统一形态，与 HTTP/工具层 error.code 词汇一致）。 */
++function printCliError(code: string, message: string, remediation?: string): void {
++  console.error(
++    JSON.stringify({ error: { code, message, ...(remediation !== undefined ? { remediation } : {}) } }, null, 2),
++  );
++}
++
++/**
++ * status 命令（R-d5）：探测守护健康。只判 ok:true 的 /health 应答；
++ * 任何失败（不可达/超时/非 200/非 JSON/ok≠true）→ stderr 结构化摘要 + 退出码 1。
++ */
++export async function statusCommand(cfg: BridgeConfig): Promise<number> {
++  const healthUrl = new URL("/health", cfg.daemonUrl);
++  let res: Response;
++  try {
++    res = await fetch(healthUrl, { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) });
++  } catch (e) {
++    const reason = e instanceof Error ? e.name : String(e);
++    printCliError(
++      "DAEMON_UNAVAILABLE",
++      `守护进程不可达：${healthUrl.toString()}（${reason}）`,
++      "启动命令：codearts-bridge daemon",
++    );
++    return 1;
++  }
++  if (!res.ok) {
++    printCliError("DAEMON_UNAVAILABLE", `守护 /health 返回 HTTP ${res.status}：${healthUrl.toString()}`);
++    return 1;
++  }
++  let body: unknown;
++  try {
++    body = (await res.json()) as unknown;
++  } catch {
++    printCliError("HEALTH_INVALID", `守护 /health 响应非 JSON：${healthUrl.toString()}`);
++    return 1;
++  }
++  const record = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : undefined;
++  if (record?.["ok"] !== true) {
++    printCliError(
++      "HEALTH_MISMATCH",
++      `端点应答非本守护健康形态（ok≠true）：${healthUrl.toString()}`,
++    );
++    return 1;
++  }
++  console.log(JSON.stringify(record, null, 2));
++  return 0;
++}
++
++/** daemonCommand 测试钩子（生产不传；onReady 在 start 完成+信号处理器就位后触发）。 */
++export interface DaemonCommandHooks {
++  onReady?: (port: number) => void;
++}
+ 
+-function main(argv: readonly string[]): number {
++/**
++ * daemon 命令（R-d5）：前台启动守护，SIGINT/SIGTERM 优雅停止。
++ * 返回退出码：正常停止 0；停止失败 1（stderr 已有结构化信息）。
++ *
++ * 信号处理器先于 start() 注册：若先启动/打印就绪行再注册，"打印→注册"的窗口期
++ * 内到达的信号按默认处置直接杀进程、优雅停止失效（实测竞态概率可观——管道写
++ * 同步返回后父进程可立即 kill，子进程可能尚未完成注册）；先注册后启动使任何
++ * 时刻的信号都进入优雅路径：start 期间到达 → start 完成后立即优雅停止。
++ */
++export async function daemonCommand(cfg: BridgeConfig = loadConfig(), hooks: DaemonCommandHooks = {}): Promise<number> {
++  const daemon = createDaemon(cfg);
++  const signals = ["SIGINT", "SIGTERM"] as const;
++  let stopping = false; // 信号去重（SIGINT+SIGTERM 连发只停一次）
++  let resolveSignal: (sig: string) => void = () => undefined;
++  const signalReceived = new Promise<string>((resolve) => {
++    resolveSignal = resolve;
++  });
++  const removeSignalListeners = () => {
++    for (const sig of signals) process.removeListener(sig, onSignal);
++  };
++  const onSignal = (sig: string) => {
++    if (stopping) return;
++    stopping = true;
++    removeSignalListeners();
++    resolveSignal(sig);
++  };
++  for (const sig of signals) process.on(sig, onSignal);
++
++  try {
++    const { port } = await daemon.start();
++    console.log(
++      `codearts-bridge daemon: 监听 127.0.0.1:${port}（version=${PLUGIN_VERSION}，stateDir=${cfg.stateDir}）；SIGINT/SIGTERM 优雅停止`,
++    );
++    hooks.onReady?.(port);
++  } catch (e) {
++    removeSignalListeners(); // 启动失败即退出：不留信号处理器悬挂
++    throw e;
++  }
++  const sig = await signalReceived;
++  try {
++    await daemon.stop();
++    console.log(`codearts-bridge daemon: 收到 ${sig}，守护已优雅停止`);
++    return 0;
++  } catch (e) {
++    printCliError(
++      "DAEMON_STOP_FAILED",
++      `守护停止失败：${e instanceof Error ? e.message : String(e)}`,
++    );
++    return 1;
++  }
++}
++
++/** CLI 命令分派（返回退出码；仅 import.meta.main 时由底部出口真正 exit）。 */
++export async function main(argv: readonly string[]): Promise<number> {
+   const cmd = argv[0];
+   if (cmd === undefined || cmd === "help") {
+     console.log(USAGE);
+     return 0;
+   }
+   if (cmd === "version") {
+     console.log(`${PLUGIN_ID} ${PLUGIN_VERSION}`);
+     return 0;
+   }
++  if (cmd === "daemon") {
++    return daemonCommand(loadConfig());
++  }
++  if (cmd === "status") {
++    return statusCommand(loadConfig());
++  }
+   console.error(`codearts-bridge: 未知命令 "${cmd}"\n${USAGE}`);
+   return 2;
+ }
+ 
+ // 仅直接执行时进入命令分派（被测试/其他模块导入时不产生副作用）
+ if (import.meta.main) {
+-  process.exit(main(Bun.argv.slice(2)));
++  main(Bun.argv.slice(2)).then(
++    (code) => process.exit(code),
++    (e: unknown) => {
++      // 分派层意外异常：显式落 stderr + 非零退出（禁静默吞错）
++      console.error(
++        `[codearts-bridge] CLI 内部错误：${e instanceof Error ? (e.stack ?? e.message) : String(e)}`,
++      );
++      process.exit(1);
++    },
++  );
+ }
+diff --git a/plugins/codearts-bridge/src/daemon.ts b/plugins/codearts-bridge/src/daemon.ts
+new file mode 100644
+index 0000000000..9b0ba1b76a
+--- /dev/null
++++ b/plugins/codearts-bridge/src/daemon.ts
+@@ -0,0 +1,276 @@
++/**
++ * codearts-bridge 守护进程骨架与 HTTP API（T3-01，M3 起点）。
++ *
++ * 职责（任务书 T3-01 + 主控裁定 R-d1~R-d4）：
++ * - 仅绑 127.0.0.1 的 HTTP 宿主——"目标永不挂起"承诺的宿主进程骨架；
++ *   T3-04（状态持久化）/ T3-05（监督循环与 goal 控制端点）后续挂载于此。
++ * - token 鉴权 + GET /health 健康端点；生命周期 start/stop（幂等）。
++ *
++ * 主控裁定落点（SDD 2026-10-31，逐条；实现处再注）：
++ * - R-d1（网络面）：绑定地址恒为 127.0.0.1（硬编码，不受 daemonUrl 主机名影响——
++ *   守护是本机单用户服务，网络面必须最小化，暴露面裁定的权威来源是裁定而非配置）。
++ *   端口取 cfg.daemonUrl 的端口部分：loadConfig 已对 daemonUrl 做合法性校验并默认
++ *   "http://127.0.0.1:4577"，故"端口默认 4577 可配（loadConfig 覆盖）"经 daemonUrl
++ *   的端口段实现（不新增第二个端口配置真相源）；端口 0 → 内核随机分配，实际端口
++ *   经 start() 返回（任务书接口：start(): Promise<{port}>）。
++ * - R-d2（token）：<stateDir>/daemon-token 首启自动生成（crypto.randomBytes(32)
++ *   .toString("hex")）、mode 0600、重启复用；请求鉴权 Authorization: Bearer <token>；
++ *   缺失/错误 → 401 结构化 JSON。复用路径显式 chmod 0600（幂等收紧，防外部工具
++ *   放宽过权限；0600 本位为 no-op）。比较用 timingSafeEqual（常量时间，防时序侧信道）。
++ * - R-d3（路由语义）：GET /health 免鉴权 → {ok, version, uptime}。设计依据：健康
++ *   探测不得要求凭据——systemd watchdog/监控脚本若须先读 token 才能探活，token
++ *   文件一旦损坏即探活死锁（watchdog 杀守护的判据失灵），探活通道必须零依赖；
++ *   端点只回静态摘要（版本+运行秒数），无凭据外泄面。未知路由 → 404 结构化
++ *   {error:{code:"NOT_FOUND"}}；其余一切请求（含非 GET 打 /health）一律先过鉴权
++ *   再路由——未鉴权者无从探测路由存在性，也拿不到 404 信息面。
++ * - R-d4（生命周期）：start 幂等——进行中/已完成的 start 复用同一次 listen（监督
++ *   循环与 CLI 可能重复触发 start，"拒绝"语义制造竞态脆弱点，"复用"与幂等恢复
++ *   语义一致，此处为显式选择而非兜底）；stop 关闭监听并先斩断全部 keep-alive
++ *   连接（否则活动连接令 close 回调悬挂，bun test 进程不退出）；stop 对未启动态
++ *   幂等空操作，stop 后可再次 start（token 重启复用语义的重启路径）。
++ *
++ * 错误纪律（仓库铁律：出错即显式报错，禁静默兜底）：
++ * - FS/listen 失败统一 BridgeError 显式上抛（DAEMON_LISTEN_FAILED /
++ *   DAEMON_TOKEN_INVALID / FS_READ_FAILED），消息含路径与原因码；
++ * - token 文件存在但为空 → DAEMON_TOKEN_INVALID（拒绝空令牌，绝不静默重新生成——
++ *   重新生成会使其他已缓存令牌的客户端静默失联，属掩盖问题的兜底行为）；
++ * - 所有 HTTP 响应（含错误）均为 application/json 结构化，无文本态响应。
++ */
++import { randomBytes, timingSafeEqual } from "node:crypto";
++import { chmod, readFile } from "node:fs/promises";
++import * as http from "node:http";
++import * as path from "node:path";
++import type { BridgeConfig } from "./core/config";
++import { PLUGIN_VERSION, ensureStateDirs } from "./core/config";
++import { BridgeError } from "./core/errors";
++import { atomicWriteFile, errnoOf } from "./core/fsx";
++
++/** token 文件名（位于状态根，与裁定 <stateDir>/daemon-token 一致；mode 0600）。 */
++const TOKEN_FILE_NAME = "daemon-token";
++
++/** daemonUrl 未写端口段时的默认端口（与 loadConfig 的 DEFAULT_DAEMON_URL 口径一致）。 */
++const DEFAULT_DAEMON_PORT = 4577;
++
++/** 守护句柄（任务书接口：createDaemon(cfg) 返回形态）。 */
++export interface DaemonHandle {
++  /** 底层 HTTP server（createDaemon 时创建、未监听；测试/上层可断言其形态）。 */
++  server: http.Server;
++  /** 启动监听；幂等复用；返回实际端口（port 0 → 内核分配值）。 */
++  start(): Promise<{ port: number }>;
++  /** 停止监听并斩断全部 keep-alive 连接；未启动时空操作；之后可再次 start。 */
++  stop(): Promise<void>;
++}
++
++/* ───── 配置派生（R-d1） ───── */
++
++/**
++ * 从 daemonUrl 提取监听端口：端口段缺省（含协议默认端口被 URL 归一为空串）→ 4577；
++ * "0" 保留（随机端口）；其余须为 0~65535 整数，非法显式抛错。
++ * daemonUrl 的合法性与协议校验由 loadConfig 负责（唯一校验点），此处只做端口派生。
++ */
++export function daemonPortOf(daemonUrl: string): number {
++  const url = new URL(daemonUrl); // loadConfig 已校验；形态非法属编程错误，任其抛 TypeError
++  if (url.port === "") return DEFAULT_DAEMON_PORT;
++  const port = Number(url.port);
++  if (!Number.isInteger(port) || port < 0 || port > 65535) {
++    throw new BridgeError(
++      "DAEMON_CONFIG_INVALID",
++      `daemonUrl 端口段非法（须为 0~65535 整数）：${JSON.stringify(url.port)}`,
++    );
++  }
++  return port;
++}
++
++/* ───── token（R-d2） ───── */
++
++/** token 文件绝对路径（<stateDir>/daemon-token）。 */
++export function daemonTokenPath(cfg: BridgeConfig): string {
++  return path.join(cfg.stateDir, TOKEN_FILE_NAME);
++}
++
++/**
++ * 载入或首启生成 token：存在 → 读入（trim 后非空才收，空文件显式报错）并收紧
++ * mode 0600；不存在（ENOENT）→ randomBytes(32).hex 经 atomicWriteFile 原子写入
++ * （mode 0600，umask 无关）。其他读错误（EACCES/EISDIR 等）显式抛出。
++ */
++async function loadOrCreateToken(cfg: BridgeConfig): Promise<string> {
++  const tokenPath = daemonTokenPath(cfg);
++  let content: string;
++  try {
++    content = await readFile(tokenPath, "utf8");
++  } catch (e) {
++    if (errnoOf(e) !== "ENOENT") {
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      throw new BridgeError(
++        "FS_READ_FAILED",
++        `读取 daemon-token 失败：path=${tokenPath} reason=${reason}`,
++        { cause: e },
++      );
++    }
++    // 首启：生成（R-d2 固定算法）并原子落盘；内存值与文件同源，重启复用即重读该文件
++    const token = randomBytes(32).toString("hex");
++    await atomicWriteFile(tokenPath, token, 0o600);
++    return token;
++  }
++  const token = content.trim();
++  if (token.length === 0) {
++    throw new BridgeError(
++      "DAEMON_TOKEN_INVALID",
++      `daemon-token 文件为空（拒绝空令牌）：path=${tokenPath}`,
++      { remediation: "删除该文件后重启守护进程即可重新生成" },
++    );
++  }
++  // 复用路径：显式收紧 0600（幂等；防外部工具放宽过权限后残留）
++  await chmod(tokenPath, 0o600);
++  return token;
++}
++
++/** 提取请求的 Bearer 令牌；头缺失或方案非 "Bearer"（精确匹配，本插件客户端约定）→ undefined。 */
++function bearerTokenOf(req: http.IncomingMessage): string | undefined {
++  const header = req.headers.authorization;
++  if (typeof header !== "string") return undefined;
++  const m = /^Bearer (.+)$/.exec(header);
++  const token = m?.[1];
++  return token === undefined ? undefined : token;
++}
++
++/** 常量时间令牌比较（长度不等先短路——长度本身不属机密）；空串永不相等。 */
++function tokenMatches(presented: string, expected: string): boolean {
++  if (presented.length === 0) return false;
++  const a = Buffer.from(presented, "utf8");
++  const b = Buffer.from(expected, "utf8");
++  if (a.length !== b.length) return false;
++  return timingSafeEqual(a, b);
++}
++
++/* ───── HTTP 处理（R-d3） ───── */
++
++/** 统一 JSON 响应出口：所有响应（含错误）application/json 结构化。 */
++function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
++  const body = JSON.stringify(payload);
++  res.writeHead(status, {
++    "Content-Type": "application/json; charset=utf-8",
++    "Content-Length": Buffer.byteLength(body),
++  });
++  res.end(body);
++}
++
++/* ───── createDaemon（R-d1~R-d4） ───── */
++
++/** 组装守护进程句柄：HTTP 路由、token 鉴权、幂等 start/stop。 */
++export function createDaemon(cfg: BridgeConfig): DaemonHandle {
++  const port = daemonPortOf(cfg.daemonUrl); // R-d1：端口唯一来源 = daemonUrl 端口段
++  let token: string | undefined; // start() 载入；请求处理闭包读取
++  let startedAtMs: number | undefined; // uptime 基准（start 时置位）
++  let listening = false; // stop 幂等判据（listen 成功才置 true）
++  let startPromise: Promise<{ port: number }> | undefined; // start 幂等复用句柄
++
++  const server = http.createServer((req, res) => {
++    try {
++      const url = new URL(req.url ?? "/", "http://127.0.0.1");
++      // R-d3：仅 "GET + /health" 免鉴权（探活零依赖）；其余一律先鉴权再路由
++      const isHealthRoute = req.method === "GET" && url.pathname === "/health";
++      if (!isHealthRoute) {
++        const presented = bearerTokenOf(req);
++        if (presented === undefined || token === undefined || !tokenMatches(presented, token)) {
++          sendJson(res, 401, {
++            error: {
++              code: "UNAUTHORIZED",
++              message: "缺少或错误的 Authorization: Bearer 令牌（token 见 <stateDir>/daemon-token）",
++            },
++          });
++          return;
++        }
++      }
++      if (isHealthRoute) {
++        const uptimeSeconds = startedAtMs === undefined ? 0 : (Date.now() - startedAtMs) / 1000;
++        sendJson(res, 200, { ok: true, version: PLUGIN_VERSION, uptime: uptimeSeconds });
++        return;
++      }
++      // 鉴权已通过但无此路由（T3-05 的 /goals 端点挂载前，一切非 /health 路由均 404）
++      sendJson(res, 404, {
++        error: { code: "NOT_FOUND", message: `未知路由：${req.method} ${url.pathname}` },
++      });
++    } catch (e) {
++      // 处理器意外异常：结构化 500（可见性优先，禁静默吞掉）
++      sendJson(res, 500, { error: { code: "INTERNAL", message: String(e) } });
++    }
++  });
++
++  function start(): Promise<{ port: number }> {
++    // R-d4 幂等：进行中/已完成的 start 复用同一 Promise（不重复 listen）
++    if (startPromise !== undefined) return startPromise;
++    startPromise = (async () => {
++      await ensureStateDirs(cfg); // 状态根先行（token 落点；T1-02 幂等原语）
++      token = await loadOrCreateToken(cfg);
++      startedAtMs = Date.now();
++      await listenOnce(server, port, "127.0.0.1"); // R-d1：绑定地址恒 127.0.0.1
++      listening = true;
++      // 监听建立后的偶发 socket 错误：显式落 stderr（可见），保持守护存活
++      // （探活宿主进程崩溃会连锁打断被监督目标的续跑，属"保持运行"的显式语义而非吞错）
++      server.on("error", (e: Error) => {
++        console.error(`[codearts-bridge] 守护 server 错误（保持运行）：${e.message}`);
++      });
++      const addr = server.address();
++      if (addr === null || typeof addr === "string") {
++        // 仅 AF_INET("127.0.0.1", port) 监听，不可能出现 string 形态；防御性显式报错
++        throw new BridgeError("DAEMON_LISTEN_FAILED", `监听地址形态异常：${String(addr)}`);
++      }
++      return { port: addr.port };
++    })();
++    // 失败后清空幂等句柄，允许调用方修正配置后重试 start（成功态不受影响）
++    startPromise.catch(() => {
++      startPromise = undefined;
++    });
++    return startPromise;
++  }
++
++  async function stop(): Promise<void> {
++    startPromise = undefined; // 允许 stop 后再次 start（重启复用 token 的重启路径）
++    if (!listening) return; // 未启动/已停止：幂等空操作
++    listening = false;
++    startedAtMs = undefined;
++    // R-d4：先斩全部 keep-alive 连接再 close（否则活动连接令 close 回调悬挂，
++    // bun test 进程不退出——任务书"测试防悬挂"要求）
++    server.closeAllConnections();
++    // 运行时差异（Bun 1.4 实证）：closeAllConnections() 在 Bun 中会顺带停掉监听
++    // （listening=false、端口即释），此时再 close(cb) 会以 ERR_SERVER_NOT_RUNNING
++    // 回调报错；Node 中 closeAllConnections 不动监听，必须显式 close。
++    // 以 server.listening 实际状态分派两条路径——非兜底：两条路径的收敛不变量一致
++    // （stop 返回后端口已释放、keep-alive 连接已全断），差异只是"由谁停的监听"。
++    if (!server.listening) return;
++    await new Promise<void>((resolve, reject) => {
++      server.close((e) => {
++        if (e !== undefined && e !== null) {
++          reject(
++            new BridgeError("DAEMON_STOP_FAILED", `关闭守护失败：${e.message}`, { cause: e }),
++          );
++        } else {
++          resolve();
++        }
++      });
++    });
++  }
++
++  return { server, start, stop };
++}
++
++/** listen 的 Promise 化（一次性 error 监听，成功后摘除，避免污染后续错误通道）。 */
++function listenOnce(srv: http.Server, port: number, host: string): Promise<void> {
++  return new Promise<void>((resolve, reject) => {
++    const onError = (e: Error) => {
++      reject(
++        new BridgeError(
++          "DAEMON_LISTEN_FAILED",
++          `监听 ${host}:${port} 失败：${e.message}（errno=${errnoOf(e) ?? "UNKNOWN"}）`,
++          { cause: e },
++        ),
++      );
++    };
++    srv.once("error", onError);
++    srv.listen(port, host, () => {
++      srv.removeListener("error", onError);
++      resolve();
++    });
++  });
++}
+diff --git a/plugins/codearts-bridge/test/daemon.test.ts b/plugins/codearts-bridge/test/daemon.test.ts
+new file mode 100644
+index 0000000000..a41c192ec0
+--- /dev/null
++++ b/plugins/codearts-bridge/test/daemon.test.ts
+@@ -0,0 +1,386 @@
++/**
++ * T3-01 守护进程骨架与 API 测试（bun:test）。
++ *
++ * 纪律：
++ * - 绝不触碰真实 HOME：stateDir/daemonUrl 一律经 loadConfig overrides 注入到
++ *   <插件根>/.tmp/daemon-test/ 下的临时目录；env 参数显式传 {} 与真实 process.env 隔离。
++ * - 端口一律 0（内核随机分配）或显式探测的空闲端口（freeTcpPort），绝不与真实 4577 抢占；
++ *   fetch 直打 127.0.0.1 临时端口（任务书 Step 1 口径）。
++ * - R-d3 裁定：GET /health 免鉴权（探活零依赖防 watchdog 死锁，裁定依据见 src/daemon.ts
++ *   头注）。任务书 Step1 早稿"无 token→401"已被主控裁定取代，本文件按裁定钉死新契约：
++ *   /health 无 token/错误 token 均 200；鉴权语义经"未知路由 401/404"验证。
++ * - CLI daemon 前台命令以真进程（bun src/cli.ts daemon）+ SIGINT 驱动（R-d5 全链路）。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { readFile, rm, mkdir, stat } from "node:fs/promises";
++import * as http from "node:http";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { createDaemon, daemonPortOf } from "../src/daemon";
++import { daemonCommand, statusCommand } from "../src/cli";
++
++/** 插件根目录（test/ 的上一级）。 */
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++/** 本套件专属临时目录（.tmp/ 已 gitignore）。 */
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "daemon-test");
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  // 只删本套件专属目录，不动 .tmp/ 根（可能被其他套件并行使用）
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 构造注入型配置：stateDir 落临时目录；daemonUrl 缺省端口 0（随机端口）。 */
++function cfgFor(name: string, daemonUrl = "http://127.0.0.1:0"): BridgeConfig {
++  return loadConfig({ stateDir: path.join(TEST_ROOT, name), daemonUrl }, {});
++}
++
++/** 探测一个空闲 TCP 端口（监听 :0 → 取端口 → 立即关闭；仅测试定位用）。 */
++async function freeTcpPort(): Promise<number> {
++  const srv = http.createServer();
++  await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
++  const addr = srv.address();
++  if (addr === null || typeof addr === "string") throw new Error(`非预期地址形态：${String(addr)}`);
++  const port = addr.port;
++  await new Promise<void>((resolve) => srv.close(() => resolve()));
++  return port;
++}
++
++/** fetch JSON 响应的归一结果。 */
++interface FetchResult {
++  status: number;
++  body: unknown;
++  contentType: string;
++}
++
++/** GET 请求并把响应体按 JSON 解析（解析失败保留原文，交由断言暴露）。 */
++async function get(url: string, token?: string): Promise<FetchResult> {
++  const res = await fetch(url, {
++    headers: token === undefined ? {} : { authorization: `Bearer ${token}` },
++  });
++  const text = await res.text();
++  let body: unknown;
++  try {
++    body = JSON.parse(text) as unknown;
++  } catch {
++    body = text;
++  }
++  return { status: res.status, body, contentType: res.headers.get("content-type") ?? "" };
++}
++
++/** 捕获 console 输出执行 fn（finally 必然还原，防污染其他用例输出）。 */
++async function captureConsole<T>(
++  fn: () => Promise<T>,
++): Promise<{ result: T; logs: string[]; errors: string[] }> {
++  const logs: string[] = [];
++  const errors: string[] = [];
++  const origLog = console.log;
++  const origError = console.error;
++  console.log = (...args: unknown[]) => {
++    logs.push(args.map((a) => String(a)).join(" "));
++  };
++  console.error = (...args: unknown[]) => {
++    errors.push(args.map((a) => String(a)).join(" "));
++  };
++  try {
++    const result = await fn();
++    return { result, logs, errors };
++  } finally {
++    console.log = origLog;
++    console.error = origError;
++  }
++}
++
++describe("daemonPortOf（R-d1 端口口径）", () => {
++  it("daemonUrl 无端口段 → 默认 4577；0 保留（随机端口）；显式端口原样解析", () => {
++    expect(daemonPortOf("http://127.0.0.1")).toBe(4577);
++    expect(daemonPortOf("http://127.0.0.1:0")).toBe(0);
++    expect(daemonPortOf("http://127.0.0.1:4577")).toBe(4577);
++    expect(daemonPortOf("http://127.0.0.1:65535")).toBe(65535);
++  });
++});
++
++describe("GET /health（R-d3 免鉴权）", () => {
++  it("无 token → 200 {ok:true, version, uptime}，Content-Type 为 JSON", async () => {
++    const cfg = cfgFor("health-no-token");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const r = await get(`http://127.0.0.1:${port}/health`);
++      expect(r.status).toBe(200);
++      expect(r.contentType).toContain("application/json");
++      const body = r.body as Record<string, unknown>;
++      expect(body["ok"]).toBe(true);
++      expect(body["version"]).toBe("dev");
++      expect(typeof body["uptime"]).toBe("number");
++      expect(body["uptime"] as number).toBeGreaterThanOrEqual(0);
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("带错误 token 仍 200（免鉴权语义钉死，防回归为 401）", async () => {
++    const cfg = cfgFor("health-wrong-token");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const r = await get(`http://127.0.0.1:${port}/health`, "deadbeef");
++      expect(r.status).toBe(200);
++      expect((r.body as Record<string, unknown>)["ok"]).toBe(true);
++    } finally {
++      await daemon.stop();
++    }
++  });
++});
++
++describe("token 生命周期（R-d2）", () => {
++  it("首启自动生成 64 位 hex 令牌文件且 mode 0600", async () => {
++    const cfg = cfgFor("token-gen");
++    const tokenPath = path.join(cfg.stateDir, "daemon-token");
++    // 前置：首启前文件不存在
++    expect(await Bun.file(tokenPath).exists()).toBe(false);
++    const daemon = createDaemon(cfg);
++    await daemon.start();
++    try {
++      const content = await readFile(tokenPath, "utf8");
++      expect(content).toMatch(/^[0-9a-f]{64}$/);
++      const st = await stat(tokenPath);
++      expect(st.mode & 0o777).toBe(0o600);
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("重启复用同一 token（内容不变，旧 token 鉴权通过）", async () => {
++    const cfg = cfgFor("token-reuse");
++    const tokenPath = path.join(cfg.stateDir, "daemon-token");
++    const first = createDaemon(cfg);
++    await first.start();
++    const token1 = await readFile(tokenPath, "utf8");
++    await first.stop();
++
++    const second = createDaemon(cfg);
++    const { port } = await second.start();
++    try {
++      const token2 = await readFile(tokenPath, "utf8");
++      expect(token2).toBe(token1);
++      // 旧 token 鉴权通过：未知路由返回 404（鉴权通过后的路由未命中），而非 401
++      const r = await get(`http://127.0.0.1:${port}/nope`, token2);
++      expect(r.status).toBe(404);
++      expect((r.body as Record<string, unknown>)["error"]).toBeDefined();
++    } finally {
++      await second.stop();
++    }
++  });
++});
++
++describe("路由与鉴权（R-d2/R-d3）", () => {
++  it("未知路由无 token → 401 {error:{code:UNAUTHORIZED}} 结构化 JSON", async () => {
++    const cfg = cfgFor("auth-missing");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const r = await get(`http://127.0.0.1:${port}/goals`);
++      expect(r.status).toBe(401);
++      expect(r.contentType).toContain("application/json");
++      const err = (r.body as Record<string, { code?: string }>)["error"];
++      expect(err?.code).toBe("UNAUTHORIZED");
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("未知路由错误 token → 401", async () => {
++    const cfg = cfgFor("auth-wrong");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const r = await get(`http://127.0.0.1:${port}/goals`, "not-the-token");
++      expect(r.status).toBe(401);
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("非 Bearer 方案（Basic）→ 401", async () => {
++    const cfg = cfgFor("auth-scheme");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const res = await fetch(`http://127.0.0.1:${port}/goals`, {
++        headers: { authorization: "Basic dXNlcjpwYXNz" },
++      });
++      expect(res.status).toBe(401);
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("未知路由正确 token → 404 {error:{code:NOT_FOUND}}（结构化 JSON）", async () => {
++    const cfg = cfgFor("route-404");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const token = await readFile(path.join(cfg.stateDir, "daemon-token"), "utf8");
++      const r = await get(`http://127.0.0.1:${port}/does-not-exist`, token);
++      expect(r.status).toBe(404);
++      expect(r.contentType).toContain("application/json");
++      const err = (r.body as Record<string, { code?: string }>)["error"];
++      expect(err?.code).toBe("NOT_FOUND");
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("POST /health 过鉴权（R-d3：非 GET /health 先鉴权）：无 token→401；带正确 token→404", async () => {
++    const cfg = cfgFor("post-health");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const noToken = await fetch(`http://127.0.0.1:${port}/health`, { method: "POST" });
++      expect(noToken.status).toBe(401);
++      const token = await readFile(path.join(cfg.stateDir, "daemon-token"), "utf8");
++      const withToken = await fetch(`http://127.0.0.1:${port}/health`, {
++        method: "POST",
++        headers: { authorization: `Bearer ${token}` },
++      });
++      expect(withToken.status).toBe(404);
++      const err = (await withToken.json() as Record<string, { code?: string }>)["error"];
++      expect(err?.code).toBe("NOT_FOUND");
++    } finally {
++      await daemon.stop();
++    }
++  });
++});
++
++describe("生命周期（R-d4）", () => {
++  it("start 幂等复用：二次 start 返回同一端口（不重复 listen）", async () => {
++    const cfg = cfgFor("start-idempotent");
++    const daemon = createDaemon(cfg);
++    const a = await daemon.start();
++    try {
++      const b = await daemon.start();
++      expect(b.port).toBe(a.port);
++      expect(b.port).toBeGreaterThan(0);
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("daemonUrl 显式端口被采用：start 返回该端口且可用", async () => {
++    const port = await freeTcpPort();
++    const cfg = cfgFor("explicit-port", `http://127.0.0.1:${port}`);
++    const daemon = createDaemon(cfg);
++    const started = await daemon.start();
++    try {
++      expect(started.port).toBe(port);
++      const r = await get(`http://127.0.0.1:${port}/health`);
++      expect(r.status).toBe(200);
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("stop 幂等：未 start 直接 stop 不抛；stop 后可再次 start 并响应", async () => {
++    const cfg = cfgFor("stop-idempotent");
++    const daemon = createDaemon(cfg);
++    await daemon.stop(); // 未启动：幂等空操作
++    const { port } = await daemon.start();
++    try {
++      const r = await get(`http://127.0.0.1:${port}/health`);
++      expect(r.status).toBe(200);
++    } finally {
++      await daemon.stop();
++      await daemon.stop(); // 二次 stop：幂等
++    }
++  });
++});
++
++describe("CLI status（R-d5）", () => {
++  it("守护在场 → 退出码 0，stdout 输出 ok:true 的 JSON", async () => {
++    const cfg = cfgFor("cli-status-ok");
++    const daemon = createDaemon(cfg);
++    const { port } = await daemon.start();
++    try {
++      const statusCfg = loadConfig(
++        { stateDir: cfg.stateDir, daemonUrl: `http://127.0.0.1:${port}` },
++        {},
++      );
++      const cap = await captureConsole(() => statusCommand(statusCfg));
++      expect(cap.result).toBe(0);
++      expect(cap.logs.join("\n")).toContain('"ok": true');
++    } finally {
++      await daemon.stop();
++    }
++  });
++
++  it("守护不可达 → 非零退出，stderr 结构化摘要（DAEMON_UNAVAILABLE）", async () => {
++    const port = await freeTcpPort(); // 已关闭的空闲端口 → 连接拒绝
++    const cfg = cfgFor("cli-status-down", `http://127.0.0.1:${port}`);
++    const cap = await captureConsole(() => statusCommand(cfg));
++    expect(cap.result).not.toBe(0);
++    expect(cap.errors.join("\n")).toContain("DAEMON_UNAVAILABLE");
++  });
++});
++
++describe("CLI daemon 前台命令（R-d5，真进程 SIGINT）", () => {
++  it(
++    // 真进程全链路：spawn → 监听行 → SIGINT → 优雅 stop → exit 0 → 端口释放。
++    // （曾出现的偶发 143 根因是 cli.ts 旧实现"打印就绪行→注册信号处理器"的窗口期
++    // 竞态：管道写同步返回后父进程可先于子进程完成注册而 kill——已改为先注册
++    // 处理器再启动监听（见 daemonCommand 头注），本用例因此确定性通过。）
++    "bun src/cli.ts daemon 前台运行，SIGINT 优雅停止：退出码 0 且端口释放",
++    async () => {
++      const port = await freeTcpPort();
++      const stateDir = path.join(TEST_ROOT, "cli-daemon");
++      const env = {
++        ...process.env,
++        CODEARTS_BRIDGE_STATE_DIR: stateDir,
++        CODEARTS_BRIDGE_DAEMON_URL: `http://127.0.0.1:${port}`,
++      };
++      const proc = Bun.spawn({
++        cmd: [process.execPath, "src/cli.ts", "daemon"],
++        cwd: PLUGIN_ROOT,
++        env,
++        stdout: "pipe",
++        stderr: "pipe",
++      });
++      try {
++        // 等 stdout 出现监听行（5s 上限防悬挂）
++        const reader = proc.stdout.getReader();
++        const decoder = new TextDecoder();
++        let seen = "";
++        const deadline = Date.now() + 5000;
++        for (;;) {
++          if (Date.now() > deadline) throw new Error("daemon 前台启动超时（未见到监听行）");
++          const { done, value } = await reader.read();
++          if (done) break;
++          seen += decoder.decode(value, { stream: true });
++          if (seen.includes("监听")) break;
++        }
++        expect(seen).toContain("127.0.0.1");
++        proc.kill("SIGINT");
++        const code = await proc.exited;
++        expect(code).toBe(0);
++        // 优雅停止证据：同端口可立即再次监听（server 已 close）
++        const cfg = loadConfig({ stateDir, daemonUrl: `http://127.0.0.1:${port}` }, {});
++        const again = createDaemon(cfg);
++        const restarted = await again.start();
++        expect(restarted.port).toBe(port);
++        await again.stop();
++      } finally {
++        try {
++          proc.kill(9);
++        } catch {
++          // 进程已退出：清理为无操作
++        }
++      }
++    },
++    20000,
++  );
++});

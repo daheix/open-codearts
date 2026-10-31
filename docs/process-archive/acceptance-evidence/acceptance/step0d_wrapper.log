@@ -1,0 +1,38 @@
+--- wrapper 脚本内容 (installers/codearts):
+#!/usr/bin/env bash
+
+# --- 环境变量配置区 ---
+export package_tag="undefined"
+export CODEAGENT_USE_MESSAGE_FEEDBACK="false"
+export OMO_SEND_ANONYMOUS_TELEMETRY="0"
+export SCENARIO="codeartsdoer"
+export KERNEL_DATA_DIR="$HOME/.codeartsdoer/cli-data"
+export KERNEL_STATE_DIR="${KERNEL_STATE_DIR:-$HOME/.codeartsdoer/state}"
+export KERNEL_CONFIG_DIR="$HOME/.codeartsdoer"
+export OPENCODE_CHANNEL="latest"
+export OPENCODE_CONFIG="$HOME/.codeartsdoer/codearts_cli.json"
+export OPENCODE_CONFIG_FILE="codearts_cli.json,codearts_cli.jsonc"
+export OPENCODE_MODE="tui"
+export PLUGIN_ENV="hc"
+export NODE_TLS_REJECT_UNAUTHORIZED="0"
+export OPENCODE_DISABLE_MODELS_FETCH="1"
+export OPENCODE_DISABLE_AUTOUPDATE="true"
+export OPENCODE_ALWAYS_NOTIFY_UPDATE="false"
+
+
+# Detect acp parameter and set dedicated environment variable
+export KERNEL_ACP=""
+if [ "${1}" = "acp" ]; then
+    export KERNEL_ACP="acp"
+    export CODEARTS_ENV="ai-devSpace"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/bin/codearts" "$@"--- installers/bin 目录:
+总计 187340
+drwxrwxr-x 2 wsc wsc         4 10月 31 11:45 .
+drwxrwxr-x 3 wsc wsc         6 10月 24 23:52 ..
+-rwxr-xr-x 1 wsc wsc 161024128 10月 30 20:20 codearts.bak-26.10.9
+-rwxr-xr-x 1 wsc wsc 161024128 10月 24 23:52 codearts.delete
+--- installers/bin/codearts.bak-26.10.9 类型:
+/home/wsc/.codeartsdoer/installers/bin/codearts.bak-26.10.9: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=a9a0d18db4f98a86ad4778800c5fa46943f81b2e, not stripped

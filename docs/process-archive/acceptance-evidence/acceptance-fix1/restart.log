@@ -1,0 +1,8 @@
+=== fix1 复验 2026-10-31 18:20:18 ===
+active
+10月 31 18:20:18 wsc-Default-string systemd[2128]: codearts-bridge.service: Consumed 2.822s CPU time, 10.4M memory peak, 0B memory swap peak.
+10月 31 18:20:18 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 18:20:18 wsc-Default-string codearts-bridge[602169]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+10月 31 18:20:18 wsc-Default-string codearts-bridge[602169]: [codearts-bridge] 启动对账完成：resumed=0 blocked=0
+10月 31 18:20:18 wsc-Default-string codearts-bridge[602169]: codearts-bridge daemon: 监听 127.0.0.1:4577（version=dev，stateDir=/home/wsc/.codearts-bridge）；SIGINT/SIGTERM 优雅停止
+{"ok":true,"version":"dev","uptime":2.384,"actives":0}

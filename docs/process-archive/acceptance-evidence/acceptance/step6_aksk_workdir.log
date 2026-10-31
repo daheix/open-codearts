@@ -1,0 +1,16 @@
+=== Step6 structured 对照 2026-10-31T17:46:59+08:00 ===
+--- config akskFile 默认路径:
+24: *   CODEARTS_BRIDGE_AKSK_FILE   → akskFile
+70:  akskFile: string; // 默认 <stateDir>/config.env
+210:  // 状态根先解析（akskFile 默认值依赖它）
+221:  const akskFile =
+--- AK/SK 凭据文件存在性（预期缺失）:
+ls: 无法访问 '/home/wsc/.codeartsdoer/codearts_ak_sk*': 没有那个文件或目录
+ls: 无法访问 '/home/wsc/.codearts-bridge/ak_sk*': 没有那个文件或目录
+--- 守护启动日志中的凭据判定（AKSK_MISSING 证据）:
+10月 31 17:46:22 wsc-Default-string codearts-bridge[583237]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+--- codearts --help 中 run/format 子命令存在性（不实际执行模型回合，不烧配额）:
+--- workdir 终态核验（目标未完成，hello-bridge.txt/drillb.txt 应不存在）:
+总计 10
+drwxrwxr-x 2 wsc wsc  2 10月 31 17:33 .
+drwxrwxr-x 3 wsc wsc 26 10月 31 17:46 ..

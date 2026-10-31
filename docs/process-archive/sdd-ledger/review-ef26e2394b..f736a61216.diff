@@ -1,0 +1,1568 @@
+# Review package: ef26e2394b..f736a61216
+
+## Commits
+f736a61216 codearts-bridge(T3-06): 目标工具与回呼 — 守护代理/显式不可用错误/终态通知 — R-g1~R-g4 落地：新增 goal-tools.ts（server.ts 730 行叠加将破 ≤1000 铁律，按 T1-05 upgrade.ts 独立成文件先例裁决）承载六工具+薄代理+回呼轮询，server.ts 仅装配。R-g1 薄代理：codearts_goal_start/status/list/logs/control+daemon_status 经 daemonUrl HTTP（daemonRequest 唯一出口：Bearer daemon-token 读 <stateDir>/daemon-token（路径唯一真相=daemonTokenPath）、10s 超时、2xx JSON 原样透传、守护非 2xx 结构化错误体 {error:{code,message,remediation}} 原样构造 BridgeError 经 R-t1 出口零改写落 content——501 GOAL_HOST_DISABLED 含 remediation 同路径）；R-g2 不可达显式：fetch 失败（ECONNREFUSED/超时）→DAEMON_UNAVAILABLE（remediation 含 codearts-bridge daemon 启动指引）不自动启动守护（接线属 T3-07）、token 缺失=守护从未启动同码显式、空 token 文件 DAEMON_TOKEN_INVALID 与守护同码同义、非 JSON/非结构化/缺 goalId →DAEMON_RESPONSE_INVALID 禁猜；R-g3 回呼尽力通知（非投递保证）：createGoalCallbackLoop+defaultGoalPollLoop（setInterval 30s unref，tick 返回 Promise 使可等待宿主 await 单轮）、setup 注册/unload 清理（cleanup 恒返回，registration 缺席也摘定时器）、GET /goals 快照对比按告警级别单调升级恰好一次（终态 complete/stopped>blocked>strikes 达阈值>无；首见即终态且为本实例发起→通知覆盖 30s 内快完成路径，其余首见记基线防插件重载刷屏）、通知走 ctx.session.synthetic（宿主 session 域缺失→skipped 审计）、发起会话未知→skipped 审计、synthetic 抛错/轮询失败/审计失败仅审计或 stderr 留痕不阻塞不重试、会话表空零通知对象跳过网络；R-g4 会话绑定：goal_start 以 initiatedBy 透传发起 sessionID（守护 parseCreateInput 未知字段前向容忍，读码实证无需降级路径）+本地 goalId→sessionID 映射供回呼定位；goalId 路径安全白名单与守护同源（requireValidGoalId 单一真相）；ToolDeps 增 daemonFetch/goalSessions/goalPollLoop/goalPollIntervalMs 注入缝（fake fetch 绝不联网、手动 loop 绝不真等 30s）；审计词表登记 goal.notify/notify-failed/notify-skipped/poll-failed；15 新测试（代理 POST/路径查询串/控制体/501 透传/连接失败/token 缺失/非法输入零请求/终态恰一次/session 缺失仅审计/空表跳轮询/通知失败不阻塞/strikes 告警/注册与卸载清理），全量 422 计数（421 pass+1 skip）/0 fail/typecheck 零错误，server.ts 818 行、goal-tools.ts 702 行
+
+## Files changed
+ plugins/codearts-bridge/src/goal-tools.ts       | 702 ++++++++++++++++++++++++
+ plugins/codearts-bridge/src/server.ts           | 114 +++-
+ plugins/codearts-bridge/test/goal-tools.test.ts | 504 +++++++++++++++++
+ 3 files changed, 1307 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/goal-tools.ts b/plugins/codearts-bridge/src/goal-tools.ts
+new file mode 100644
+index 0000000000..35fa1cac5c
+--- /dev/null
++++ b/plugins/codearts-bridge/src/goal-tools.ts
+@@ -0,0 +1,702 @@
++/**
++ * codearts_goal_* / codearts_daemon_status 六工具 + 守护 HTTP 薄代理 + 目标回呼轮询（T3-06）。
++ *
++ * 文件归属说明：任务书 Files 只列 server.ts，但 server.ts 已 730 行，叠加六工具
++ * 与回呼轮询将突破"单文件 ≤1000 行"仓库铁律——按 T1-05 upgrade.ts 独立成文件的
++ * 既有裁决先例（主控裁定 2026-10-31），本域实现独立成文件；server.ts 仅做装配。
++ *
++ * 职责边界：
++ * - 薄代理（R-g1）：六个工具是守护 HTTP API 的薄代理——Bearer daemon-token 鉴权、
++ *   daemonUrl 取自 cfg、守护响应（含结构化错误）透传为工具 content；本文件不做
++ *   任何领域决策（目标状态机/分页语义全在守护侧 daemon-goals.ts）。
++ * - 回呼轮询（R-g3）：插件侧 30s 轮询 GET /goals，对比上次快照检测目标终态/告警，
++ *   经 ctx.session.synthetic 向发起会话尽力通知（**尽力通知，非投递保证**——
++ *   通知失败仅审计不阻塞、不重试；守护重启或插件卸载期间的窗口不补偿）。
++ *
++ * 主控裁定落点（SDD 2026-10-31，逐条）：
++ * - R-g1（代理语义）：六工具=守护 HTTP 的薄代理（Bearer daemon-token；daemonUrl
++ *   从 cfg）；响应透传为 content；守护 501 GOAL_HOST_DISABLED 原样透传（含
++ *   remediation）——实现路径：守护非 2xx 结构化错误体 {error:{code,message,
++ *   remediation?}} 原样构造 BridgeError，经 server.ts R-t1 出口落 content，
++ *   三字段零改写。
++ * - R-g2（不可达显式）：fetch 失败（ECONNREFUSED/超时）→ BridgeError
++ *   (DAEMON_UNAVAILABLE)（remediation 含 `codearts-bridge daemon` 启动指引）；
++ *   无静默兜底、不自动启动守护（启动接线属 T3-07）。
++ * - R-g3（回呼尽力通知）：插件轮询 30s（setup 注册、unload 清理）；检测目标
++ *   终态/告警（对比上次快照）→ ctx.session.synthetic（若发起会话 id 已知）通知；
++ *   失败仅审计不阻塞。告警分级：终态(complete/stopped) > blocked(等人工) >
++ *   strikes 达阈值(连续无进展)——快照对比按级别单调升级触发，恰好一次。
++ * - R-g4（会话绑定）：goal_start 记录发起 sessionID（context.sessionID）入守护
++ *   请求体（initiatedBy 字段经 body 透传）。守护侧 parseCreateInput 仅取已知键、
++ *   未知字段前向容忍（读码实证，daemon-goals.ts 头注"未知字段忽略"口径），无需
++ *   降级路径；发起会话另存插件本地映射（goal_start 成功后 goalId→sessionID），
++ *   供回呼轮询定位通知目标。
++ *
++ * 错误码登记（本文件新增，与 errors.ts 开放 string 约定一致）：
++ * - DAEMON_UNAVAILABLE：守护不可达（连接失败/超时/token 缺失=从未启动）；
++ * - DAEMON_RESPONSE_INVALID：守护响应形态非法（非 JSON/非结构化错误体/缺 goalId）；
++ * - DAEMON_TOKEN_INVALID：daemon-token 文件为空（与 daemon.ts 同码同义）。
++ *
++ * 审计词表登记（appendInstallAudit，spec §8 审计原则）：
++ * - goal.notify：回呼通知已投递（info）；
++ * - goal.notify-failed：synthetic 投递失败（warn；尽力通知失败仅审计不阻塞）；
++ * - goal.notify-skipped：无投递通道（发起会话未知/宿主未注入 synthetic）仅审计；
++ * - goal.poll-failed：GET /goals 轮询失败（warn；下轮重试）。
++ *
++ * 权限说明：goal_* 与 daemon_status 属目标域操作（spec §6.5 权限清单仅列
++ * upgrade/repair/hygiene 执行），不设权限门——与 codearts_run 同口径。
++ */
++import { readFile } from "node:fs/promises";
++import type { BridgeConfig } from "./core/config";
++import { BridgeError } from "./core/errors";
++import { errnoOf } from "./core/fsx";
++import { requireValidGoalId } from "./core/goal/state";
++import { daemonTokenPath } from "./daemon";
++import type { ToolCtxLike, BridgeToolDef } from "./server";
++
++/* ───── 守护 HTTP 薄代理（R-g1/R-g2） ───── */
++
++/** 守护调用超时（毫秒）：本机回环 + 本守护，10s 足够容忍 logs 大页；超时按 R-g2 显式不可用。 */
++export const DAEMON_HTTP_TIMEOUT_MS = 10_000;
++
++/** 目标回呼轮询周期（R-g3 固定 30s；导出供测试钉死唯一真相）。 */
++export const GOAL_POLL_INTERVAL_MS = 30_000;
++
++/** R-g2 启动指引（remediation 固定文案；CLI daemon 命令见 src/cli.ts）。 */
++export const DAEMON_START_REMEDIATION =
++  "先启动守护进程再重试：bun <本插件包>/src/cli.ts daemon（全局安装可用 codearts-bridge daemon）；" +
++  "生产常驻（systemd 服务自启）由后续任务交付。";
++
++/** 守护 HTTP 响应的最小结构面（与全局 fetch 的 Response 结构兼容）。 */
++export interface DaemonHttpResponse {
++  status: number;
++  json(): Promise<unknown>;
++}
++
++/** 守护 HTTP 请求 init（fetch(RequestInit) 的结构子集；测试 fake 按此实现）。 */
++export interface DaemonRequestInit {
++  method: string;
++  headers: Record<string, string>;
++  body?: string;
++  signal?: AbortSignal;
++}
++
++/** 守护 HTTP 客户端抽象（生产=daemonHttpFetcher；测试注入 fake，绝不联网）。 */
++export type DaemonFetcher = (url: string, init: DaemonRequestInit) => Promise<DaemonHttpResponse>;
++
++/** 生产实现：全局 fetch 透传（Response 结构兼容 DaemonHttpResponse）。 */
++export const daemonHttpFetcher: DaemonFetcher = (url, init) => fetch(url, init);
++
++function isPlainObject(v: unknown): v is Record<string, unknown> {
++  return typeof v === "object" && v !== null && !Array.isArray(v);
++}
++
++/**
++ * 读守护令牌（<stateDir>/daemon-token；路径唯一真相=daemon.ts daemonTokenPath）。
++ * - ENOENT → DAEMON_UNAVAILABLE（守护从未启动过——token 由守护首启生成，文件缺失
++ *   即不可用，属 R-g2 口径而非普通 FS 错误）；
++ * - 其他读错误 → FS_READ_FAILED（真实 IO 故障，不冒充不可用）；
++ * - 空文件 → DAEMON_TOKEN_INVALID（与守护侧同码同义：拒绝空令牌）。
++ * 每次调用即读（不缓存）：token 仅在删文件重启守护时更替，直读永远新鲜且零状态。
++ */
++async function readDaemonToken(cfg: BridgeConfig): Promise<string> {
++  const tokenPath = daemonTokenPath(cfg);
++  let content: string;
++  try {
++    content = await readFile(tokenPath, "utf8");
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") {
++      throw new BridgeError(
++        "DAEMON_UNAVAILABLE",
++        `daemon-token 不存在（守护从未启动）：path=${tokenPath}`,
++        { remediation: DAEMON_START_REMEDIATION },
++      );
++    }
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取 daemon-token 失败：path=${tokenPath} reason=${reason}`, {
++      cause: e,
++    });
++  }
++  const token = content.trim();
++  if (token.length === 0) {
++    throw new BridgeError("DAEMON_TOKEN_INVALID", `daemon-token 文件为空（拒绝空令牌）：path=${tokenPath}`, {
++      remediation: "删除该文件后重启守护进程即可重新生成",
++    });
++  }
++  return token;
++}
++
++/** daemonRequest 依赖（cfg + fetcher；测试经 fetcher 注入 fake）。 */
++export interface DaemonRequestDeps {
++  cfg: BridgeConfig;
++  fetcher: DaemonFetcher;
++}
++
++/**
++ * 守护 HTTP 薄代理内核（R-g1/R-g2 唯一出口）：
++ * - Bearer daemon-token 鉴权；POST body JSON；10s 超时（AbortSignal.timeout）；
++ * - 2xx → 解析 JSON 原样返回（透传载荷）；
++ * - 非 2xx 且错误体为守护结构化形态 {error:{code,message,remediation?}} →
++ *   原样构造 BridgeError（经 server.ts R-t1 出口三字段零改写落 content——
++ *   含 501 GOAL_HOST_DISABLED 的 remediation 透传）；
++ * - 连接失败/超时 → DAEMON_UNAVAILABLE（R-g2：不自动启动守护，仅给启动指引）；
++ * - 响应非 JSON / 错误体形态非法 → DAEMON_RESPONSE_INVALID（显式，禁猜）。
++ */
++export async function daemonRequest(
++  deps: DaemonRequestDeps,
++  args: { method: "GET" | "POST"; path: string; body?: unknown },
++): Promise<unknown> {
++  const token = await readDaemonToken(deps.cfg);
++  const url = `${deps.cfg.daemonUrl.replace(/\/+$/, "")}${args.path}`;
++  let res: DaemonHttpResponse;
++  try {
++    res = await deps.fetcher(url, {
++      method: args.method,
++      headers: {
++        Authorization: `Bearer ${token}`,
++        ...(args.body !== undefined ? { "Content-Type": "application/json" } : {}),
++      },
++      ...(args.body !== undefined ? { body: JSON.stringify(args.body) } : {}),
++      signal: AbortSignal.timeout(DAEMON_HTTP_TIMEOUT_MS),
++    });
++  } catch (e) {
++    // R-g2：ECONNREFUSED/超时等全部显式不可用（无静默兜底、不自动启动守护）
++    throw new BridgeError(
++      "DAEMON_UNAVAILABLE",
++      `守护进程不可达：${url}（${e instanceof Error ? e.message : String(e)}）`,
++      { remediation: DAEMON_START_REMEDIATION, cause: e },
++    );
++  }
++  let body: unknown;
++  try {
++    body = await res.json();
++  } catch (e) {
++    throw new BridgeError("DAEMON_RESPONSE_INVALID", `守护响应非 JSON：status=${res.status} url=${url}`, {
++      cause: e,
++    });
++  }
++  if (res.status < 200 || res.status >= 300) {
++    const errRec = isPlainObject(body) && isPlainObject(body["error"]) ? body["error"] : undefined;
++    const code = typeof errRec?.["code"] === "string" ? errRec["code"] : undefined;
++    if (code !== undefined) {
++      // R-g1：守护结构化错误原样透传（GOAL_HOST_DISABLED 501 同路径，remediation 零改写）
++      throw new BridgeError(
++        code,
++        typeof errRec!["message"] === "string" ? (errRec!["message"] as string) : `守护返回 HTTP ${res.status}`,
++        {
++          remediation:
++            typeof errRec!["remediation"] === "string" ? (errRec!["remediation"] as string) : undefined,
++        },
++      );
++    }
++    throw new BridgeError(
++      "DAEMON_RESPONSE_INVALID",
++      `守护响应形态非法（非结构化错误体）：status=${res.status} url=${url}`,
++    );
++  }
++  return body;
++}
++
++/* ───── 目标回呼轮询（R-g3：尽力通知，非投递保证） ───── */
++
++/** 告警级别（对比快照按级别单调升级触发；级别序：无 < strikes告警 < blocked < 终态）。 */
++export const GOAL_ALERT_NONE = 0;
++export const GOAL_ALERT_STRIKES = 1;
++export const GOAL_ALERT_BLOCKED = 2;
++export const GOAL_ALERT_TERMINAL = 3;
++
++/** GET /goals 摘要行（守护契约字段；插件侧不再二次校验——薄代理口径）。 */
++export interface GoalNotifySnapshot {
++  goalId: string;
++  state: string;
++  rounds: number;
++  strikes: number;
++  objective: string;
++}
++
++/** 由摘要行计算告警级别（终态 > blocked > strikes 达阈值 > 无）。 */
++export function goalAlertLevel(state: string, strikes: number, strikesThreshold: number): number {
++  if (state === "complete" || state === "stopped") return GOAL_ALERT_TERMINAL;
++  if (state === "blocked") return GOAL_ALERT_BLOCKED;
++  if (typeof strikes === "number" && strikes >= strikesThreshold) return GOAL_ALERT_STRIKES;
++  return GOAL_ALERT_NONE;
++}
++
++/** 通知文本（中文人话；goalId/objective/rounds 入文，便于会话续查 goal_status/logs）。 */
++export function goalNotifyText(g: GoalNotifySnapshot, level: number): string {
++  const base = `「${g.objective}」（goalId=${g.goalId}，rounds=${g.rounds}）`;
++  if (level === GOAL_ALERT_TERMINAL) {
++    return g.state === "complete" ? `codearts 目标已完成：${base}` : `codearts 目标已停止：${base}`;
++  }
++  if (level === GOAL_ALERT_BLOCKED) return `codearts 目标已阻塞，等待人工处理：${base}`;
++  return `codearts 目标连续无进展告警（strikes=${g.strikes}）：${base}`;
++}
++
++/** 轮询定时器宿主（生产=setInterval 30s unref；测试注入手动驱动）。 */
++export interface GoalPollLoop {
++  start(tick: () => void | Promise<void>): void;
++  stop(): void;
++}
++
++/** 生产缺省循环：setInterval + unref（插件存活由宿主进程承载，定时器不得悬挂测试/卸载）。 */
++export function defaultGoalPollLoop(intervalMs: number): GoalPollLoop {
++  let timer: ReturnType<typeof setInterval> | undefined;
++  return {
++    start(tick: () => void | Promise<void>): void {
++      if (timer !== undefined) clearInterval(timer); // 重复 start 先摘旧（幂等）
++      timer = setInterval(() => {
++        void Promise.resolve()
++          .then(tick)
++          .catch((e: unknown) => {
++            // pollOnce 内部已自容错；此处是框架级意外：stderr 可见非静默
++            console.error(`[codearts-bridge] 目标回呼轮询框架异常：${e instanceof Error ? e.message : String(e)}`);
++          });
++      }, intervalMs);
++      (timer as unknown as { unref?: () => void }).unref?.();
++    },
++    stop(): void {
++      if (timer !== undefined) clearInterval(timer);
++      timer = undefined;
++    },
++  };
++}
++
++/** 回呼轮询依赖（R-g3；synthetic/audit 均可缺省失败——尽力通知语义）。 */
++export interface GoalCallbackDeps {
++  cfg: BridgeConfig;
++  fetcher: DaemonFetcher;
++  /** GET /goals 代理（装配层注入；内含 Bearer/token 细节）。 */
++  listGoals: () => Promise<GoalNotifySnapshot[]>;
++  /** goalId → 发起会话映射（goal_start 登记；实例内存，插件重载后即失——尽力通知口径）。 */
++  sessions: ReadonlyMap<string, string>;
++  /** 宿主通知通道（ctx.session.synthetic；缺省=无通道，通知转 skipped 审计）。 */
++  synthetic?: (input: { sessionID: string; text: string }) => Promise<unknown>;
++  /** 审计出口（appendInstallAudit；失败仅 stderr 留痕，不阻塞轮询）。 */
++  audit: (entry: Record<string, unknown>) => Promise<void>;
++  /** 定时器宿主。 */
++  loop: GoalPollLoop;
++}
++
++/**
++ * 目标回呼轮询（R-g3）。**尽力通知，非投递保证**：
++ * - 本实例未发起任何目标（sessions 空）→ 无通知对象，直接跳过网络轮询；
++ * - 每轮拉取 GET /goals，与上次快照按告警级别对比：级别升级才通知（终态/strikes
++ *   首见即终态且为本实例发起 → 通知，覆盖"goal_start 后 30s 内即完成"快路径；
++ *   其余首见仅记基线，防插件重载后对历史终态目标刷屏）；
++ * - 通知走 synthetic（发起会话已知且通道在场）；任何失败（无通道/synthetic 抛错/
++ *   轮询失败/审计失败）仅审计或 stderr 留痕，不阻塞、不重试、不外抛。
++ */
++export function createGoalCallbackLoop(deps: GoalCallbackDeps): {
++  pollOnce(): Promise<void>;
++  stop(): void;
++} {
++  /** goalId → 上次快照告警级别（快照对比的状态基座）。 */
++  const levels = new Map<string, number>();
++  const auditSafe = async (entry: Record<string, unknown>): Promise<void> => {
++    try {
++      await deps.audit(entry);
++    } catch (e) {
++      // 审计写失败不阻塞轮询，但必须可见（禁静默吞错）：stderr 结构化留痕
++      console.error(
++        `[codearts-bridge] 目标回呼审计写入失败：kind=${String(entry["kind"])} reason=${e instanceof Error ? e.message : String(e)}`,
++      );
++    }
++  };
++  async function notify(g: GoalNotifySnapshot, level: number): Promise<void> {
++    const sessionID = deps.sessions.get(g.goalId);
++    if (sessionID === undefined || deps.synthetic === undefined) {
++      // "session 缺失→仅审计"（任务书 Step1）：无投递通道的显式留痕，非静默丢弃
++      await auditSafe({
++        ts: new Date().toISOString(),
++        kind: "goal.notify-skipped",
++        goalId: g.goalId,
++        state: g.state,
++        reason: sessionID === undefined ? "session-unknown" : "synthetic-unavailable",
++      });
++      return;
++    }
++    try {
++      await deps.synthetic({ sessionID, text: goalNotifyText(g, level) });
++      await auditSafe({
++        ts: new Date().toISOString(),
++        kind: "goal.notify",
++        level: "info",
++        goalId: g.goalId,
++        sessionID,
++        state: g.state,
++      });
++    } catch (e) {
++      // 尽力通知失败仅审计不阻塞（R-g3；不重试——重试属守护域监督职责）
++      await auditSafe({
++        ts: new Date().toISOString(),
++        kind: "goal.notify-failed",
++        level: "warn",
++        goalId: g.goalId,
++        sessionID,
++        state: g.state,
++        message: e instanceof Error ? e.message : String(e),
++      });
++    }
++  }
++  async function pollOnce(): Promise<void> {
++    if (deps.sessions.size === 0) return; // 零通知对象：跳过网络（显式语义，见头注）
++    let raw: unknown;
++    try {
++      raw = await deps.listGoals();
++    } catch (e) {
++      await auditSafe({
++        ts: new Date().toISOString(),
++        kind: "goal.poll-failed",
++        level: "warn",
++        message: `目标列表轮询失败（下轮重试）：${e instanceof Error ? e.message : String(e)}`,
++      });
++      return;
++    }
++    if (!Array.isArray(raw)) {
++      // 守护契约破坏（GET /goals 必回数组）：显式审计留痕并跳过本轮，禁静默猜形
++      await auditSafe({
++        ts: new Date().toISOString(),
++        kind: "goal.poll-failed",
++        level: "warn",
++        message: `GET /goals 响应非数组（守护契约破坏）：${JSON.stringify(raw).slice(0, 200)}`,
++      });
++      return;
++    }
++    const next = raw as GoalNotifySnapshot[];
++    for (const g of next) {
++      const prev = levels.get(g.goalId);
++      const level = goalAlertLevel(g.state, g.strikes, deps.cfg.thresholds.strikes);
++      levels.set(g.goalId, level);
++      const firstSeen = prev === undefined;
++      const shouldNotify = firstSeen
++        ? deps.sessions.has(g.goalId) && level === GOAL_ALERT_TERMINAL // 快完成路径（头注）
++        : level > prev!; // 级别升级才通知（恰好一次的关键）
++      if (!shouldNotify) continue;
++      await notify(g, level);
++    }
++  }
++  deps.loop.start(() =>
++    // 返回 Promise 而非 void 启动：可等待的定时器宿主（测试手动 loop）能 await 到
++    // 单轮完成；defaultGoalPollLoop 的 .catch 已兜住框架级意外（pollOnce 内部自容错）
++    pollOnce().catch((e: unknown) => {
++      // 框架级意外（pollOnce 已自容错，理论不可达）：stderr 可见非静默
++      console.error(`[codearts-bridge] 目标回呼轮询框架异常：${e instanceof Error ? e.message : String(e)}`);
++    }),
++  );
++  return {
++    pollOnce,
++    stop: () => deps.loop.stop(),
++  };
++}
++
++/* ───── 六工具定义（schema/摘要/execute；装配经 createGoalTools） ───── */
++
++/* 输入归一助手（与 server.ts 同码两道防线口径：宿主 schema 校验 + execute 内同码复检） */
++
++function inputRecord(raw: unknown): Record<string, unknown> | undefined {
++  if (raw === undefined || raw === null) return undefined;
++  if (typeof raw !== "object" || Array.isArray(raw)) {
++    throw new BridgeError("TOOL_INPUT_INVALID", `工具输入须为 JSON 对象，实际为 ${typeof raw}`);
++  }
++  return raw as Record<string, unknown>;
++}
++
++function optBoolean(input: Record<string, unknown> | undefined, key: string): boolean | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "boolean") {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为布尔值，实际为 ${typeof v}`);
++  }
++  return v;
++}
++
++function optString(input: Record<string, unknown> | undefined, key: string): string | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "string") {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为字符串，实际为 ${typeof v}`);
++  }
++  return v;
++}
++
++function optStringArray(input: Record<string, unknown> | undefined, key: string): string[] | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为字符串数组，实际为 ${JSON.stringify(v)}`);
++  }
++  return v as string[];
++}
++
++function optNonNegativeInt(input: Record<string, unknown> | undefined, key: string): number | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为非负整数，实际为 ${JSON.stringify(v) ?? "undefined"}`);
++  }
++  return v;
++}
++
++function optPositiveInt(input: Record<string, unknown> | undefined, key: string): number | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为正整数，实际为 ${JSON.stringify(v) ?? "undefined"}`);
++  }
++  return v;
++}
++
++/** goalId 归一：类型检查 + 守护同源白名单（requireValidGoalId，路径穿越拒绝面单一真相）。 */
++function requireGoalId(input: Record<string, unknown> | undefined): string {
++  const raw = optString(input, "goalId");
++  if (raw === undefined) {
++    throw new BridgeError("TOOL_INPUT_INVALID", "参数 goalId 须为非空字符串");
++  }
++  return requireValidGoalId(raw);
++}
++
++/* ───── 输入 schema（严格封闭：additionalProperties:false） ───── */
++
++const GOAL_START_INPUT_SCHEMA = {
++  type: "object",
++  properties: {
++    objective: {
++      type: "string",
++      minLength: 1,
++      description: "目标描述（非空；由守护监督的 AI 会话负责跑到底）",
++    },
++    verify: {
++      type: "array",
++      items: { type: "string" },
++      description: "独立验收命令清单（每条须独立执行并通过；缺省无）",
++    },
++    workdir: { type: "string", description: "目标工作目录（绝对路径；缺省随守护）" },
++    maxRounds: { type: "integer", minimum: 1, description: "注入轮次上限（缺省守护默认）" },
++    autoNudge: { type: "boolean", description: "逐目标自动续跑覆盖（缺省随宿主配置）" },
++  },
++  required: ["objective"],
++  additionalProperties: false,
++} as const;
++
++const GOAL_ID_INPUT_SCHEMA = {
++  type: "object",
++  properties: {
++    goalId: { type: "string", minLength: 1, description: "目标 id（codearts_goal_start 返回）" },
++  },
++  required: ["goalId"],
++  additionalProperties: false,
++} as const;
++
++const GOAL_LOGS_INPUT_SCHEMA = {
++  type: "object",
++  properties: {
++    goalId: { type: "string", minLength: 1, description: "目标 id" },
++    cursor: {
++      type: "integer",
++      minimum: 0,
++      description: "续读游标（上次响应 nextCursor 原样回传；缺省从头读）",
++    },
++    limit: { type: "integer", minimum: 1, description: "单页事件上限（缺省 200，上限 1000 由守护裁定）" },
++  },
++  required: ["goalId"],
++  additionalProperties: false,
++} as const;
++
++const GOAL_CONTROL_INPUT_SCHEMA = {
++  type: "object",
++  properties: {
++    goalId: { type: "string", minLength: 1, description: "目标 id" },
++    action: {
++      type: "string",
++      enum: ["pause", "resume", "stop"],
++      description: "pause=暂停注入；resume=注入继续；stop=终态停止",
++    },
++  },
++  required: ["goalId", "action"],
++  additionalProperties: false,
++} as const;
++
++/* ───── 人类可读简报（content[1]） ───── */
++
++function summarizeGoalStart(p: Record<string, any>): string {
++  return `codearts_goal_start：已创建目标 ${p.goalId}（终态/告警将随 30s 轮询尽力通知本会话——非投递保证）`;
++}
++
++function summarizeGoalStatus(p: Record<string, any>): string {
++  return `codearts_goal_status：目标 ${p.goalId} phase=${p.phase} rounds=${p.rounds} strikes=${p.strikes}`;
++}
++
++function summarizeGoalList(p: Record<string, any>): string {
++  const items = Array.isArray(p) ? (p as Array<Record<string, any>>) : [];
++  const head = items.slice(0, 8).map((g) => `${g.goalId}:${g.state}`).join(", ");
++  return `codearts_goal_list：共 ${items.length} 个目标${items.length > 0 ? ` [${head}${items.length > 8 ? ", …" : ""}]` : ""}`;
++}
++
++function summarizeGoalLogs(p: Record<string, any>): string {
++  const n = Array.isArray(p.events) ? p.events.length : 0;
++  return `codearts_goal_logs：返回 ${n} 条事件，nextCursor=${p.nextCursor}（续读请原样回传）`;
++}
++
++function summarizeGoalControl(p: Record<string, any>): string {
++  const st = (p.state ?? {}) as Record<string, any>;
++  return `codearts_goal_control：目标 ${st.goalId} → phase=${st.phase}`;
++}
++
++function summarizeDaemonStatus(p: Record<string, any>): string {
++  return `codearts_daemon_status：守护运行中 version=${p.version} uptime=${Math.round(Number(p.uptime ?? 0))}s 活跃目标=${p.actives}`;
++}
++
++/* ───── 装配入口 ───── */
++
++/** wrap 函数形态（server.ts wrapTool 的柯里化出口；类型自 server.ts 结构引用）。 */
++export type GoalToolWrap = (
++  tool: string,
++  summarize: (payload: Record<string, any>) => string,
++  body: (input: Record<string, unknown> | undefined, ctx: ToolCtxLike) => Promise<unknown>,
++) => BridgeToolDef["execute"];
++
++/** createGoalTools 依赖（server.ts createTools 装配时注入同一 cfg/fetcher/会话表）。 */
++export interface GoalToolDeps {
++  cfg: BridgeConfig;
++  fetcher: DaemonFetcher;
++  /** goalId → 发起会话映射（goal_start 写、回呼轮询读；server.ts 装配层持有同一实例）。 */
++  sessions: Map<string, string>;
++  /** server.ts 的 wrapTool 柯里化（R-t1 统一出口复用）。 */
++  wrap: GoalToolWrap;
++}
++
++/** proxy 调用薄封装（六工具共用；path 由各工具按守护 API 契约拼装）。 */
++function proxy(deps: GoalToolDeps, args: { method: "GET" | "POST"; path: string; body?: unknown }): Promise<unknown> {
++  return daemonRequest({ cfg: deps.cfg, fetcher: deps.fetcher }, args);
++}
++
++/**
++ * 构造六目标域工具（T3-06）：goal_start/status/list/logs/control + daemon_status。
++ * 全部经 daemonRequest 薄代理（R-g1）；业务校验/状态机在守护侧，本层只做输入
++ * 归一（两道防线同码）与 goalId 路径安全白名单（与守护同源）。
++ */
++export function createGoalTools(deps: GoalToolDeps): BridgeToolDef[] {
++  const goalStartTool: BridgeToolDef = {
++    name: "goal_start",
++    description:
++      "创建守护监督目标（POST /goals）：objective 由守护监督的 AI 会话跑到底（停滞自动续跑、" +
++      "会话死重建续跑、verify 命令双过验收）。返回 {goalId}；本会话 id 自动随请求透传守护" +
++      "（initiatedBy），并登记回呼通知——目标终态/告警将经 30s 轮询尽力通知本会话（非投递保证，" +
++      "可用 codearts_goal_status 主动查）。需要守护进程在跑（否则返回 DAEMON_UNAVAILABLE 与启动指引）。" +
++      "非管理动作，无需权限。",
++    input: GOAL_START_INPUT_SCHEMA,
++    options: { namespace: "codearts" },
++    execute: deps.wrap("goal_start", summarizeGoalStart, async (input, ctx) => {
++      const objective = optString(input, "objective");
++      if (objective === undefined || objective.trim().length === 0) {
++        throw new BridgeError("TOOL_INPUT_INVALID", "参数 objective 须为非空字符串");
++      }
++      const verify = optStringArray(input, "verify");
++      const workdir = optString(input, "workdir");
++      const maxRounds = optPositiveInt(input, "maxRounds");
++      const autoNudge = optBoolean(input, "autoNudge");
++      const payload = (await proxy(deps, {
++        method: "POST",
++        path: "/goals",
++        body: {
++          objective,
++          ...(verify !== undefined ? { verify } : {}),
++          ...(workdir !== undefined ? { workdir } : {}),
++          ...(maxRounds !== undefined ? { maxRounds } : {}),
++          ...(autoNudge !== undefined ? { autoNudge } : {}),
++          initiatedBy: ctx.sessionID, // R-g4：发起会话透传（守护 parseCreateInput 前向容忍未知字段）
++        },
++      })) as Record<string, unknown>;
++      const goalId = payload["goalId"];
++      if (typeof goalId !== "string" || goalId.length === 0) {
++        // 守护契约破坏（POST /goals 必回 goalId）：显式报错，禁猜禁兜底
++        throw new BridgeError(
++          "DAEMON_RESPONSE_INVALID",
++          `POST /goals 响应缺 goalId：${JSON.stringify(payload).slice(0, 200)}`,
++        );
++      }
++      deps.sessions.set(goalId, ctx.sessionID); // R-g3：本地登记发起会话（回呼通知目标）
++      return payload;
++    }),
++  };
++
++  const goalStatusTool: BridgeToolDef = {
++    name: "goal_status",
++    description:
++      "查询单个目标完整状态（GET /goals/:id，透传守护）：phase(active/paused/blocked/complete/stopped)、" +
++      "rounds、strikes、steps、session 引用等。在册目标实时、终态目标读盘。非管理动作，无需权限。",
++    input: GOAL_ID_INPUT_SCHEMA,
++    options: { namespace: "codearts" },
++    execute: deps.wrap("goal_status", summarizeGoalStatus, async (input) => {
++      const goalId = requireGoalId(input);
++      return await proxy(deps, { method: "GET", path: `/goals/${goalId}` });
++    }),
++  };
++
++  const goalListTool: BridgeToolDef = {
++    name: "goal_list",
++    description:
++      "列出全部目标摘要（GET /goals，磁盘全生命周期视图）：[{goalId, state, rounds, strikes, " +
++      "objective(≤120字)}]。非管理动作，无需权限。",
++    input: { type: "object", properties: {}, additionalProperties: false } as const,
++    options: { namespace: "codearts" },
++    execute: deps.wrap("goal_list", summarizeGoalList, async () => {
++      return await proxy(deps, { method: "GET", path: "/goals" });
++    }),
++  };
++
++  const goalLogsTool: BridgeToolDef = {
++    name: "goal_logs",
++    description:
++      "分页读取目标审计流（GET /goals/:id/logs?cursor=，顺序稳定分页）：events 为追加序审计事件" +
++      "（每条含 seq），nextCursor 为续读游标（原样回传即不重不漏）。非管理动作，无需权限。",
++    input: GOAL_LOGS_INPUT_SCHEMA,
++    options: { namespace: "codearts" },
++    execute: deps.wrap("goal_logs", summarizeGoalLogs, async (input) => {
++      const goalId = requireGoalId(input);
++      const cursor = optNonNegativeInt(input, "cursor");
++      const limit = optPositiveInt(input, "limit");
++      const query =
++        cursor !== undefined || limit !== undefined
++          ? `?${[...(cursor !== undefined ? [`cursor=${cursor}`] : []), ...(limit !== undefined ? [`limit=${limit}`] : [])].join("&")}`
++          : "";
++      return await proxy(deps, { method: "GET", path: `/goals/${goalId}/logs${query}` });
++    }),
++  };
++
++  const goalControlTool: BridgeToolDef = {
++    name: "goal_control",
++    description:
++      "控制目标（POST /goals/:id/control，即时生效）：pause=暂停注入（此后不再驱动）；" +
++      "resume=注入继续并转 active；stop=终态停止。blocked（等人工）目标 pause 显式 409。" +
++      "返回 {state}。非管理动作，无需权限。",
++    input: GOAL_CONTROL_INPUT_SCHEMA,
++    options: { namespace: "codearts" },
++    execute: deps.wrap("goal_control", summarizeGoalControl, async (input) => {
++      const goalId = requireGoalId(input);
++      const action = optString(input, "action");
++      if (action !== "pause" && action !== "resume" && action !== "stop") {
++        throw new BridgeError(
++          "TOOL_INPUT_INVALID",
++          `参数 action 须为 pause/resume/stop 之一，实际为 ${JSON.stringify(action ?? null)}`,
++        );
++      }
++      return await proxy(deps, { method: "POST", path: `/goals/${goalId}/control`, body: { action } });
++    }),
++  };
++
++  const daemonStatusTool: BridgeToolDef = {
++    name: "daemon_status",
++    description:
++      "守护进程健康（GET /health，免鉴权端点透传）：{ok, version, uptime, actives}。守护未运行时" +
++      "显式返回 DAEMON_UNAVAILABLE 与启动指引（codearts-bridge daemon）——不静默假装、不自动启动。" +
++      "非管理动作，无需权限。",
++    input: { type: "object", properties: {}, additionalProperties: false } as const,
++    options: { namespace: "codearts" },
++    execute: deps.wrap("daemon_status", summarizeDaemonStatus, async () => {
++      return await proxy(deps, { method: "GET", path: "/health" });
++    }),
++  };
++
++  return [goalStartTool, goalStatusTool, goalListTool, goalLogsTool, goalControlTool, daemonStatusTool];
++}
+diff --git a/plugins/codearts-bridge/src/server.ts b/plugins/codearts-bridge/src/server.ts
+index 6affeeec1e..8775588535 100644
+--- a/plugins/codearts-bridge/src/server.ts
++++ b/plugins/codearts-bridge/src/server.ts
+@@ -1,46 +1,53 @@
+ /**
+  * codearts-bridge opencode 插件入口与 M1 工具接线（T1-08）+ M2 run 工具（T2-05）。
+  *
+  * 职责边界：插件定义、管理工具的注册与编排（薄编排层）；
+  * 安装探测/修复/升级/健康/治理的业务逻辑全部在 src/core/*（T1-02~T1-07），
+  * run 工具的传输选择/单轮运行/超时取消/审计编排全部在 src/core/run.ts（T2-05），
+  * 本文件不做任何业务判断——只做 参数归一 → 权限门 → 调 core → 结构化返回。
+  *
+- * 工具集（全部经 T1-02~T1-07、T2-05 模块接线；对外有效名 = namespace + "_" + name）：
++ * 工具集（全部经 T1-02~T1-07、T2-05、T3-06 模块接线；对外有效名 = namespace + "_" + name）：
+  * - codearts_status            → probeInstall + readAksk + collectHealth 摘要 + 传输/守护状态
+  * - codearts_repair            → 权限门 → probeInstall 幂等检查（R-t3）→ repairInstall → ensureBackup
+  * - codearts_upgrade           → 权限门 → upgradeInstall（fetcher/extract 可注入）
+  * - codearts_health            → collectHealth 快照（真实环境全量扫日志，实测约 14s/次，见 health.ts 头注）
+  * - codearts_hygiene({apply?}) → planHygiene（只读）→ apply=true 时权限门 → applyHygiene
+  * - codearts_run({prompt,...}) → runOnce（R-cr1 传输选择/R-cr2 超时/R-cr3 进度取消/R-cr4 审计；run 非管理动作，不设权限门）
++ * - codearts_goal_start/status/list/logs/control → 守护 HTTP 薄代理（T3-06 R-g1/R-g2；
++ *   领域实现在 goal-tools.ts——server.ts 行数纪律下的独立文件，归属裁决见其头注）
++ * - codearts_daemon_status     → GET /health 透传；不可达显式 DAEMON_UNAVAILABLE + 启动指引
++ * - 目标回呼轮询（T3-06 R-g3）：setup 注册 30s 轮询、unload 清理；目标终态/告警 →
++ *   ctx.session.synthetic 尽力通知（非投递保证；失败仅审计）
+  *
+  * 主控裁定落点（SDD 2026-10-31，逐条）：
+  * - R-t1（错误以 content 返回）：工具 execute 的业务错误不抛裸异常——统一经
+  *   toErrorPayload 以 { error:{code,message,remediation?} } 结构化进 content；
+  *   BridgeError 映射自身字段；未知异常 → code="INTERNAL" 并尽力写一条
+  *   tool.internal-error 审计警告（审计失败不掩盖返回给调用方的结构化错误，
+  *   与 upgrade.ts 失败审计同纪律）。宿主侧 schema 校验失败由宿主自行报错，
+  *   不在本层伪造兜底。
+  * - R-t2（权限门）：repair / upgrade / hygiene(apply=true) 必须先经
+  *   permission.assert({sessionID, agent, action:"codearts.manage",
+  *   resources, save, source:{type:"tool",messageID,id}})；resources/save：
+  *   repair/upgrade→["install"]，hygiene→["state"]。被拒 → 捕获断言错误并
+  *   以 PERMISSION_DENIED 结构化 content 返回、绝不执行（宿主文档建议 rethrow，
+  *   本裁定显式选择结构化返回：AI 调用方可见拒绝原因并可引导用户授权，裁定优先）。
+  *   permission 域缺失（非宿主调用）→ PERMISSION_GATE_UNAVAILABLE 显式报错，
+  *   禁止任何"跳过权限"的静默旁路。
+  * - R-t3（repair 幂等）：bin 健康（present ∧ 未漂移 ∧ 备份有效）时返回
+  *   already-healthy 结构化结果（非错误）；显式 fixAutoupdate 请求在幂等路径
+  *   同样生效（fixAutoupdateFlag 独立审计，透传不丢弃）；无备份场景的
+  *   BIN_MISSING_NO_BACKUP 由 repairInstall 抛出、经 R-t1 以 content 返回。
+- * - R-t6（文件组织）：本文件单文件实现六工具（约 750 行），远低于 1000 行红线。
++ * - R-t6（文件组织）：M1 六工具 + M2 run 单文件实现（约 750 行）；T3-06 目标域
++ *   六工具与回呼轮询独立成 goal-tools.ts（server.ts 行数纪律 ≤1000，裁决先例
++ *   同 T1-05 upgrade.ts），本文件只做装配。
+  *
+  * 可注入依赖（ToolDeps，测试与宿主两种装配路径）：
+  * - 生产：default 导出 buildPlugin()——config 取 loadConfig()（环境变量/默认值），
+  *   permission 取宿主注入的 context.permission；
+  * - 测试：buildPlugin(deps) 注入 configOverrides/exec/fetcher/extract/kernelDataDir，
+  *   配合 fake ctx（捕获 editor + fake permission）直调 execute，绝不触碰真实 HOME、
+  *   绝不联网、绝不真跑 codearts 二进制。
+  *
+  * 宿主契约（@opencode/plugin 2.2.3，实测 dist 类型）：
+  * - Plugin.define({ id, setup })；setup(context) 内经 context.tool.transform 拿到
+@@ -70,38 +77,47 @@ import { appendInstallAudit } from "./core/install";
+ import { httpFetcher, upgradeInstall } from "./core/upgrade";
+ import type { Fetcher } from "./core/upgrade";
+ import {
+   defaultBuildTransport,
+   defaultRunClock,
+   probeTmuxAvailable,
+   runOnce,
+ } from "./core/run";
+ import type { RunClock, TransportSelection } from "./core/run";
+ import type { CodeartsTransport, SessionRef } from "./core/transport/types";
++import {
++  createGoalCallbackLoop,
++  createGoalTools,
++  daemonHttpFetcher,
++  daemonRequest,
++  defaultGoalPollLoop,
++  GOAL_POLL_INTERVAL_MS,
++} from "./goal-tools";
++import type { DaemonFetcher, GoalNotifySnapshot, GoalPollLoop } from "./goal-tools";
+ 
+ /* ───── 工具层类型（最小结构；与宿主类型结构兼容） ───── */
+ 
+ /** 权限门所需的最小结构（@opencode/plugin 2.2.3 PermissionDomain.assert 子集）。 */
+ export interface PermissionGate {
+   assert(input: {
+     sessionID: string;
+     agent?: string;
+     action: string;
+     resources: string[];
+     save?: string[];
+     metadata?: Record<string, unknown>;
+     source?: { type: "tool"; messageID: string; id: string };
+   }): Promise<void>;
+ }
+ 
+-/** 工具执行上下文的 M1 关心子集（宿主 ToolContext 的超集可结构赋值）。 */
+-interface ToolCtxLike {
++/** 工具执行上下文的关心子集（宿主 ToolContext 的超集可结构赋值；goal-tools.ts 复用）。 */
++export interface ToolCtxLike {
+   readonly sessionID: string;
+   readonly agent?: string;
+   readonly messageID: string;
+   readonly id: string;
+   /**
+    * 宿主进度通道（R-cr3；宿主 Tool.Context.progress）。缺省=无进度通道
+    * （非宿主调用/测试），如实跳过——不是静默兜底，是通道缺失的显式语义。
+    */
+   readonly progress?: (update: Record<string, unknown>) => unknown;
+   /**
+@@ -118,22 +134,35 @@ interface ToolTextContent {
+ 
+ /** 本插件工具的统一定义形状（结构兼容宿主 Tool.Info；execute 返回 content）。 */
+ export interface BridgeToolDef {
+   name: string;
+   description: string;
+   input: Record<string, unknown>;
+   options: { namespace: string };
+   execute: (input: unknown, context: ToolCtxLike) => Promise<{ content: ToolTextContent[] }>;
+ }
+ 
+-/** M1 五管理工具 + M2 run 工具名（注册顺序即此顺序；测试逐名精确断言）。 */
+-export const TOOL_NAMES = ["status", "repair", "upgrade", "health", "hygiene", "run"] as const;
++/** M1 五管理工具 + M2 run + T3-06 目标域六工具名（注册顺序即此顺序；测试逐名精确断言）。 */
++export const TOOL_NAMES = [
++  "status",
++  "repair",
++  "upgrade",
++  "health",
++  "hygiene",
++  "run",
++  "goal_start",
++  "goal_status",
++  "goal_list",
++  "goal_logs",
++  "goal_control",
++  "daemon_status",
++] as const;
+ 
+ /** 权限动作名（R-t2 固定值；后续 M2/M3 若需细分再扩，不在 M1 拆分）。 */
+ export const MANAGE_ACTION = "codearts.manage";
+ 
+ /** buildPlugin / createTools 可注入依赖。 */
+ export interface ToolDeps {
+   /** 显式配置覆盖（测试注入 fixture 路径；生产可由 opencode options 同名键覆盖）。 */
+   configOverrides?: Partial<BridgeConfig>;
+   /** 命令执行抽象（缺省 createNodeExec；测试注入 fake，绝不真跑二进制）。 */
+   exec?: Exec;
+@@ -144,20 +173,35 @@ export interface ToolDeps {
+   /** 内核数据目录（R-h3/R-hy5 传参口径；缺省 collectHealth 内部默认）。 */
+   kernelDataDir?: string;
+   /** 权限域（生产由宿主 context.permission 注入；缺省时管理工具显式报错，见 R-t2）。 */
+   permission?: PermissionGate;
+   /** 传输工厂（缺省 defaultBuildTransport；测试注入 FakeTransport，绝不 spawn）。 */
+   buildTransport?: (sel: TransportSelection) => CodeartsTransport;
+   /** tmux 可用性探测（缺省 probeTmuxAvailable；测试注入确定性结果）。 */
+   tmuxProbe?: () => Promise<boolean>;
+   /** run 时钟（缺省 defaultRunClock；测试注入 FakeClock 确定性驱动超时/节流）。 */
+   clock?: RunClock;
++  /**
++   * 守护 HTTP 客户端（T3-06 R-g1；缺省 daemonHttpFetcher=全局 fetch；测试注入
++   * fake 绝不联网）。目标域六工具与回呼轮询共用同一注入点。
++   */
++  daemonFetch?: DaemonFetcher;
++  /**
++   * goalId → 发起会话映射（T3-06 R-g3/R-g4；goal_start 写、回呼轮询读）。
++   * 缺省内部新建 Map——buildPlugin 装配时显式传入同一实例给工具与轮询（测试
++   * 注入共享 Map 以断言登记/通知目标）。
++   */
++  goalSessions?: Map<string, string>;
++  /** 目标回呼轮询定时器宿主（缺省 defaultGoalPollLoop(30s, unref)；测试注入手动驱动）。 */
++  goalPollLoop?: GoalPollLoop;
++  /** 目标回呼轮询周期毫秒（缺省 GOAL_POLL_INTERVAL_MS=30000；仅注入 loop 时有意义）。 */
++  goalPollIntervalMs?: number;
+ }
+ 
+ /* ───── content 装配（R-t1） ───── */
+ 
+ function textContent(text: string): ToolTextContent {
+   return { type: "text", text };
+ }
+ 
+ /** 统一成功出口：content[0]=JSON 摘要（机器），content[1]=人类可读中文简报。 */
+ function toolOk(payload: unknown, human: string): { content: ToolTextContent[] } {
+@@ -465,20 +509,24 @@ function configOverridesFromOptions(options: unknown): Partial<BridgeConfig> {
+  *   修复本身已留 repair 审计）。
+  * - hygiene：先 planHygiene（纯只读），apply=true 才过权限门并 applyHygiene(同一条计划)
+  *   （R-hy4 执行清单=计划清单由 applyHygiene 的清单执行语义保证）。
+  */
+ export function createTools(deps: ToolDeps = {}): BridgeToolDef[] {
+   const cfg = loadConfig(deps.configOverrides ?? {});
+   const exec = deps.exec ?? createNodeExec();
+   const fetcher = deps.fetcher ?? httpFetcher;
+   const permission = deps.permission;
+   const kernelDataDir = deps.kernelDataDir;
++  // T3-06：目标域共享装配（会话表由 buildPlugin 显式传入；直调 createTools 的测试
++  // 场景缺省内部新建——与回呼轮询隔离，仅工具自身登记仍可测）
++  const goalSessions = deps.goalSessions ?? new Map<string, string>();
++  const daemonFetcher = deps.daemonFetch ?? daemonHttpFetcher;
+   // R-h3/R-hy5：kernelDataDir 传参口径——未注入时交由 core 层默认（真实 HOME 口径）
+   const healthOpts = (): { kernelDataDir?: string } =>
+     kernelDataDir !== undefined ? { kernelDataDir } : {};
+   const wrap = (
+     tool: string,
+     summarize: (payload: Record<string, any>) => string,
+     body: (input: Record<string, unknown> | undefined, ctx: ToolCtxLike) => Promise<unknown>,
+   ): BridgeToolDef["execute"] => wrapTool(tool, summarize, body, { cfg });
+ 
+   const statusTool: BridgeToolDef = {
+@@ -514,21 +562,21 @@ export function createTools(deps: ToolDeps = {}): BridgeToolDef[] {
+           logsBytes: health.logs.bytes,
+           lastErrorsCount: health.lastErrors.length,
+           kernelRssFromLog: health.kernelRssFromLog,
+           rssBytes: health.rssBytes,
+         },
+         transport: {
+           configured: cfg.transport,
+           ptyHost: cfg.ptyHost,
+           daemonUrl: cfg.daemonUrl,
+           connected: false,
+-          note: "run 工具按轮构建传输（R-cr1 选择）；daemon 常驻通道为 M3 任务占位，尚未接入（connected=false 为如实状态）",
++          note: "run 工具按轮构建传输（R-cr1 选择）；目标域工具经守护 HTTP 薄代理（T3-06，daemonUrl）；daemon 常驻通道仍未接入（connected=false 为如实状态）",
+         },
+       };
+     }),
+   };
+ 
+   const repairTool: BridgeToolDef = {
+     name: "repair",
+     description:
+       "自愈修复 codearts CLI 安装：从有效备份原子恢复二进制（校验→部署→复验→审计），" +
+       "可选 fixAutoupdate 显式关停自动升级。二进制健康时幂等返回 already-healthy（非错误）。" +
+@@ -664,21 +712,29 @@ export function createTools(deps: ToolDeps = {}): BridgeToolDef[] {
+         ...(ctx.progress !== undefined ? { progress: (u: { status: string }) => ctx.progress!(u) } : {}),
+         ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
+         ...(deps.buildTransport !== undefined ? { buildTransport: deps.buildTransport } : {}),
+         ...(deps.tmuxProbe !== undefined ? { tmuxProbe: deps.tmuxProbe } : {}),
+         ...(deps.clock !== undefined ? { clock: deps.clock } : {}),
+         ...(kernelDataDir !== undefined ? { kernelDataDir } : {}), // R-p2 日志源传参口径
+       });
+     }),
+   };
+ 
+-  return [statusTool, repairTool, upgradeTool, healthTool, hygieneTool, runTool];
++  // T3-06：目标域六工具（守护薄代理 R-g1/R-g2；领域校验在守护侧，本层只装配）
++  const goalTools = createGoalTools({
++    cfg,
++    fetcher: daemonFetcher,
++    sessions: goalSessions,
++    wrap,
++  });
++
++  return [statusTool, repairTool, upgradeTool, healthTool, hygieneTool, runTool, ...goalTools];
+ }
+ 
+ /* ───── 插件装配 ───── */
+ 
+ /**
+  * 构建插件定义（deps 注入点）。生产用 default 导出（无 deps）；
+  * 测试注入 fake 依赖并配合 fake ctx（捕获 editor + fake permission）直调 execute。
+  */
+ export function buildPlugin(deps: ToolDeps = {}): Plugin.Plugin {
+   return Plugin.define({
+@@ -694,37 +750,69 @@ export function buildPlugin(deps: ToolDeps = {}): Plugin.Plugin {
+       if (typeof transform !== "function") {
+         throw new Error(
+           `[codearts-bridge] 插件上下文不兼容：缺少 context.tool.transform` +
+             `（插件 id=${PLUGIN_ID}）。期望契约：opencode V2 插件 API` +
+             `（@opencode/plugin 2.x）注入的 setup(context) 须提供 context.tool.transform；` +
+             `当前宿主版本过旧或插件加载路径错误，拒绝注册工具。`,
+         );
+       }
+ 
+       // 权限域来自宿主上下文（R-t2）；配置覆盖优先级：deps（测试）> opencode options > env > 默认值
++      // R-g3/R-g4：会话表单实例共享——goal_start 写、回呼轮询读（deps 未注入时
++      // 此处新建并下发，杜绝"工具与轮询各持一份"的分裂）
++      const goalSessions = deps.goalSessions ?? new Map<string, string>();
+       const tools = createTools({
+         ...deps,
+         configOverrides: {
+           ...(deps.configOverrides ?? {}),
+           ...configOverridesFromOptions(context.options),
+         },
++        goalSessions,
+         permission: context.permission as PermissionGate | undefined,
+       });
+ 
+       const registration = await transform((editor) => {
+         for (const tool of tools) {
+           editor.add(tool as Parameters<typeof editor.add>[0]);
+         }
+       });
+ 
+-      // 把宿主返回的注册句柄转交为清理回调，供宿主卸载插件时释放
+-      if (registration) {
+-        return async () => {
++      // R-g3 目标回呼轮询：setup 注册、unload 清理（见 goal-tools.ts 头注）。
++      // 宿主 session 域缺失（测试/非宿主上下文）→ 无通知通道，通知转 skipped 审计
++      //（显式语义，非静默兜底）；配置与工具层同一覆盖口径（纯函数二次解析）。
++      const pollCfg = loadConfig({
++        ...(deps.configOverrides ?? {}),
++        ...configOverridesFromOptions(context.options),
++      });
++      const pollFetcher = deps.daemonFetch ?? daemonHttpFetcher;
++      const hostSynthetic = context.session?.synthetic;
++      const callback = createGoalCallbackLoop({
++        cfg: pollCfg,
++        fetcher: pollFetcher,
++        listGoals: async () =>
++          (await daemonRequest({ cfg: pollCfg, fetcher: pollFetcher }, {
++            method: "GET",
++            path: "/goals",
++          })) as GoalNotifySnapshot[],
++        sessions: goalSessions,
++        synthetic:
++          hostSynthetic !== undefined
++            ? (input: { sessionID: string; text: string }) => hostSynthetic(input)
++            : undefined,
++        audit: (entry: Record<string, unknown>) => appendInstallAudit(pollCfg, entry),
++        loop: deps.goalPollLoop ?? defaultGoalPollLoop(deps.goalPollIntervalMs ?? GOAL_POLL_INTERVAL_MS),
++      });
++
++      // 宿主卸载：停轮询（R-g3 unload 清理）+ 释放注册句柄；恒返回清理函数
++      //（即使 registration 缺席，轮询定时器也必须被摘除）
++      return async () => {
++        callback.stop();
++        if (registration) {
+           await registration.dispose();
+-        };
+-      }
++        }
++      };
+     },
+   });
+ }
+ 
+ /** 生产入口：配置取环境变量/默认值，权限域在 setup 时从宿主上下文接线。 */
+ export default buildPlugin();
+diff --git a/plugins/codearts-bridge/test/goal-tools.test.ts b/plugins/codearts-bridge/test/goal-tools.test.ts
+new file mode 100644
+index 0000000000..f50ef8aab5
+--- /dev/null
++++ b/plugins/codearts-bridge/test/goal-tools.test.ts
+@@ -0,0 +1,504 @@
++/**
++ * 插件目标工具与回呼测试（T3-06，TDD）。
++ *
++ * 覆盖（任务书 Step1 + 主控裁定 R-g1..R-g4，逐条）：
++ * - R-g1（薄代理）：goal_start/status/list/logs/control 经 daemonUrl HTTP 代理守护
++ *   API（Bearer daemon-token）；守护结构化错误（含 501 GOAL_HOST_DISABLED）原样
++ *   透传（code/message/remediation 三字段经 R-t1 出口落 content）；
++ * - R-g2（不可达显式）：fetch 失败（ECONNREFUSED/超时/token 缺失）→
++ *   DAEMON_UNAVAILABLE（remediation 含 `codearts-bridge daemon` 启动指引）；
++ *   无静默兜底、不自动启动守护；
++ * - R-g3（回呼尽力通知）：轮询 30s（setup 注册、unload 清理）；目标终态/告警
++ *   （对比上次快照）→ ctx.session.synthetic 恰好一次；session 缺失→仅审计；
++ *   通知失败仅审计不阻塞；
++ * - R-g4（会话绑定）：goal_start 把发起 sessionID 以 initiatedBy 透传守护请求体。
++ *
++ * 隔离：daemonFetch 注入 fake（绝不联网）；goalPollLoop 注入手动驱动（绝不真等
++ * 30s）；stateDir 为工作目录内 .tmp/（用后即删）；绝不触碰真实 HOME。
++ */
++import { afterEach, describe, expect, it } from "bun:test";
++import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import * as path from "node:path";
++import { buildPlugin } from "../src/server";
++import { GOAL_POLL_INTERVAL_MS } from "../src/goal-tools";
++import type { DaemonFetcher, GoalPollLoop } from "../src/goal-tools";
++
++/* ───── 测试环境装配 ───── */
++
++/** 测试用临时根（工作目录内 .tmp/，afterEach 统一清理，禁系统临时目录）。 */
++const TMP_ROOT = path.join(import.meta.dir, ".tmp", "t19");
++mkdirSync(TMP_ROOT, { recursive: true });
++
++let root: string | undefined;
++let seq = 0;
++
++/** 每用例独立目录（含 state/；token 由用例按需写入）。 */
++function makeRoot(): { root: string; stateDir: string } {
++  seq += 1;
++  const r = path.join(TMP_ROOT, `case-${seq}`);
++  const stateDir = path.join(r, "state");
++  mkdirSync(stateDir, { recursive: true });
++  root = r;
++  return { root: r, stateDir };
++}
++
++afterEach(() => {
++  if (root !== undefined) rmSync(root, { recursive: true, force: true });
++  root = undefined;
++});
++
++/** 写入 daemon-token（守护首启产物的最小替身；readDaemonToken 按同一路径约定读取）。 */
++function writeToken(stateDir: string, token = "test-token"): void {
++  writeFileSync(path.join(stateDir, "daemon-token"), token, "utf8");
++}
++
++/** 一次守护 HTTP 调用的捕获记录（只取断言关心的字段）。 */
++interface RecordedCall {
++  url: string;
++  method: string;
++  authorization?: string;
++  contentType?: string;
++  bodyText?: string;
++}
++
++/** fake 守护响应器：输入捕获调用、输出 {status, body}；抛错=模拟连接失败。 */
++type FakeResponder = (call: RecordedCall) => { status: number; body: unknown };
++
++/** 注入式 fake fetch（捕获 URL/method/头/体；绝不联网）。 */
++function makeFakeDaemon(respond: FakeResponder): { fetcher: DaemonFetcher; calls: RecordedCall[] } {
++  const calls: RecordedCall[] = [];
++  const fetcher: DaemonFetcher = async (url, init) => {
++    const rec: RecordedCall = {
++      url,
++      method: init.method,
++      authorization: init.headers["Authorization"],
++      contentType: init.headers["Content-Type"],
++      bodyText: init.body,
++    };
++    calls.push(rec);
++    return { status: respond(rec).status, json: async () => respond(rec).body };
++  };
++  return { fetcher, calls };
++}
++
++/** add 被调用时捕获到的工具信息（同 server.test.ts 口径）。 */
++interface CapturedTool {
++  name: string;
++  options?: { namespace?: string };
++  execute: (input: unknown, context: unknown) => Promise<unknown>;
++}
++
++type SyntheticSpy = (input: { sessionID: string; text: string }) => Promise<unknown>;
++
++/** 带 session 域的 fake 宿主上下文（synthetic 缺省=宿主未提供通知通道）。 */
++function makeFakeContext(opts: { synthetic?: SyntheticSpy } = {}): { ctx: unknown; added: CapturedTool[] } {
++  const added: CapturedTool[] = [];
++  const ctx = {
++    options: {},
++    permission: undefined,
++    ...(opts.synthetic !== undefined ? { session: { synthetic: opts.synthetic } } : {}),
++    tool: {
++      transform: async (cb: (editor: unknown) => void) => {
++        cb({
++          add: (tool: CapturedTool) => {
++            added.push(tool);
++          },
++        });
++        return { dispose: async () => {} };
++      },
++    },
++  };
++  return { ctx, added };
++}
++
++function asHostContext(ctx: unknown): Parameters<ReturnType<typeof buildPlugin>["setup"]>[0] {
++  return ctx as Parameters<ReturnType<typeof buildPlugin>["setup"]>[0];
++}
++
++/** 手动驱动的轮询循环（R-g3 测试缝：不依赖真实 30s 定时器）。 */
++interface ManualLoop extends GoalPollLoop {
++  readonly started: boolean;
++  readonly stopped: boolean;
++  fire(): Promise<void>;
++}
++
++function makeManualLoop(): ManualLoop {
++  let tick: (() => void | Promise<void>) | undefined;
++  const flags = { started: false, stopped: false };
++  return {
++    start(t) {
++      tick = t;
++      flags.started = true;
++    },
++    stop() {
++      flags.stopped = true;
++      tick = undefined;
++    },
++    get started() {
++      return flags.started;
++    },
++    get stopped() {
++      return flags.stopped;
++    },
++    async fire() {
++      await tick?.();
++    },
++  };
++}
++
++/** 插件测试夹具：隔离配置 + fake fetch + 共享会话表 + 手动轮询循环。 */
++interface Harness {
++  stateDir: string;
++  added: CapturedTool[];
++  sessions: Map<string, string>;
++  calls: RecordedCall[];
++  loop: ManualLoop;
++  cleanup: () => Promise<void>;
++  tool(name: string): CapturedTool;
++}
++
++async function makeHarness(opts: {
++  respond: FakeResponder;
++  synthetic?: SyntheticSpy;
++  writeTokenFile?: boolean;
++}): Promise<Harness> {
++  const { root: r, stateDir } = makeRoot();
++  if (opts.writeTokenFile !== false) writeToken(stateDir);
++  const sessions = new Map<string, string>();
++  const loop = makeManualLoop();
++  const { fetcher, calls } = makeFakeDaemon(opts.respond);
++  const plugin = buildPlugin({
++    configOverrides: {
++      stateDir,
++      installDir: path.join(r, "installers"),
++      daemonUrl: "http://127.0.0.1:4599",
++    },
++    daemonFetch: fetcher,
++    goalSessions: sessions,
++    goalPollLoop: loop,
++  });
++  const { ctx, added } = makeFakeContext({ synthetic: opts.synthetic });
++  const cleanup = await plugin.setup(asHostContext(ctx));
++  return {
++    stateDir,
++    added,
++    sessions,
++    calls,
++    loop,
++    cleanup: async () => {
++      await cleanup?.();
++    },
++    tool: (name) => {
++      const t = added.find((x) => x.name === name);
++      expect(t).toBeDefined();
++      return t!;
++    },
++  };
++}
++
++/** 执行工具并解析 content[0] 的机器可读 JSON（R-t1 统一出口）。 */
++async function executeJson(
++  tool: CapturedTool,
++  input: unknown,
++  sessionID = "ses_origin",
++): Promise<Record<string, unknown>> {
++  const result = (await tool.execute(input, {
++    sessionID,
++    agent: "build",
++    messageID: "msg-1",
++    id: "call-1",
++  })) as { content: Array<{ type: string; text: string }> };
++  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
++}
++
++/** 读审计流（<stateDir>/audit/install.jsonl）为对象数组；文件不存在=空数组。 */
++function auditEntries(stateDir: string): Array<Record<string, unknown>> {
++  let text: string;
++  try {
++    text = readFileSync(path.join(stateDir, "audit", "install.jsonl"), "utf8");
++  } catch {
++    return [];
++  }
++  return text
++    .split("\n")
++    .filter((l) => l.trim().length > 0)
++    .map((l) => JSON.parse(l) as Record<string, unknown>);
++}
++
++/* ───── R-g1/R-g2：守护 HTTP 薄代理 ───── */
++
++describe("codearts_goal_* 守护薄代理（R-g1/R-g2）", () => {
++  it("goal_start 代理 POST /goals：Bearer token、R-g4 initiatedBy 透传、返回 goalId 并登记发起会话", async () => {
++    const h = await makeHarness({ respond: () => ({ status: 200, body: { goalId: "gabc-123" } }) });
++    const payload = await executeJson(h.tool("goal_start"), {
++      objective: "修复编译错误",
++      verify: ["bun test"],
++    });
++    expect(payload.goalId).toBe("gabc-123");
++    expect(h.calls).toHaveLength(1);
++    const c = h.calls[0]!;
++    expect(c.method).toBe("POST");
++    expect(c.url).toBe("http://127.0.0.1:4599/goals");
++    expect(c.authorization).toBe("Bearer test-token");
++    expect(c.contentType).toBe("application/json");
++    const body = JSON.parse(c.bodyText!) as Record<string, unknown>;
++    expect(body.objective).toBe("修复编译错误");
++    expect(body.verify).toEqual(["bun test"]);
++    expect(body.initiatedBy).toBe("ses_origin"); // R-g4：发起会话透传守护（守护侧前向容忍未知字段）
++    expect(h.sessions.get("gabc-123")).toBe("ses_origin"); // R-g3：本地登记发起会话（回呼通知目标）
++    await h.cleanup();
++  });
++
++  it("daemon 连接失败 → DAEMON_UNAVAILABLE（remediation 含 codearts-bridge daemon 启动指引，R-g2）", async () => {
++    const h = await makeHarness({
++      respond: () => {
++        throw new Error("connect ECONNREFUSED 127.0.0.1:4599");
++      },
++    });
++    const payload = await executeJson(h.tool("goal_start"), { objective: "x" });
++    const err = payload.error as Record<string, unknown>;
++    expect(err.code).toBe("DAEMON_UNAVAILABLE");
++    expect(String(err.message)).toContain("ECONNREFUSED");
++    expect(String(err.remediation)).toContain("codearts-bridge daemon");
++    await h.cleanup();
++  });
++
++  it("守护 501 GOAL_HOST_DISABLED 原样透传（含 remediation，R-g1）", async () => {
++    const h = await makeHarness({
++      respond: () => ({
++        status: 501,
++        body: {
++          error: {
++            code: "GOAL_HOST_DISABLED",
++            message: "守护未挂载目标域宿主（GoalHost），/goals* 端点不可用",
++            remediation: "以 createDaemon(cfg, hooks, goals) 挂载 GoalHost 后启动。",
++          },
++        },
++      }),
++    });
++    const payload = await executeJson(h.tool("goal_list"), {});
++    const err = payload.error as Record<string, unknown>;
++    expect(err.code).toBe("GOAL_HOST_DISABLED");
++    expect(err.message).toBe("守护未挂载目标域宿主（GoalHost），/goals* 端点不可用");
++    expect(err.remediation).toBe("以 createDaemon(cfg, hooks, goals) 挂载 GoalHost 后启动。");
++    await h.cleanup();
++  });
++
++  it("goal_status/list/logs/control 代理路径、查询串与控制体（R-g1）", async () => {
++    const h = await makeHarness({
++      respond: (c) => {
++        if (c.method === "GET" && c.url.endsWith("/goals/g-1")) {
++          return { status: 200, body: { goalId: "g-1", phase: "active", rounds: 2, strikes: 0 } };
++        }
++        if (c.method === "GET" && c.url.endsWith("/goals")) return { status: 200, body: [] };
++        if (c.method === "GET" && c.url.endsWith("/goals/g-1/logs?cursor=3&limit=10")) {
++          return { status: 200, body: { goalId: "g-1", events: [], nextCursor: 3 } };
++        }
++        if (c.method === "GET" && c.url.endsWith("/goals/g-1/logs")) {
++          return { status: 200, body: { goalId: "g-1", events: [], nextCursor: 0 } };
++        }
++        if (c.method === "POST" && c.url.endsWith("/goals/g-1/control")) {
++          return { status: 200, body: { state: { goalId: "g-1", phase: "paused" } } };
++        }
++        throw new Error(`fake daemon 未预期调用：${c.method} ${c.url}`);
++      },
++    });
++    const status = await executeJson(h.tool("goal_status"), { goalId: "g-1" });
++    expect(status.phase).toBe("active");
++
++    const list = await executeJson(h.tool("goal_list"), {});
++    expect(Array.isArray(list)).toBe(true);
++
++    const page = await executeJson(h.tool("goal_logs"), { goalId: "g-1", cursor: 3, limit: 10 });
++    expect(page.nextCursor).toBe(3);
++    const bare = await executeJson(h.tool("goal_logs"), { goalId: "g-1" });
++    expect(bare.nextCursor).toBe(0);
++
++    const ctrl = await executeJson(h.tool("goal_control"), { goalId: "g-1", action: "resume" });
++    const ctrlState = ctrl.state as Record<string, unknown>;
++    expect(ctrlState.phase).toBe("paused");
++    const ctrlCall = h.calls.find((c) => c.url.endsWith("/goals/g-1/control"))!;
++    expect(ctrlCall.method).toBe("POST");
++    expect(JSON.parse(ctrlCall.bodyText!)).toEqual({ action: "resume" });
++    await h.cleanup();
++  });
++
++  it("非法输入就地报错且不发起请求：goalId 路径穿越→GOAL_ID_INVALID、action 非法→TOOL_INPUT_INVALID", async () => {
++    const h = await makeHarness({ respond: () => ({ status: 200, body: {} }) });
++    const badId = await executeJson(h.tool("goal_status"), { goalId: "../etc/passwd" });
++    expect((badId.error as Record<string, unknown>).code).toBe("GOAL_ID_INVALID");
++    const badAction = await executeJson(h.tool("goal_control"), { goalId: "g-1", action: "purge" });
++    expect((badAction.error as Record<string, unknown>).code).toBe("TOOL_INPUT_INVALID");
++    expect(h.calls).toHaveLength(0);
++    await h.cleanup();
++  });
++
++  it("daemon_status 透传 /health 健康载荷", async () => {
++    const h = await makeHarness({
++      respond: (c) => {
++        if (c.method === "GET" && c.url.endsWith("/health")) {
++          return { status: 200, body: { ok: true, version: "dev", uptime: 1.5, actives: 2 } };
++        }
++        throw new Error(`fake daemon 未预期调用：${c.method} ${c.url}`);
++      },
++    });
++    const payload = await executeJson(h.tool("daemon_status"), {});
++    expect(payload.ok).toBe(true);
++    expect(payload.actives).toBe(2);
++    await h.cleanup();
++  });
++
++  it("daemon_status 不可达 → DAEMON_UNAVAILABLE（显式指引，不静默假装，R-g2）", async () => {
++    const h = await makeHarness({
++      respond: () => {
++        throw new Error("connect ECONNREFUSED 127.0.0.1:4599");
++      },
++    });
++    const payload = await executeJson(h.tool("daemon_status"), {});
++    const err = payload.error as Record<string, unknown>;
++    expect(err.code).toBe("DAEMON_UNAVAILABLE");
++    expect(String(err.remediation)).toContain("codearts-bridge daemon");
++    await h.cleanup();
++  });
++
++  it("daemon-token 缺失 → DAEMON_UNAVAILABLE（守护从未启动；消息含 token 路径）", async () => {
++    const h = await makeHarness({
++      respond: () => ({ status: 200, body: {} }),
++      writeTokenFile: false,
++    });
++    const payload = await executeJson(h.tool("goal_list"), {});
++    const err = payload.error as Record<string, unknown>;
++    expect(err.code).toBe("DAEMON_UNAVAILABLE");
++    expect(String(err.message)).toContain("daemon-token");
++    expect(h.calls).toHaveLength(0); // 无 token 时根本不应发起 HTTP
++    await h.cleanup();
++  });
++});
++
++/* ───── R-g3：目标回呼轮询（尽力通知，非投递保证） ───── */
++
++describe("目标回呼轮询（R-g3）", () => {
++  it("GOAL_POLL_INTERVAL_MS 缺省 30s（轮询节拍唯一真相）", () => {
++    expect(GOAL_POLL_INTERVAL_MS).toBe(30000);
++  });
++
++  it("setup 注册轮询、unload 清理（R-g3）", async () => {
++    const h = await makeHarness({ respond: () => ({ status: 200, body: [] }) });
++    expect(h.loop.started).toBe(true);
++    await h.cleanup();
++    expect(h.loop.stopped).toBe(true);
++  });
++
++  it("终态事件后 synthetic 恰好调用一次（快照对比不重复通知）", async () => {
++    let listBody: unknown = [{ goalId: "g-1", state: "active", rounds: 1, strikes: 0, objective: "写文档" }];
++    const synCalls: Array<{ sessionID: string; text: string }> = [];
++    const h = await makeHarness({
++      respond: (c) => {
++        if (c.method === "POST" && c.url.endsWith("/goals")) return { status: 200, body: { goalId: "g-1" } };
++        if (c.method === "GET" && c.url.endsWith("/goals")) return { status: 200, body: listBody };
++        throw new Error(`fake daemon 未预期调用：${c.method} ${c.url}`);
++      },
++      synthetic: async (input) => {
++        synCalls.push(input);
++      },
++    });
++    await executeJson(h.tool("goal_start"), { objective: "写文档" });
++    await h.loop.fire(); // active：记录基线，不通知
++    expect(synCalls).toHaveLength(0);
++    listBody = [{ goalId: "g-1", state: "complete", rounds: 5, strikes: 0, objective: "写文档" }];
++    await h.loop.fire(); // 终态：通知恰一次
++    expect(synCalls).toHaveLength(1);
++    expect(synCalls[0]!.sessionID).toBe("ses_origin");
++    expect(synCalls[0]!.text).toContain("已完成");
++    expect(synCalls[0]!.text).toContain("g-1");
++    await h.loop.fire(); // 仍为终态：不重复通知
++    expect(synCalls).toHaveLength(1);
++    const notify = auditEntries(h.stateDir).find((e) => e["kind"] === "goal.notify");
++    expect(notify).toBeDefined();
++    expect(notify!["goalId"]).toBe("g-1");
++    await h.cleanup();
++  });
++
++  it("session 缺失（goalId 不在会话表）→ 仅审计不通知", async () => {
++    const synCalls: Array<{ sessionID: string; text: string }> = [];
++    let listBody: unknown = [{ goalId: "g-9", state: "active", rounds: 3, strikes: 0, objective: "别处发起的目标" }];
++    const h = await makeHarness({
++      respond: () => ({ status: 200, body: listBody }),
++      synthetic: async (input) => {
++        synCalls.push(input);
++      },
++    });
++    // 会话表非空（保证轮询运行）但不含 g-9：模拟发起实例重载后映射丢失的形态
++    h.sessions.set("g-lost", "ses_gone");
++    await h.loop.fire(); // active：基线
++    expect(synCalls).toHaveLength(0);
++    listBody = [{ goalId: "g-9", state: "blocked", rounds: 3, strikes: 0, objective: "别处发起的目标" }];
++    await h.loop.fire(); // blocked 升级 → 尝试通知 → 会话未知 → 仅审计
++    expect(synCalls).toHaveLength(0);
++    const skipped = auditEntries(h.stateDir).find((e) => e["kind"] === "goal.notify-skipped");
++    expect(skipped).toBeDefined();
++    expect(skipped!["goalId"]).toBe("g-9");
++    expect(skipped!["reason"]).toBe("session-unknown");
++    await h.cleanup();
++  });
++
++  it("本实例未发起任何目标时跳过网络轮询（零通知对象）", async () => {
++    const h = await makeHarness({
++      respond: () => {
++        throw new Error("不应发起任何请求");
++      },
++      synthetic: async () => undefined,
++    });
++    await h.loop.fire();
++    expect(h.calls).toHaveLength(0);
++    await h.cleanup();
++  });
++
++  it("通知失败（synthetic 抛错）→ 仅审计不阻塞，后续目标照常尝试", async () => {
++    let listBody: unknown = [{ goalId: "g-1", state: "complete", rounds: 2, strikes: 0, objective: "A" }];
++    let attempts = 0;
++    const h = await makeHarness({
++      respond: (c) => {
++        if (c.method === "GET" && c.url.endsWith("/goals")) return { status: 200, body: listBody };
++        throw new Error(`fake daemon 未预期调用：${c.method} ${c.url}`);
++      },
++      synthetic: async () => {
++        attempts += 1;
++        throw new Error("session 已关闭");
++      },
++    });
++    h.sessions.set("g-1", "ses_origin");
++    await h.loop.fire();
++    expect(attempts).toBe(1);
++    const failed = auditEntries(h.stateDir).find((e) => e["kind"] === "goal.notify-failed");
++    expect(failed).toBeDefined();
++    expect(String(failed!["message"])).toContain("session 已关闭");
++    listBody = [
++      { goalId: "g-1", state: "complete", rounds: 2, strikes: 0, objective: "A" },
++      { goalId: "g-2", state: "stopped", rounds: 1, strikes: 0, objective: "B" },
++    ];
++    h.sessions.set("g-2", "ses_origin");
++    await h.loop.fire(); // 不阻塞：第二个目标照常尝试通知
++    expect(attempts).toBe(2);
++    await h.cleanup();
++  });
++
++  it("strikes 达阈值告警通知（active 相位、对比快照升级触发）", async () => {
++    let listBody: unknown = [{ goalId: "g-1", state: "active", rounds: 4, strikes: 1, objective: "调参" }];
++    const synCalls: Array<{ sessionID: string; text: string }> = [];
++    const h = await makeHarness({
++      respond: () => ({ status: 200, body: listBody }),
++      synthetic: async (input) => {
++        synCalls.push(input);
++      },
++    });
++    h.sessions.set("g-1", "ses_origin");
++    await h.loop.fire(); // strikes=1 < 阈值 3：基线
++    expect(synCalls).toHaveLength(0);
++    listBody = [{ goalId: "g-1", state: "active", rounds: 4, strikes: 3, objective: "调参" }];
++    await h.loop.fire(); // strikes=3 达阈值：告警通知
++    expect(synCalls).toHaveLength(1);
++    expect(synCalls[0]!.text).toContain("无进展");
++    await h.cleanup();
++  });
++});

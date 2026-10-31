@@ -1,0 +1,1442 @@
+# Review package: 8b7d4a43ba..9b3ea99d74
+
+## Commits
+9b3ea99d74 codearts-bridge(T2-02): script(1) PTY 宿主 — 两段式提交/信号化读取/请求级存活检查 — createScriptTransport(exec,opts) 实现 CodeartsTransport 六方法（契约对齐 types.ts 唯一真相源，observe 扩展 ObserveOptions.kernelDataDir 传参 R-p2）：R-p1 inject=write(text)→注入时钟120ms→write("\r")（窗口期死亡/多行文本显式报错 INJECT_TEXT_MULTILINE）；R-p2 observe 增量 tail <kernelDataDir>/log/kernel-*.log（statSync 同步基线保证确定性、watcher 事件+轮询 tick 双触发、轮转切换/缺失不报错、service= 行转 output 信号、meta.log 如实标注 available/file/serviceLines）；R-p3 abort 立即放弃+残存保留给下一次 observe（与 FakeTransport T9 基准同态）；R-p4 detached+kill(-pid,SIGKILL) 组杀、ESRCH 幂等、family 场景 pid 快照经 /proc argv 级匹配核对全树无残留（子串匹配曾误杀外层 shell 已改元素级判定）；R-p5 PtyChild 注入 seam+nodeScriptSpawnPty 生产实现（argv 数组、PATH 显式探测缺失即 PTY_HOST_UNAVAILABLE、每流独立 StringDecoder R-p6）；进程自然退出产一次性 done 信号；fake-tui.sh fixture 六场景（默认/stall/error/exit/utf8/family）。22 新测试实跑 script(1)+bash fixture（离线），全量 195 绿+typecheck 零错误
+
+## Files changed
+ plugins/codearts-bridge/src/core/transport/fake.ts |   4 +-
+ .../src/core/transport/pty-script.ts               | 624 +++++++++++++++++++++
+ .../codearts-bridge/src/core/transport/types.ts    |  15 +-
+ .../test/fixtures/fake-codearts/fake-tui.sh        |  75 +++
+ .../codearts-bridge/test/transport-script.test.ts  | 600 ++++++++++++++++++++
+ 5 files changed, 1315 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/transport/fake.ts b/plugins/codearts-bridge/src/core/transport/fake.ts
+index 58fe8b25ce..86db0d51d7 100644
+--- a/plugins/codearts-bridge/src/core/transport/fake.ts
++++ b/plugins/codearts-bridge/src/core/transport/fake.ts
+@@ -26,21 +26,21 @@
+  * - observe 的 signal abort：迭代**立即正常结束**（"立即放弃"语义——已入队
+  *   未消费的残存信号丢弃，不抛错，R-tr2）；
+  * - snapshot.raw：会话 raw 缓冲按序拼接的 output/error 信号 text（入队时
+  *   累积、与是否被 observe 消费无关，模拟终端缓冲区）；其余信号类型与无
+  *   text 信号不进 raw。meta 含 id/kind/alive/closed/injections/signalCount
+  *   （signalCount = 累计入队信号总数，含已消费）。
+  */
+ 
+ import type { BridgeConfig } from "../config";
+ import { BridgeError } from "../errors";
+-import type { CodeartsTransport, SessionRef, Signal, TransportKind } from "./types";
++import type { CodeartsTransport, ObserveOptions, SessionRef, Signal, TransportKind } from "./types";
+ 
+ /** 注入留痕条目（injections 数组元素；ref 用于多会话场景区分归属）。 */
+ export interface InjectionRecord {
+   ref: SessionRef;
+   text: string;
+   at: number;
+ }
+ 
+ /** FakeTransport 构造选项。 */
+ export interface FakeTransportOptions {
+@@ -118,21 +118,21 @@ export class FakeTransport implements CodeartsTransport {
+   async inject(ref: SessionRef, text: string): Promise<void> {
+     const s = this.requireSession(ref);
+     if (!s.alive) {
+       throw new BridgeError("SESSION_NOT_ALIVE", `会话已停止，拒绝注入：id=${ref.id}`, {
+         remediation: "先 start 复用该会话引用恢复存活，再注入。",
+       });
+     }
+     this.injections.push({ ref: { ...s.ref }, text, at: s.atNext++ });
+   }
+ 
+-  observe(ref: SessionRef, opts?: { signal?: AbortSignal }): AsyncIterable<Signal> {
++  observe(ref: SessionRef, opts?: ObserveOptions): AsyncIterable<Signal> {
+     const s = this.requireSession(ref);
+     if (s.observer !== null) {
+       throw new BridgeError(
+         "OBSERVER_ACTIVE",
+         `会话已有活跃观察者（单观察者模型）：id=${ref.id}`,
+         { remediation: "先结束当前观察（迭代完成/return/abort）再重新 observe。" },
+       );
+     }
+     // 已 abort：立即正常结束的空迭代，且不占用观察者名额（"未开始即取消"）。
+     if (opts?.signal?.aborted) return emptySignals();
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-script.ts b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+new file mode 100644
+index 0000000000..1a5caf61a8
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/transport/pty-script.ts
+@@ -0,0 +1,624 @@
++/**
++ * codearts-bridge script(1) PTY 宿主（T2-02）。
++ *
++ * 职责：CodeartsTransport 的第一个真实传输——经 util-linux script(1) 为目标
++ * TUI 提供真实 PTY（无 tmux 环境的零依赖宿主；tmux 宿主见 T2-03）。
++ * 契约唯一真相源为 types.ts；本文件实现其全部六方法，并对齐 T2-01
++ * FakeTransport 的可观测语义（T3-03 监督状态机以此为可迁移基准）。
++ *
++ * 主控裁定对照（2026-10-31，逐条落实）：
++ * - R-p1 两段式注入：inject = write(text) → 可注入时钟等待 120ms →
++ *   write("\r") 单独提交（v0.2.6 教训：文本+回车同块会被粘贴识别吞掉）。
++ *   文本含 \r/\n 显式抛 INJECT_TEXT_MULTILINE（与两段式契约冲突，禁静默截断）。
++ * - R-p2 日志信号源：observe 额外 tail `<kernelDataDir>/log/kernel-*.log`
++ *   增量（kernelDataDir 经 ObserveOptions 传参，缺省 ~/.codeartsdoer/cli-data，
++ *   不扩展 BridgeConfig——与 R-h3/R-h5 同风格）；`service=` 行转为 output
++ *   信号补充。日志源不可用（目录/文件缺失、读取错误）**一律不报错、不影响
++ *   PTY 通道**，来源可用性在 snapshot.meta.log 如实标注（本裁定显式豁免
++ *   "禁静默兜底"全局约束于日志源；PTY 侧错误仍显式抛出）。
++ * - R-p3 abort 对齐（T9 基准）：observe 尊重 opts.signal——挂起等待中 abort
++ *   迭代立即正常落定、残存信号不交付当前消费者但保留给下一次 observe
++ *   （与 FakeTransport 同态）、不 flush、不抛错。
++ * - R-p4 进程组终止：生产 spawnPty 以 detached:true 使子进程为进程组长，
++ *   stop 经 process.kill(-pid, SIGKILL) 整组终止（含孙进程），杜绝
++ *   createNodeExec 同款"只杀 shell 残孙子"问题；ESRCH 视为终止目标已达成
++ *   （stop 幂等语义），其余错误显式抛 PTY_STOP_FAILED。
++ * - R-p5 PtyChild 注入：exec.spawnPty(args, env) 注入 seam；生产缺省实现
++ *   nodeScriptSpawnPty = `script -qefc <cmd> /dev/null`，参数一律 argv 数组
++ *   传递（本实现不做 shell 字符串拼接；script -c 本身为 sh 语义，故对
++ *   配置路径做 shQuote 转义——数据源仅限配置路径，非用户文本）。
++ * - R-p6 UTF-8：PTY 流按 chunk 到达，stdout/stderr 各持独立 StringDecoder，
++ *   多字节序列跨 chunk 完整还原（两流独立解码器，交错不破坏字节边界）。
++ *
++ * 语义裁决（显式报错，禁静默兜底；与 FakeTransport 对齐项注明）：
++ * - 未知 ref：全部方法抛 SESSION_UNKNOWN（与 Fake 同）；
++ * - 对非存活会话 inject：抛 SESSION_NOT_ALIVE（与 Fake 同）；等待 120ms 提交
++ *   窗口期间会话死亡：同样显式抛出，不向死进程写字节；
++ * - 同一 ref 并发第二个 observe：抛 OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
++ * - start 带 ref 复用：存活会话幂等返回同 ref；已结束会话抛 SESSION_NOT_ALIVE
++ *   （真实 PTY 不可复活，禁静默重建）；
++ * - 进程自然退出：observe 产出一次性 done 信号（接口未携带退出码，text 省略）
++ *   后迭代正常结束；stop() 终止则不产 done、观察直接终止（与 Fake 同态）；
++ * - snapshot.raw = PTY 输出缓冲（全部 chunk 解码按序累积，模拟终端缓冲区，
++ *   与是否被 observe 消费无关）；日志源信号不进 raw（raw 仅 PTY 输出）。
++ *   meta.log = { available, file, serviceLines }：available = 观察进行中且正在
++ *   tail 某 kernel-*.log；file = 当前 tail 的文件名（basename）；serviceLines =
++ *   日志源产出的信号累计数（跨观察累计，留痕不丢）。
++ */
++
++import { spawn } from "node:child_process";
++import { accessSync, constants, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
++import { open } from "node:fs/promises";
++import { homedir } from "node:os";
++import * as path from "node:path";
++import { StringDecoder } from "node:string_decoder";
++import type { BridgeConfig } from "../config";
++import { BridgeError } from "../errors";
++import type {
++  CodeartsTransport,
++  ObserveOptions,
++  SessionRef,
++  Signal,
++  TransportKind,
++} from "./types";
++
++/** 两段式注入的提交间隔毫秒（R-p1；v0.2.6 教训值）。 */
++const INJECT_COMMIT_DELAY_MS = 120;
++
++/** 观察空闲轮询周期毫秒：进程死亡检测（接口无 onExit，仅 alive() 可查）与日志 tail 兜底。 */
++const POLL_MS = 200;
++
++/** 内核数据根缺省值（R-p2；与 health.ts R-h3 同源）。 */
++const DEFAULT_KERNEL_DATA_DIR = path.join(homedir(), ".codeartsdoer", "cli-data");
++
++/** 内核日志文件名口径（与 health.ts KERNEL_LOG_RE 同源：log 目录顶层 kernel-*.log）。 */
++const KERNEL_LOG_RE = /^kernel-.+\.log$/;
++
++/** 可注入时钟（R-p1）：返回在 ms 毫秒后落定的 Promise。 */
++export type PtyClock = (ms: number) => Promise<void>;
++
++const defaultClock: PtyClock = (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++/**
++ * sh 单引号转义：script -c 经 /bin/sh 语义执行（已实测 `&&` 生效），命令串中
++ * 的路径须转义以防空格/引号破坏。数据源仅为配置路径（installDir），非用户文本。
++ */
++export function shQuote(s: string): string {
++  return `'${s.replaceAll("'", `'\\''`)}'`;
++}
++
++/** PTY 子进程句柄（R-p5 注入 seam；实现方保证 onData 单播、write 同步入队）。 */
++export interface PtyChild {
++  pid: number;
++  onData(cb: (chunk: string) => void): void;
++  write(data: string): void;
++  kill(): void;
++  alive(): boolean;
++}
++
++/* ───── 生产缺省 PtyChild 实现（node child_process + script(1)） ───── */
++
++/** PATH 探测：返回可执行文件绝对路径；找不到返回 null（不做任何兜底替换）。 */
++function lookPath(exe: string, env: NodeJS.ProcessEnv): string | null {
++  if (exe.includes("/")) {
++    try {
++      accessSync(exe, constants.X_OK);
++      return exe;
++    } catch {
++      return null;
++    }
++  }
++  for (const dir of (env.PATH ?? "").split(":")) {
++    if (dir === "") continue;
++    const candidate = path.join(dir, exe);
++    try {
++      accessSync(candidate, constants.X_OK);
++      return candidate;
++    } catch {
++      // 该目录不存在此文件：继续搜下一目录（搜索语义，非兜底）
++    }
++  }
++  return null;
++}
++
++/**
++ * 生产缺省 spawnPty：spawn args[0]（detached，子进程为进程组长），stdio 三管道。
++ * - 可执行文件缺失：同步抛 PTY_HOST_UNAVAILABLE（无竞态，先探测后 spawn）；
++ * - R-p6：stdout/stderr 各持独立 StringDecoder，多字节跨 chunk 完整还原；
++ * - R-p4：kill = process.kill(-pid, SIGKILL) 整组终止；ESRCH = 已死（幂等）。
++ */
++export function nodeScriptSpawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
++  const exe = args[0];
++  if (exe === undefined || exe === "") {
++    throw new BridgeError("PTY_HOST_UNAVAILABLE", "spawnPty 参数缺少可执行文件名", {
++      remediation: "检查 ptyHost=script 的传输装配参数。",
++    });
++  }
++  const resolved = lookPath(exe, env);
++  if (resolved === null) {
++    throw new BridgeError("PTY_HOST_UNAVAILABLE", `PATH 上未找到可执行文件：${exe}`, {
++      remediation: "安装 util-linux（提供 script(1)），或将 ptyHost 配置为 tmux。",
++    });
++  }
++  const child = spawn(resolved, args.slice(1), {
++    detached: true, // R-p4：新会话/进程组，供 kill(-pid) 整树终止
++    env,
++    stdio: ["pipe", "pipe", "pipe"],
++  });
++  if (child.pid === undefined) {
++    throw new BridgeError("PTY_SPAWN_FAILED", `进程 spawn 失败：${exe}`);
++  }
++  const pid: number = child.pid; // 收窄捕获（闭包内 child.pid 类型为 number|undefined）
++
++  let exited = false;
++  const decOut = new StringDecoder("utf8"); // R-p6：每流独立解码器
++  const decErr = new StringDecoder("utf8");
++  let sink: ((chunk: string) => void) | null = null;
++
++  child.stdout?.on("data", (b: Buffer) => {
++    const s = decOut.write(b);
++    if (s !== "" && sink !== null) sink(s);
++  });
++  child.stderr?.on("data", (b: Buffer) => {
++    const s = decErr.write(b);
++    if (s !== "" && sink !== null) sink(s);
++  });
++  child.on("exit", () => {
++    exited = true;
++  });
++  // 流错误（典型：写端 EPIPE）= 底层进程已死：alive() 如实转 false（显式状态，
++  // 非兜底——不改变错误向调用方的呈现，inject 等入口仍会显式报 SESSION_NOT_ALIVE）。
++  const markDead = (): void => {
++    exited = true;
++  };
++  child.stdin?.on("error", markDead);
++  child.stdout?.on("error", markDead);
++  child.stderr?.on("error", markDead);
++  child.on("error", markDead);
++
++  return {
++    pid,
++    onData(cb) {
++      sink = cb;
++    },
++    write(data) {
++      child.stdin?.write(data);
++    },
++    kill() {
++      if (exited) return;
++      try {
++        process.kill(-pid, "SIGKILL"); // R-p4：负 pid = 整个进程组
++      } catch (e) {
++        const code = (e as NodeJS.ErrnoException | null)?.code;
++        if (code !== "ESRCH") {
++          throw new BridgeError(
++            "PTY_STOP_FAILED",
++            `进程组终止失败：pid=${pid} errno=${code ?? String(e)}`,
++            { cause: e },
++          );
++        }
++        // ESRCH：进程组已不存在——终止目标已达成（stop 幂等），非静默兜底
++      }
++    },
++    alive() {
++      return !exited;
++    },
++  };
++}
++
++/* ───── 会话状态与日志 tailer ───── */
++
++/** 单个 script PTY 会话的全部可变状态（经 ref.id 寻址）。 */
++interface PtySession {
++  ref: SessionRef;
++  child: PtyChild;
++  /** PTY 输出缓冲：全部 chunk 解码按序累积（snapshot.raw，与消费无关）。 */
++  raw: string;
++  /** 待消费信号队列（PTY chunk / 日志 service 行 / done）。 */
++  queue: Signal[];
++  /** observe 挂起等待者（wakeAll 唤醒后自旋复查状态）。 */
++  waiters: Array<() => void>;
++  /** 当前活跃观察者标记（单观察者模型；null = 无）。 */
++  observer: symbol | null;
++  /** stop 置位：观察迭代终止条件之一。 */
++  closed: boolean;
++  /** 进程死亡 done 信号是否已产出（只产一次）。 */
++  exitHandled: boolean;
++  /** 日志源状态（snapshot.meta.log；观察期间由 tailer 维护，serviceLines 跨观察累计）。 */
++  log: { available: boolean; file: string | null; serviceLines: number };
++}
++
++/** 日志 tailer（observe 生命期；R-p2）。 */
++interface LogTailer {
++  /** 增量扫描一次（事件驱动 + 观察轮询 tick 兜底调用；幂等、可重入合并）。 */
++  poll(): Promise<void>;
++  /** 关闭 watcher（幂等；关闭后 available 转 false 如实标注）。 */
++  close(): void;
++}
++
++/** 会话唤醒/等待机制（模块级：PTY 观察循环与日志 tailer 共用）。 */
++function wakeAll(s: PtySession): void {
++  const waiters = s.waiters.splice(0);
++  for (const wake of waiters) wake();
++}
++
++function waitFor(s: PtySession): Promise<void> {
++  return new Promise((resolve) => {
++    s.waiters.push(resolve);
++  });
++}
++
++/** 列出 log 目录顶层 kernel-*.log，按 mtime 降序取最新（并列按文件名）。 */
++function newestKernelLog(
++  dir: string,
++): { path: string; name: string; size: number; mtimeMs: number } | null {
++  let best: { path: string; name: string; size: number; mtimeMs: number } | null = null;
++  for (const name of readdirSync(dir)) {
++    if (!KERNEL_LOG_RE.test(name)) continue;
++    const full = path.join(dir, name);
++    const st = statSync(full);
++    if (!st.isFile()) continue;
++    if (
++      best === null ||
++      st.mtimeMs > best.mtimeMs ||
++      (st.mtimeMs === best.mtimeMs && name > best.name)
++    ) {
++      best = { path: full, name, size: st.size, mtimeMs: st.mtimeMs };
++    }
++  }
++  return best;
++}
++
++/**
++ * 装配日志 tailer（observe 调用时同步执行——statSync 基线保证确定性：observe
++ * 返回后追加的内容必被读到；watcher 就绪前的事件由观察轮询 tick 兜底）。
++ * - 基线 = 最新 kernel-*.log 当前大小（只看增量）；无文件/目录缺失 → 不可用态；
++ * - 事件（文件追加/目录建删）→ poll：重列目录，最新文件变化即切换（新文件从 0
++ *   读，轮转内容全新）；否则从 offset 增量读，完整行经 service= 过滤入队；
++ * - 一切 FS 错误按 R-p2 处理：不抛出，如实转不可用态（PTY 通道不受影响）。
++ */
++function armLogTailer(s: PtySession, kernelDataDir: string | undefined): LogTailer {
++  const dir = path.join(kernelDataDir ?? DEFAULT_KERNEL_DATA_DIR, "log");
++  let current: string | null = null;
++  let offset = 0;
++  let partial = ""; // 未遇 \n 的行尾残段（跨增量保持）
++  const decoder = new StringDecoder("utf8"); // 文件字节 → 字符（跨增量多字节安全）
++  let closedT = false;
++  let polling = false;
++  let dirty = false;
++  let fileWatcher: FSWatcher | null = null;
++  let dirWatcher: FSWatcher | null = null;
++
++  const markUnavailable = (): void => {
++    s.log = { ...s.log, available: false, file: null };
++  };
++
++  // ── 同步基线（确定性关键：observe 返回时基线已定） ──
++  try {
++    const newest = newestKernelLog(dir);
++    if (newest !== null) {
++      current = newest.path;
++      offset = newest.size;
++      s.log = { ...s.log, available: true, file: newest.name };
++    }
++  } catch {
++    markUnavailable(); // 目录缺失等（R-p2：不报错）
++  }
++
++  const rearmFileWatcher = (p: string): void => {
++    fileWatcher?.close();
++    fileWatcher = null;
++    try {
++      const w = watch(p, { persistent: false }, () => void tailer.poll());
++      w.on("error", () => {
++        // 被跟踪文件被删/失效（轮转常态）：关闭自身，目录 watcher + 轮询兜底恢复
++        w.close();
++        if (fileWatcher === w) fileWatcher = null;
++      });
++      fileWatcher = w;
++    } catch {
++      // watch 启动失败（文件竞态删除）：轮询兜底
++    }
++  };
++
++  const tailer: LogTailer = {
++    poll() {
++      if (closedT) return Promise.resolve();
++      if (polling) {
++        dirty = true;
++        return Promise.resolve();
++      }
++      polling = true;
++      const step = async (): Promise<void> => {
++        try {
++          do {
++            dirty = false;
++            await readIncrement();
++          } while (dirty);
++        } catch {
++          markUnavailable(); // R-p2：日志源任何错误不影响 PTY 通道
++        }
++      };
++      return step().finally(() => {
++        polling = false;
++      });
++    },
++    close() {
++      if (closedT) return;
++      closedT = true;
++      fileWatcher?.close();
++      fileWatcher = null;
++      dirWatcher?.close();
++      dirWatcher = null;
++      markUnavailable();
++    },
++  };
++
++  async function readIncrement(): Promise<void> {
++    let newest: ReturnType<typeof newestKernelLog> = null;
++    try {
++      newest = newestKernelLog(dir);
++    } catch {
++      markUnavailable(); // 目录在观察中被删（R-p2）
++      return;
++    }
++    if (newest === null) {
++      current = null;
++      offset = 0;
++      partial = "";
++      markUnavailable();
++      return;
++    }
++    if (newest.path !== current) {
++      // 轮转/首见新文件：从 0 读（新文件内容全部为增量），残段作废
++      rearmFileWatcher(newest.path);
++      current = newest.path;
++      offset = 0;
++      partial = "";
++      s.log = { ...s.log, available: true, file: newest.name };
++    }
++    if (offset >= newest.size) return; // 无增量
++    const fh = await open(newest.path, "r");
++    try {
++      const len = newest.size - offset;
++      const buf = Buffer.alloc(len);
++      const { bytesRead } = await fh.read(buf, 0, len, offset);
++      offset += bytesRead;
++      partial += decoder.write(buf.subarray(0, bytesRead));
++    } finally {
++      await fh.close();
++    }
++    const lines = partial.split("\n");
++    partial = lines.pop() ?? ""; // 末段可能不完整：留待下一增量
++    for (const raw of lines) {
++      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
++      if (!line.includes("service=")) continue; // R-p2：仅 service= 行转为信号
++      s.log.serviceLines++;
++      s.queue.push({ t: "output", at: Date.now(), text: line });
++    }
++    wakeAll(s);
++  }
++
++  // 目录 watcher：轮转（新建/删除/重命名）感知；追加事件在部分平台亦可见，
++  // 与文件 watcher 双保险，均只作 poll 触发信号。
++  try {
++    dirWatcher = watch(dir, { persistent: false }, () => void tailer.poll());
++    dirWatcher.on("error", () => {
++      dirWatcher?.close();
++      dirWatcher = null;
++    });
++  } catch {
++    markUnavailable(); // 目录缺失等（R-p2：不报错）
++  }
++  if (current !== null) rearmFileWatcher(current);
++
++  return tailer;
++}
++
++/* ───── script(1) 传输 ───── */
++
++/** createScriptTransport 选项。 */
++export interface ScriptTransportOptions {
++  /** 注入时钟（R-p1 缺省 setTimeoutPromise）；观察轮询 tick 同用此时钟。 */
++  clock?: PtyClock;
++}
++
++/**
++ * 构造 script(1) PTY 宿主传输。
++ * @param exec PtyChild 注入 seam（R-p5）：生产传 { spawnPty: nodeScriptSpawnPty }；
++ *   测试可注入 fake child 或经 nodeScriptSpawnPty 真实 spawn bash fixture。
++ */
++export function createScriptTransport(
++  exec: { spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild },
++  opts: ScriptTransportOptions = {},
++): CodeartsTransport {
++  const clock = opts.clock ?? defaultClock;
++  const kind: TransportKind = "pty";
++  /** 会话表：id → 状态（含已 stop 会话：snapshot/留痕不丢）。 */
++  const sessions = new Map<string, PtySession>();
++  let idNext = 0;
++
++  function requireSession(ref: SessionRef): PtySession {
++    const s = sessions.get(ref.id);
++    if (s === undefined) {
++      throw new BridgeError("SESSION_UNKNOWN", `未知会话引用：kind=${ref.kind} id=${ref.id}`, {
++        remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
++      });
++    }
++    return s;
++  }
++
++  function assertInjectable(s: PtySession, ref: SessionRef): void {
++    if (s.closed || !s.child.alive()) {
++      throw new BridgeError(
++        "SESSION_NOT_ALIVE",
++        `会话已结束，拒绝操作：id=${ref.id}`,
++        {
++          remediation: "script 宿主会话不可复活；请新建会话（start 不带 ref）。",
++        },
++      );
++    }
++  }
++
++  const transport: CodeartsTransport = {
++    kind,
++
++    async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
++      if (ref !== undefined) {
++        const s = requireSession(ref);
++        assertInjectable(s, ref);
++        return { ...s.ref }; // 复用语义：存活会话幂等返回（真实 PTY 无恢复概念）
++      }
++      const id = `script-${++idNext}`;
++      const created: SessionRef = { kind, id };
++      const cmd = shQuote(path.join(cfg.installDir, "bin", "codearts"));
++      // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
++      const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
++      const s: PtySession = {
++        ref: created,
++        child,
++        raw: "",
++        queue: [],
++        waiters: [],
++        observer: null,
++        closed: false,
++        exitHandled: false,
++        log: { available: false, file: null, serviceLines: 0 },
++      };
++      // onData 单播：start 时接线一次，输出持续入 raw + 队列（与是否观察无关）
++      child.onData((chunk) => {
++        s.raw += chunk;
++        s.queue.push({ t: "output", at: Date.now(), text: chunk });
++        wakeAll(s);
++      });
++      sessions.set(id, s);
++      return { ...created };
++    },
++
++    async inject(ref: SessionRef, text: string): Promise<void> {
++      const s = requireSession(ref);
++      assertInjectable(s, ref);
++      if (text.includes("\r") || text.includes("\n")) {
++        throw new BridgeError(
++          "INJECT_TEXT_MULTILINE",
++          `注入文本含换行符（长度=${text.length}），与两段式提交契约冲突`,
++          { remediation: "单行文本注入；多行内容分行多次 inject，每段单独提交。" },
++        );
++      }
++      s.child.write(text);
++      await clock(INJECT_COMMIT_DELAY_MS); // R-p1：两段式提交窗口
++      assertInjectable(s, ref); // 窗口期死亡：显式报错，不向死进程写 "\r"
++      s.child.write("\r");
++    },
++
++    observe(ref: SessionRef, observeOpts?: ObserveOptions): AsyncIterable<Signal> {
++      const s = requireSession(ref);
++      if (s.observer !== null) {
++        throw new BridgeError("OBSERVER_ACTIVE", `会话已有活跃观察者（单观察者模型）：id=${ref.id}`, {
++          remediation: "先结束当前观察（迭代完成/return/abort）再重新 observe。",
++        });
++      }
++      if (observeOpts?.signal?.aborted) return emptySignals(); // 未开始即取消
++
++      const token = Symbol("observer");
++      s.observer = token;
++      // tailer 同步装配（statSync 基线在返回前确定——增量语义的确定性关键）
++      const tailer = armLogTailer(s, observeOpts?.kernelDataDir);
++      const signal = observeOpts?.signal;
++      let terminated = false;
++      const release = (): void => {
++        if (s.observer === token) s.observer = null;
++        tailer.close();
++      };
++
++      async function* iterate(): AsyncGenerator<Signal> {
++        const onAbort = (): void => wakeAll(s);
++        signal?.addEventListener("abort", onAbort, { once: true });
++        try {
++          while (true) {
++            // abort = 立即放弃：残存不交付、保留给下一次 observe（T9 基准同态）
++            if (signal?.aborted || terminated) return;
++            if (s.queue.length > 0) {
++              yield s.queue.shift() as Signal;
++              continue;
++            }
++            if (s.closed) return; // stop：观察直接终止（不产 done，与 Fake 同态）
++            if (!s.child.alive()) {
++              if (!s.exitHandled) {
++                s.exitHandled = true;
++                s.queue.push({ t: "done", at: Date.now() }); // 进程自然退出：一次性 done
++                continue;
++              }
++              return;
++            }
++            const tick = clock(POLL_MS).then(() => {
++              void tailer.poll(); // 日志 tail 兜底（事件丢失/未就绪窗口）
++            });
++            await Promise.race([waitFor(s), tick]);
++          }
++        } finally {
++          signal?.removeEventListener("abort", onAbort);
++          release();
++        }
++      }
++
++      // 包装迭代器（与 FakeTransport M34 同构）：显式 return/throw 先同步终结
++      // 挂起等待并释放观察者/关闭 tailer，再委托内部 generator——"未启动即
++      // return"（generator 体未执行、finally 不触发）也不泄漏 watcher。
++      const inner = iterate();
++      const iterator: AsyncIterator<Signal> = {
++        next: () => inner.next(),
++        return: (v?: unknown) => {
++          terminated = true;
++          release();
++          wakeAll(s);
++          return inner.return(v as undefined);
++        },
++        throw: (e?: unknown) => {
++          terminated = true;
++          release();
++          wakeAll(s);
++          return inner.throw(e);
++        },
++      };
++      return { [Symbol.asyncIterator]: () => iterator };
++    },
++
++    async alive(ref: SessionRef): Promise<boolean> {
++      const s = requireSession(ref);
++      return !s.closed && s.child.alive();
++    },
++
++    async stop(ref: SessionRef): Promise<void> {
++      const s = requireSession(ref);
++      if (!s.closed) {
++        s.closed = true;
++        if (s.child.alive()) s.child.kill(); // R-p4：整组 SIGKILL（实现见 nodeScriptSpawnPty）
++      }
++      wakeAll(s);
++    },
++
++    async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
++      const s = requireSession(ref);
++      return {
++        raw: s.raw,
++        meta: {
++          id: s.ref.id,
++          kind: s.ref.kind,
++          host: "script",
++          pid: s.child.pid,
++          alive: !s.closed && s.child.alive(),
++          closed: s.closed,
++          log: { ...s.log },
++        },
++      };
++    },
++  };
++
++  return transport;
++}
++
++/** 空信号迭代（observe 收到已 abort 的 signal 时返回；不占观察者、不装配 tailer）。 */
++function emptySignals(): AsyncIterable<Signal> {
++  return (async function* () {})();
++}
+diff --git a/plugins/codearts-bridge/src/core/transport/types.ts b/plugins/codearts-bridge/src/core/transport/types.ts
+index 62de75d6d4..9ef843a14f 100644
+--- a/plugins/codearts-bridge/src/core/transport/types.ts
++++ b/plugins/codearts-bridge/src/core/transport/types.ts
+@@ -21,20 +21,33 @@ export interface Signal {
+   at: number;
+   text?: string;
+ }
+ 
+ /** 会话引用：由 transport.start 返回、后续方法凭其寻址（不透明值，调用方只透传）。 */
+ export interface SessionRef {
+   kind: TransportKind;
+   id: string;
+ }
+ 
++/**
++ * observe 选项（T2-02 扩展，主控裁定 2026-10-31 R-p2）：
++ * - signal：取消语义见 observe 注（唯一真相源：立即放弃、残存不交付、不抛错）。
++ * - kernelDataDir：内核数据根（日志源 `<dir>/log/kernel-*.log`）经 opts 传参
++ *   （与 T1-06 R-h3 / T1-07 R-h5 同风格，**不扩展 BridgeConfig**）；缺省由实现
++ *   自定（script 宿主默认 ~/.codeartsdoer/cli-data）。仅真实传输消费；日志源
++ *   不可用不报错，来源可用性在 snapshot.meta 如实标注（R-p2）。
++ */
++export interface ObserveOptions {
++  signal?: AbortSignal;
++  kernelDataDir?: string;
++}
++
+ /** 目标会话传输接口（最小完整，六方法）。 */
+ export interface CodeartsTransport {
+   /** 本传输的种类（构造即定；SessionRef.kind 与之一致）。 */
+   readonly kind: TransportKind;
+ 
+   /**
+    * 启动（或复用）一个目标会话。ref 缺省创建新会话；传入 start 返回过的 ref
+    * 表示复用/恢复该会话（语义由实现定义并注明）。
+    */
+   start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef>;
+@@ -42,21 +55,21 @@ export interface CodeartsTransport {
+   /** 向会话注入一段文本（如续跑指令）。 */
+   inject(ref: SessionRef, text: string): Promise<void>;
+ 
+   /**
+    * 观察会话事件流。opts.signal abort → 迭代正常结束（不抛错，R-tr2）。
+    * abort 语义（本文件为唯一真相源）：**立即放弃**——残存未消费信号丢弃、
+    * 不 flush；真实传输（T2-02~04）须对齐该状态机行为（T3-03 经 FakeTransport
+    * 验证的行为以此为基准）。
+    * 并发观察策略由实现定义（FakeTransport 为单观察者，重复 observe 显式报错）。
+    */
+-  observe(ref: SessionRef, opts?: { signal?: AbortSignal }): AsyncIterable<Signal>;
++  observe(ref: SessionRef, opts?: ObserveOptions): AsyncIterable<Signal>;
+ 
+   /** 会话是否存活。 */
+   alive(ref: SessionRef): Promise<boolean>;
+ 
+   /** 停止会话；对已停止会话幂等。 */
+   stop(ref: SessionRef): Promise<void>;
+ 
+   /** 会话当前状态快照（raw 语义由实现定义并注明）。 */
+   snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }>;
+ }
+diff --git a/plugins/codearts-bridge/test/fixtures/fake-codearts/fake-tui.sh b/plugins/codearts-bridge/test/fixtures/fake-codearts/fake-tui.sh
+new file mode 100644
+index 0000000000..84add814e0
+--- /dev/null
++++ b/plugins/codearts-bridge/test/fixtures/fake-codearts/fake-tui.sh
+@@ -0,0 +1,75 @@
++#!/usr/bin/env bash
++# fake-tui.sh — codearts TUI 测试替身（T2-02）。
++#
++# 经 script(1) PTY 宿主实跑（test/transport-script.test.ts），行为与真实 TUI
++# 的可观测面一致：文本字符累积缓冲；提交回车触发回显与提交标记。
++#
++# 用法: fake-tui.sh [--scenario stall|error|exit|utf8|family]
++#   默认:   逐字符读 stdin（-icanon，绕过 canonical 行缓冲——行模式无法把
++#           "提交用 \r"与文本行终结区分开）；\r/\n 提交时：缓冲非空 →
++#           打印 "[RX:<buf>]" + "[ENTER]"（两段式提交的两个可观测事件），
++#           缓冲为空（单独 \r）→ 仅 "[ENTER]"；EOF 退出 0。
++#   stall:  静默消费 stdin、永不输出（供 abort/stop 语义测试）。
++#   error:  打印 "[FAKE-ERROR]" 后 exit 3（非零退出场景）。
++#   exit:   打印 "[FAKE-EXIT]" 后 exit 0（自然退出场景）。
++#   utf8:   分两次写入多字节字符"你好"的原始字节（模拟跨 chunk 拆分）后待机。
++#   family: 后台拉起带标记的孙进程（argv[0]=codearts-tree-marker）后待机，
++#           供 stop 全树终止测试（R-p4）经 /proc 扫描核对无残留。
++set -u
++
++scenario="default"
++if [[ $# -ge 2 && "$1" == "--scenario" ]]; then
++  scenario="$2"
++fi
++
++case "$scenario" in
++  stall)
++    # 静默待机：读 stdin 不输出，EOF 退出
++    while IFS= read -r _; do :; done
++    exit 0
++    ;;
++  error)
++    printf '[FAKE-ERROR]\n'
++    exit 3
++    ;;
++  exit)
++    printf '[FAKE-EXIT]\n'
++    exit 0
++    ;;
++  utf8)
++    # "你好" 的 UTF-8 字节拆两半写入（e4 bd a0 / e5 a5 bd），中间留间隔，
++    # 令管道 chunk 边界大概率落在多字节序列中间（StringDecoder 跨 chunk 场景）
++    printf '\xe4\xbd'
++    sleep 0.15
++    printf '\xa0\xe5\xa5\xbd\n'
++    while IFS= read -r _; do :; done
++    exit 0
++    ;;
++  family)
++    # 孙进程：argv[0] 改为唯一标记，便于 /proc 扫描核对（不依赖 sleep 时长断言）
++    bash -c 'exec -a codearts-tree-marker sleep 300' &
++    while IFS= read -r _; do :; done
++    exit 0
++    ;;
++  default)
++    # 逐字符读：关 canonical 行缓冲（stty 作用于本 PTY slave；非 tty 直跑时
++    # 退化为行读——仅影响手动调试，测试恒经 PTY）
++    stty -icanon min 1 time 0 2>/dev/null || :
++    buf=""
++    while IFS= read -r -N 1 ch; do
++      case "$ch" in
++        $'\r' | $'\n')
++          if [[ -n "$buf" ]]; then
++            printf '[RX:%s]\n' "$buf"
++            buf=""
++          fi
++          printf '[ENTER]\n'
++          ;;
++        *)
++          buf+="$ch"
++          ;;
++      esac
++    done
++    exit 0
++    ;;
++esac
+diff --git a/plugins/codearts-bridge/test/transport-script.test.ts b/plugins/codearts-bridge/test/transport-script.test.ts
+new file mode 100644
+index 0000000000..f6f9cb4eb2
+--- /dev/null
++++ b/plugins/codearts-bridge/test/transport-script.test.ts
+@@ -0,0 +1,600 @@
++/**
++ * T2-02 script(1) PTY 宿主测试（bun:test）。
++ *
++ * 主控裁定对照（2026-10-31）：
++ * - R-p1 两段式注入：inject = write(text) → 可注入时钟等待 120ms → write("\r")
++ *   （v0.2.6 教训：文本+回车同块会被粘贴识别吞掉）；时钟经 opts 注入保确定性。
++ * - R-p2 日志信号源：observe 额外 tail <kernelDataDir>/log/kernel-*.log 增量，
++ *   service= 行转 output 信号；日志源缺失/轮转不报错，可用性在 snapshot.meta
++ *   如实标注（测试：追加 service 行产信号 / 缺失标不可用 / 基线前内容不产信号）。
++ * - R-p3 abort 对齐（T9 基准）：observe 尊重 opts.signal——挂起等待中 abort
++ *   迭代正常落定、残存信号不交付当前消费者但保留给下一次 observe（与
++ *   FakeTransport 同态）、不抛错。
++ * - R-p4 进程组终止：stop 连底层子进程树一并终止（detached + 组杀）；
++ *   测试用 family 场景的标记孙进程经 /proc 扫描核对全树无残留。
++ * - R-p5 PtyChild 注入：生产缺省实现 = `script -qefc <cmd> /dev/null`（argv
++ *   数组传递）；测试注入 fake child 或对 bash fixture 真实 spawn（离线本地）。
++ * - R-p6 UTF-8：StringDecoder 处理多字节跨 chunk（utf8 场景拆字节写入）。
++ *
++ * 错误路径（禁静默兜底，显式 BridgeError）：SESSION_UNKNOWN / SESSION_NOT_ALIVE /
++ * OBSERVER_ACTIVE / INJECT_TEXT_MULTILINE / PTY_HOST_UNAVAILABLE。
++ */
++import { afterEach, describe, expect, it } from "bun:test";
++import { mkdtempSync, mkdirSync, appendFileSync, rmSync, writeFileSync } from "node:fs";
++import { accessSync, constants, readdirSync, readFileSync } from "node:fs";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import {
++  createScriptTransport,
++  nodeScriptSpawnPty,
++  shQuote,
++  type PtyChild,
++} from "../src/core/transport/pty-script";
++import type { SessionRef, Signal } from "../src/core/transport/types";
++
++/** 与真实环境完全隔离的配置（测试不触碰真实 HOME/安装目录）。 */
++const CFG = loadConfig(
++  { stateDir: "/nonexistent/codearts-bridge-script-test", installDir: "/nonexistent/installers" },
++  {},
++);
++
++const FIXTURE = path.join(import.meta.dir, "fixtures", "fake-codearts", "fake-tui.sh");
++
++/** 测试用临时根（工作目录内 .tmp/，用后即删，禁系统临时目录）。 */
++const TMP_ROOT = path.join(import.meta.dir, ".tmp", "t10");
++
++/** 建立每用例独立的内核数据根（自动建父目录）。 */
++function makeKernelDir(prefix: string): string {
++  mkdirSync(TMP_ROOT, { recursive: true });
++  return mkdtempSync(path.join(TMP_ROOT, prefix));
++}
++
++/* ───── 测试替身：可记录的 Fake PtyChild 与 exec ───── */
++
++interface FakeChild extends PtyChild {
++  writes: string[];
++  killCalls: number;
++  isAlive: boolean;
++  /** 模拟 PTY 输出 chunk 到达（StringDecoder 之前的数据已按字符串给出）。 */
++  emit(chunk: string): void;
++  /** 模拟底层进程死亡。 */
++  die(): void;
++}
++
++function makeFakeChild(): FakeChild {
++  let cb: ((chunk: string) => void) | null = null;
++  const child: FakeChild = {
++    pid: 424242,
++    writes: [],
++    killCalls: 0,
++    isAlive: true,
++    onData(fn) {
++      cb = fn;
++    },
++    write(data) {
++      child.writes.push(data);
++    },
++    kill() {
++      child.killCalls++;
++      child.isAlive = false;
++    },
++    alive() {
++      return child.isAlive;
++    },
++    emit(chunk) {
++      cb?.(chunk);
++    },
++    die() {
++      child.isAlive = false;
++    },
++  };
++  return child;
++}
++
++/** exec 记录器：捕获 spawnPty 的 (args, env) 并返回指定 child。 */
++function recordingExec(child: PtyChild) {
++  const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
++  return {
++    calls,
++    exec: {
++      spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
++        calls.push({ args, env });
++        return child;
++      },
++    },
++  };
++}
++
++/** 真实 spawn：经 nodeScriptSpawnPty 以 script(1) 包装 bash fixture（离线本地）。 */
++function realExec(scenario?: string): { exec: { spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild } } {
++  const cmd = `bash ${shQuote(FIXTURE)}${scenario ? ` --scenario ${scenario}` : ""}`;
++  return {
++    exec: {
++      spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
++        // 透传传输层构造的 script 参数形态，仅替换 -c 的命令为 fixture（R-p5 允许真实 spawn）
++        return nodeScriptSpawnPty(["script", "-qefc", cmd, "/dev/null"], env);
++      },
++    },
++  };
++}
++
++/* ───── 测试辅助 ───── */
++
++const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
++
++/** 限时收集信号直至谓词命中（超时抛错，避免用例悬挂）。 */
++async function collectUntil(
++  iter: AsyncIterator<Signal>,
++  until: (sig: Signal, acc: string) => boolean,
++  timeoutMs = 5000,
++): Promise<{ got: Signal[]; acc: string }> {
++  const got: Signal[] = [];
++  let acc = "";
++  const deadline = Date.now() + timeoutMs;
++  while (true) {
++    const remaining = deadline - Date.now();
++    if (remaining <= 0) throw new Error(`collectUntil 超时（${timeoutMs}ms）；已收 ${got.length} 条，累计文本=${JSON.stringify(acc)}`);
++    const r = await Promise.race([
++      iter.next(),
++      sleep(remaining).then(() => null),
++    ]);
++    if (r === null) throw new Error(`collectUntil 超时（等待 next 挂起）；累计文本=${JSON.stringify(acc)}`);
++    if (r.done) return { got, acc };
++    got.push(r.value);
++    if (r.value.text !== undefined) acc += r.value.text;
++    if (until(r.value, acc)) return { got, acc };
++  }
++}
++
++/**
++ * /proc 扫描：argv 元素命中谓词的进程 pid 列表（R-p4 全树核对）。
++ * 用 argv 元素级匹配（marker 取 argv[0] 全等 / fixture 取元素包含路径），
++ * 而非整串子串匹配——否则任何 cmdline 里恰好含同款字样的进程（例如外层
++ * shell 的 -c 载荷、grep/pgrep 模式串）都会被误杀/误报（实测发生过）。
++ */
++function findProcs(match: (argv: string[]) => boolean): number[] {
++  const out: number[] = [];
++  for (const ent of readdirSync("/proc")) {
++    if (!/^\d+$/.test(ent)) continue;
++    try {
++      const argv = readFileSync(`/proc/${ent}/cmdline`, "utf8")
++        .split("\0")
++        .filter((a) => a !== "");
++      if (match(argv)) out.push(Number(ent));
++    } catch {
++      // 进程在扫描间隙消失：不计
++    }
++  }
++  return out;
++}
++
++/** 标记孙进程（exec -a 改 argv[0]，全等匹配）。 */
++const isMarkerProc = (argv: string[]): boolean => argv[0] === "codearts-tree-marker";
++
++/** fixture 相关进程（fixture bash 或其 script 宿主：argv 元素含 fixture 文件名）。 */
++const isFixtureProc = (argv: string[]): boolean => argv.some((a) => a.includes("fake-tui.sh"));
++
++/** pid 存活判定（僵尸进程 /proc/<pid> 仍存在，cmdline 为空——按存在性核比较严格）。 */
++function existsPid(pid: number): boolean {
++  try {
++    accessSync(`/proc/${pid}`, constants.F_OK);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** 轮询直至谓词成立或超时（真实时间，限时毫秒级）。 */
++async function pollUntil(p: () => boolean, timeoutMs: number, what: string): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (!p()) {
++    if (Date.now() > deadline) throw new Error(`pollUntil 超时：${what}`);
++    await sleep(25);
++  }
++}
++
++/** 每用例注册清理动作（observe 迭代终结 + stop + 临时目录），防 watcher/进程泄漏悬挂。 */
++const cleanups: Array<() => Promise<void>> = [];
++afterEach(async () => {
++  while (cleanups.length > 0) {
++    const fn = cleanups.pop();
++    if (fn) await fn();
++  }
++});
++
++/** 为一个用例创建 script 传输（默认真实时钟；两段式时延测试注入假时钟）。 */
++function makeTransport(
++  exec: { spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild },
++  opts?: { clock?: (ms: number) => Promise<void> },
++) {
++  const t = createScriptTransport(exec, opts);
++  cleanups.push(async () => {
++    /* 无全局会话清单；各用例自行 stop（幂等） */
++  });
++  return t;
++}
++
++/* ───── 用例 ───── */
++
++describe("createScriptTransport.start / R-p5 argv 形态", () => {
++  it("start 经 exec.spawnPty 以 argv 数组传递 script 参数与 env（禁 shell 拼接注入）", async () => {
++    const child = makeFakeChild();
++    const { calls, exec } = recordingExec(child);
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    expect(ref.kind).toBe("pty");
++    expect(ref.id).toMatch(/^script-/);
++    expect(calls).toHaveLength(1);
++    expect(calls[0]!.args).toEqual([
++      "script",
++      "-qefc",
++      shQuote(`${CFG.installDir}/bin/codearts`),
++      "/dev/null",
++    ]);
++    expect(calls[0]!.env).toBe(process.env);
++  });
++
++  it("installDir 含空格时命令串经 shQuote 转义（script -c 为 sh 语义）", async () => {
++    const cfg2 = loadConfig(
++      { stateDir: "/nonexistent/s", installDir: "/opt/dir with space" },
++      {},
++    );
++    const { calls, exec } = recordingExec(makeFakeChild());
++    const t = makeTransport(exec);
++    await t.start(cfg2);
++    expect(calls[0]!.args![2]).toBe("'/opt/dir with space/bin/codearts'");
++  });
++
++  it("start 复用：存活会话幂等返回同 ref；已死会话显式 SESSION_NOT_ALIVE；未知 ref 显式 SESSION_UNKNOWN", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    const again = await t.start(CFG, ref);
++    expect(again).toEqual(ref);
++
++    child.die();
++    await expect(t.start(CFG, ref)).rejects.toMatchObject({ code: "SESSION_NOT_ALIVE" });
++    await expect(t.alive({ kind: "pty", id: "script-999" })).rejects.toMatchObject({
++      code: "SESSION_UNKNOWN",
++    });
++  });
++});
++
++describe("R-p1 两段式注入", () => {
++  it("inject = write(text) → 可注入时钟等待 120ms → write(\"\\r\")，三次调用依序", async () => {
++    const child = makeFakeChild();
++    const { exec } = recordingExec(child);
++    const order: string[] = [];
++    const clock = async (ms: number): Promise<void> => {
++      order.push(`clock:${ms}`);
++    };
++    const t = makeTransport(exec, { clock });
++    const ref = await t.start(CFG);
++    await t.inject(ref, "继续");
++    expect(order).toEqual(["clock:120"]);
++    expect(child.writes).toEqual(["继续", "\r"]);
++  });
++
++  it("inject 文本含 \\r 或 \\n → INJECT_TEXT_MULTILINE 显式报错且不写任何字节", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    await expect(t.inject(ref, "a\rb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
++    await expect(t.inject(ref, "a\nb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
++    expect(child.writes).toEqual([]);
++  });
++
++  it("inject 对未知 ref → SESSION_UNKNOWN；对已 stop 会话 → SESSION_NOT_ALIVE 且不写", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    await expect(t.inject({ kind: "pty", id: "nope" }, "x")).rejects.toMatchObject({
++      code: "SESSION_UNKNOWN",
++    });
++    const ref = await t.start(CFG);
++    await t.stop(ref);
++    await expect(t.inject(ref, "x")).rejects.toMatchObject({ code: "SESSION_NOT_ALIVE" });
++    expect(child.writes).toEqual([]);
++  });
++});
++
++describe("observe：PTY 输出信号化（fake child 确定性用例）", () => {
++  it("chunk 按序成为 output 信号；单观察者：并发第二 observe 显式 OBSERVER_ACTIVE", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    child.emit("alpha");
++    child.emit("beta");
++
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const r1 = await iter.next();
++    expect(r1.value).toMatchObject({ t: "output", text: "alpha" });
++    expect(() => t.observe(ref)).toThrow(BridgeError);
++    const r2 = await iter.next();
++    expect(r2.value).toMatchObject({ t: "output", text: "beta" });
++    await iter.return?.(undefined);
++    // 迭代结束后观察者名额释放，可再次 observe
++    const iter2 = t.observe(ref)[Symbol.asyncIterator]();
++    await iter2.return?.(undefined);
++  });
++
++  it("R-p3 abort：未开始即取消 → 空迭代；残存保留给下一次 observe；挂起中 abort → 正常落定（T9 基准同态）", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    child.emit("residual");
++
++    // ① 已 abort 的 signal 传入：立即正常结束的空迭代（残存不消费、不销毁）
++    const ac1 = new AbortController();
++    ac1.abort();
++    const got: Signal[] = [];
++    for await (const sig of t.observe(ref, { signal: ac1.signal })) got.push(sig);
++    expect(got).toEqual([]);
++
++    // ② 残存保留给下一次 observe（与 FakeTransport 行为同态）
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    expect((await iter.next()).value).toMatchObject({ text: "residual" });
++    await iter.return?.(undefined);
++
++    // ③ 挂起等待中 abort：pending next 正常落定（done=true，不抛错）
++    const ac2 = new AbortController();
++    const iter2 = t.observe(ref, { signal: ac2.signal })[Symbol.asyncIterator]();
++    const pending = iter2.next(); // 队列空 → 挂起
++    ac2.abort();
++    expect((await pending).done).toBe(true);
++    await iter2.return?.(undefined);
++  });
++
++  it("exit 检测：底层进程死后 alive=false，observe 产出 done 信号后自然结束（不挂起）", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    child.die(); // 底层进程死亡（无 onExit 接口，经轮询 tick 检测）
++    const { got } = await collectUntil(iter, (sig) => sig.t === "done", 3000);
++    expect(got.at(-1)!.t).toBe("done");
++    expect(await t.alive(ref)).toBe(false);
++    expect((await iter.next()).done).toBe(true);
++  });
++
++  it("stop：child.kill 恰调一次、alive=false、挂起 observe 正常终止、stop 幂等、后续 observe 立即空迭代", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    child.emit("before-stop");
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    expect((await iter.next()).value).toMatchObject({ text: "before-stop" });
++    const pending = iter.next();
++    await t.stop(ref);
++    expect((await pending).done).toBe(true);
++    expect(child.killCalls).toBe(1);
++    expect(await t.alive(ref)).toBe(false);
++
++    await t.stop(ref); // 幂等：不再 kill
++    expect(child.killCalls).toBe(1);
++    const got: Signal[] = [];
++    for await (const sig of t.observe(ref)) got.push(sig);
++    expect(got).toEqual([]);
++  });
++});
++
++describe("observe：日志信号源（R-p2，实跑 fixture）", () => {
++  it("追加 service=om 行 → output 信号；基线前已存在行不产信号", async () => {
++    const { exec } = realExec("stall");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++
++    const kdir = makeKernelDir("log-");
++    const logDir = path.join(kdir, "log");
++    mkdirSync(logDir, { recursive: true });
++    const logFile = path.join(logDir, "kernel-a.log");
++    writeFileSync(logFile, "INFO boot ok\nWARN old service=om-before\n");
++    cleanups.push(async () => rmSync(kdir, { recursive: true, force: true }));
++
++    const iter = t.observe(ref, { kernelDataDir: kdir })[Symbol.asyncIterator]();
++    // observe 返回后（基线已定）再追加增量行
++    appendFileSync(logFile, "INFO new service=om-after\n");
++    const { got, acc } = await collectUntil(iter, (_s, acc2) => acc2.includes("om-after"));
++    expect(got.every((s) => s.t === "output")).toBe(true);
++    expect(acc).toContain("om-after");
++    expect(acc).not.toContain("om-before");
++    await iter.return?.(undefined);
++    await t.stop(ref);
++  });
++
++  it("日志文件缺失（目录不存在）→ 不报错、无日志信号；snapshot.meta.log 如实标注不可用", async () => {
++    const { exec } = realExec("stall");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref, { kernelDataDir: path.join(TMP_ROOT, "no-such-dir") })[Symbol.asyncIterator]();
++    const p = iter.next();
++    const r = await Promise.race([p, sleep(600).then(() => null)]);
++    expect(r).toBeNull(); // 600ms 内无任何日志信号（亦未抛错）
++    await t.stop(ref); // 唤醒挂起 next → 迭代正常终止
++    expect((await p).done).toBe(true);
++    const snap = await t.snapshot(ref);
++    expect(snap.meta.log).toMatchObject({ available: false, file: null });
++  });
++
++  it("轮转：observe 中旧文件删除、新文件建立并写入 service 行 → 信号来自新文件且 meta.log.file 更新", async () => {
++    const { exec } = realExec("stall");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++
++    const kdir = makeKernelDir("rot-");
++    const logDir = path.join(kdir, "log");
++    mkdirSync(logDir, { recursive: true });
++    const fileA = path.join(logDir, "kernel-a.log");
++    writeFileSync(fileA, "old baseline\n");
++    cleanups.push(async () => rmSync(kdir, { recursive: true, force: true }));
++
++    const iter = t.observe(ref, { kernelDataDir: kdir })[Symbol.asyncIterator]();
++    // 轮转：删 A 建 B（mtime 更新 → newest 切换），B 从头读（全新内容）
++    rmSync(fileA);
++    const fileB = path.join(logDir, "kernel-b.log");
++    appendFileSync(fileB, "INFO rotated service=om-rotated\n");
++    const { acc } = await collectUntil(iter, (_s, a) => a.includes("om-rotated"));
++    expect(acc).toContain("service=om-rotated");
++    expect(acc).not.toContain("old baseline");
++
++    const snap = await t.snapshot(ref);
++    expect(snap.meta.log).toMatchObject({ available: true, file: "kernel-b.log" });
++    await iter.return?.(undefined);
++    await t.stop(ref);
++  });
++});
++
++describe("observe：真实 PTY 往返（script -qefc 实跑 fixture，R-p5/R-p6）", () => {
++  it("注入文本回显 [RX:<text>] 与 [ENTER] 依序成为 output 信号（两段式提交端到端）", async () => {
++    const { exec } = realExec();
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    cleanups.push(async () => {
++      await t.stop(ref);
++    });
++    await t.inject(ref, "hello");
++    const { acc } = await collectUntil(iter, (_s, a) => a.includes("[ENTER]"));
++    // 回显顺序：注入文本回显/fixture 回显在前，[ENTER] 在后
++    expect(acc).toContain("[RX:hello]");
++    expect(acc.indexOf("[RX:hello]")).toBeLessThan(acc.indexOf("[ENTER]"));
++    await iter.return?.(undefined);
++  });
++
++  it("R-p6 UTF-8 跨 chunk：多字节序列拆两半写入 → 信号文本完整还原\"你好\"", async () => {
++    const { exec } = realExec("utf8");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const { acc } = await collectUntil(iter, (_s, a) => a.includes("你好"));
++    expect(acc).toContain("你好");
++    await iter.return?.(undefined);
++    await t.stop(ref);
++  });
++
++  it("exit 场景：进程死后 alive=false 且 observe 结束（done 信号后迭代终止，不挂起）", async () => {
++    const { exec } = realExec("exit");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const { got } = await collectUntil(iter, (s) => s.t === "done");
++    expect(got.at(-1)!.t).toBe("done");
++    expect(await t.alive(ref)).toBe(false); // done 已产出：进程死亡已确认
++    expect((await iter.next()).done).toBe(true);
++  });
++
++  it("error 场景（exit=3）：同样产出 done 信号并终止（退出码属 TUI 语义，宿主如实转达结束）", async () => {
++    const { exec } = realExec("error");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const { acc } = await collectUntil(iter, (s) => s.t === "done");
++    expect(acc).toContain("[FAKE-ERROR]");
++    expect((await iter.next()).done).toBe(true);
++  });
++});
++
++describe("R-p4 stop 进程组终止（实跑 family 场景，/proc 全树核对）", () => {
++  it("stop 后宿主 script、fixture bash、标记孙进程全部消失；stop 幂等", async () => {
++    // 清场：清掉此前异常残留的本套件 fixture 进程（argv 精确匹配，不误伤他者）
++    for (const pid of [...findProcs(isMarkerProc), ...findProcs(isFixtureProc)]) {
++      try {
++        process.kill(pid, "SIGKILL");
++      } catch {
++        // 已消失：不计
++      }
++    }
++    await pollUntil(
++      () => findProcs(isMarkerProc).length === 0 && findProcs(isFixtureProc).length === 0,
++      3000,
++      "前置清场应完成",
++    );
++
++    const { exec } = realExec("family");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    cleanups.push(async () => {
++      await t.stop(ref);
++    });
++    // 等标记孙进程出现（fixture 启动 + 后台拉起）
++    await pollUntil(() => findProcs(isMarkerProc).length > 0, 5000, "标记孙进程应出现");
++    // pid 快照：stop 前的本树全体成员（宿主 script + fixture bash + 孙进程）
++    const before = new Set<number>([...findProcs(isMarkerProc), ...findProcs(isFixtureProc)]);
++    expect(before.size).toBeGreaterThanOrEqual(3);
++
++    await t.stop(ref);
++    // 全树无残留：快照中每个 pid 均消失（组杀 + PTY master 关闭 SIGHUP 级联）
++    await pollUntil(
++      () => [...before].every((p) => !existsPid(p)),
++      3000,
++      "进程树应全部终止",
++    );
++    expect(await t.alive(ref)).toBe(false);
++
++    await t.stop(ref); // 幂等
++    expect(await t.alive(ref)).toBe(false);
++  });
++});
++
++describe("snapshot / alive", () => {
++  it("raw 按 PTY 输出累积；meta 含 id/host/pid/alive/closed/log（观察前 log 不可用态如实标注）", async () => {
++    const child = makeFakeChild();
++    const t = makeTransport(recordingExec(child).exec);
++    const ref = await t.start(CFG);
++    child.emit("part-1");
++    child.emit("part-2");
++    const snap = await t.snapshot(ref);
++    expect(snap.raw).toBe("part-1part-2");
++    expect(snap.meta).toMatchObject({
++      id: ref.id,
++      kind: "pty",
++      host: "script",
++      pid: 424242,
++      alive: true,
++      closed: false,
++      log: { available: false, file: null, serviceLines: 0 },
++    });
++    expect(await t.alive(ref)).toBe(true);
++  });
++
++  it("serviceLines 计数与 log 可用性在观察后如实反映", async () => {
++    const { exec } = realExec("stall");
++    const t = makeTransport(exec);
++    const ref = await t.start(CFG);
++    const kdir = makeKernelDir("meta-");
++    const logDir = path.join(kdir, "log");
++    mkdirSync(logDir, { recursive: true });
++    const logFile = path.join(logDir, "kernel-m.log");
++    writeFileSync(logFile, "base\n");
++    cleanups.push(async () => {
++      rmSync(kdir, { recursive: true, force: true });
++      await t.stop(ref);
++    });
++
++    const iter = t.observe(ref, { kernelDataDir: kdir })[Symbol.asyncIterator]();
++    appendFileSync(logFile, "A service=om-1\n");
++    await collectUntil(iter, (_s, a) => a.includes("om-1"));
++    const snap = await t.snapshot(ref);
++    expect(snap.meta.log).toMatchObject({ available: true, file: "kernel-m.log", serviceLines: 1 });
++    await iter.return?.(undefined);
++  });
++});
++
++describe("nodeScriptSpawnPty 生产缺省实现", () => {
++  it("PATH 上不存在的可执行文件 → PTY_HOST_UNAVAILABLE 显式报错（不 spawn、无竞态）", () => {
++    try {
++      nodeScriptSpawnPty(["codearts-bridge-no-such-bin-xyz"], {});
++      expect.unreachable();
++    } catch (e) {
++      expect((e as BridgeError).code).toBe("PTY_HOST_UNAVAILABLE");
++    }
++  });
++
++  it("本机 script(1) 存在：可包装 /bin/echo 并产出输出（真实 PTY 冒烟）", async () => {
++    const child = nodeScriptSpawnPty(["script", "-qefc", "echo smoke-ok", "/dev/null"], process.env);
++    const chunks: string[] = [];
++    child.onData((c) => chunks.push(c));
++    await pollUntil(() => !child.alive(), 5000, "echo 应退出");
++    expect(chunks.join("")).toContain("smoke-ok");
++  });
++});

@@ -1,0 +1,152 @@
+# Review package: 3c292e471d..8b7d4a43ba
+
+## Commits
+8b7d4a43ba codearts-bridge(T2-01): 修复评审发现 — abort 语义入 types 唯一真相源；挂起等待 return/throw 对称唤醒 — I1/M34
+
+## Files changed
+ plugins/codearts-bridge/src/core/transport/fake.ts  | 19 +++++++++++++++----
+ plugins/codearts-bridge/src/core/transport/types.ts |  3 +++
+ plugins/codearts-bridge/test/transport-fake.test.ts | 14 ++++++++++++++
+ 3 files changed, 32 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/transport/fake.ts b/plugins/codearts-bridge/src/core/transport/fake.ts
+index e4d50c736d..58fe8b25ce 100644
+--- a/plugins/codearts-bridge/src/core/transport/fake.ts
++++ b/plugins/codearts-bridge/src/core/transport/fake.ts
+@@ -133,53 +133,64 @@ export class FakeTransport implements CodeartsTransport {
+         `会话已有活跃观察者（单观察者模型）：id=${ref.id}`,
+         { remediation: "先结束当前观察（迭代完成/return/abort）再重新 observe。" },
+       );
+     }
+     // 已 abort：立即正常结束的空迭代，且不占用观察者名额（"未开始即取消"）。
+     if (opts?.signal?.aborted) return emptySignals();
+ 
+     const token = Symbol("observer");
+     s.observer = token;
+     const self = this;
++    // 消费方显式终结标记：包装迭代器 return/throw 置位并唤醒挂起等待（M34），
++    // 挂起中的 next 立即正常落定，委托给 async generator 的 return/throw 请求
++    // 才有机会被处理（否则排在永不落定的 next 之后，同样永不落定）。
++    let terminated = false;
+ 
+     async function* iterate(): AsyncGenerator<Signal> {
+       const signal = opts?.signal;
+       const onAbort = (): void => self.wakeAll(s);
+       signal?.addEventListener("abort", onAbort, { once: true });
+       try {
+         while (true) {
+-          // abort = 立即放弃：每次 next 先检查，未消费残存信号丢弃（R-tr2 正常结束）。
+-          if (signal?.aborted) return;
++          // abort = 立即放弃：每次 next 先检查，未消费残存信号丢弃（R-tr2 正常结束）；
++          // 消费方 return/throw 同为立即放弃（terminated，M34 对称语义）。
++          if (signal?.aborted || terminated) return;
+           if (s.pending.length === 0) {
+             if (s.closed || !s.alive) return;
+             await waitFor(s);
+             continue;
+           }
+           yield s.pending.shift() as Signal;
+         }
+       } finally {
+         signal?.removeEventListener("abort", onAbort);
+         self.releaseObserver(s, token);
+       }
+     }
+ 
+-    // 包装迭代器：显式 return/throw 时先同步释放观察者再委托——
+-    // 保证"未启动即 return"（async generator 体未执行、finally 不触发）也不泄漏。
++    // 包装迭代器：显式 return/throw 时先同步终结挂起等待并释放观察者再委托——
++    // ① "未启动即 return"（async generator 体未执行、finally 不触发）也不泄漏；
++    // ② 挂起等待（pending next 于 waitFor）时对称唤醒（M34）：与 abort 路径同态，
++    //    挂起中的 next 立即正常落定（done）、残存信号丢弃，消费方调用不悬死。
+     const inner = iterate();
+     const iterator: AsyncIterator<Signal> = {
+       next: () => inner.next(),
+       return: (v?: unknown) => {
++        terminated = true;
+         self.releaseObserver(s, token);
++        self.wakeAll(s);
+         return inner.return(v as undefined);
+       },
+       throw: (e?: unknown) => {
++        terminated = true;
+         self.releaseObserver(s, token);
++        self.wakeAll(s);
+         return inner.throw(e);
+       },
+     };
+     return { [Symbol.asyncIterator]: () => iterator };
+   }
+ 
+   async alive(ref: SessionRef): Promise<boolean> {
+     return this.requireSession(ref).alive;
+   }
+ 
+diff --git a/plugins/codearts-bridge/src/core/transport/types.ts b/plugins/codearts-bridge/src/core/transport/types.ts
+index 90c73c4bf4..62de75d6d4 100644
+--- a/plugins/codearts-bridge/src/core/transport/types.ts
++++ b/plugins/codearts-bridge/src/core/transport/types.ts
+@@ -37,20 +37,23 @@ export interface CodeartsTransport {
+    * 启动（或复用）一个目标会话。ref 缺省创建新会话；传入 start 返回过的 ref
+    * 表示复用/恢复该会话（语义由实现定义并注明）。
+    */
+   start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef>;
+ 
+   /** 向会话注入一段文本（如续跑指令）。 */
+   inject(ref: SessionRef, text: string): Promise<void>;
+ 
+   /**
+    * 观察会话事件流。opts.signal abort → 迭代正常结束（不抛错，R-tr2）。
++   * abort 语义（本文件为唯一真相源）：**立即放弃**——残存未消费信号丢弃、
++   * 不 flush；真实传输（T2-02~04）须对齐该状态机行为（T3-03 经 FakeTransport
++   * 验证的行为以此为基准）。
+    * 并发观察策略由实现定义（FakeTransport 为单观察者，重复 observe 显式报错）。
+    */
+   observe(ref: SessionRef, opts?: { signal?: AbortSignal }): AsyncIterable<Signal>;
+ 
+   /** 会话是否存活。 */
+   alive(ref: SessionRef): Promise<boolean>;
+ 
+   /** 停止会话；对已停止会话幂等。 */
+   stop(ref: SessionRef): Promise<void>;
+ 
+diff --git a/plugins/codearts-bridge/test/transport-fake.test.ts b/plugins/codearts-bridge/test/transport-fake.test.ts
+index c3d8cc427a..2ec7801029 100644
+--- a/plugins/codearts-bridge/test/transport-fake.test.ts
++++ b/plugins/codearts-bridge/test/transport-fake.test.ts
+@@ -231,20 +231,34 @@ describe("FakeTransport.observe 单观察者约束", () => {
+       expect.unreachable();
+     } catch (e) {
+       expect((e as BridgeError).code).toBe("OBSERVER_ACTIVE");
+     }
+     // 未启动（从未 next）的迭代器显式 return：观察者同步释放
+     await first[Symbol.asyncIterator]().return?.(undefined);
+     // 释放后可重新 observe；以 stop 终结空流（队列空且未终结时 observe 保持挂起）
+     await t.stop(ref);
+     expect(await drain(t, ref)).toEqual([]);
+   });
++
++  it("挂起 next 期间调用 return()：pending next 与 return 均落定，观察者名额释放（M34 对称唤醒）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const pending = iter.next(); // 队列空 → 挂起于 waitFor（与 abort 用例同态）
++    const ret = iter.return?.(undefined); // 消费方显式终结：须对称唤醒挂起等待
++    expect(ret).toBeDefined(); // 迭代器协议要求 return 存在（本实现显式提供）
++    expect((await pending).done).toBe(true);
++    expect((await ret)?.done).toBe(true);
++    // 名额已释放：可再次 observe（以 done 脚本信号收尾，drain 约定）
++    t.emit(ref, "done", "after-return");
++    expect((await drain(t, ref)).map((s) => s.text)).toEqual(["after-return"]);
++  });
+ });
+ 
+ describe("FakeTransport.stop / alive 切换（R-tr3-③④）", () => {
+   it("stop 后：alive=false、正在挂起的 observe 正常终止、再次 observe 立即正常结束（空）", async () => {
+     const t = new FakeTransport();
+     const ref = await t.start(CFG);
+     t.emit(ref, "output", "before-stop");
+ 
+     const iter = t.observe(ref)[Symbol.asyncIterator]();
+     const r1 = await iter.next();

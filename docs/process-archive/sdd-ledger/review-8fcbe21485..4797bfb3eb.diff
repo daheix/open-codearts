@@ -1,0 +1,307 @@
+# Review package: 8fcbe21485..4797bfb3eb
+
+## Commits
+4797bfb3eb codearts-bridge(T2-03): 修复评审发现 — 重建终止旧观察者并干净起步新对象（补组合场景单测） — I1
+
+## Files changed
+ .../codearts-bridge/src/core/transport/pty-tmux.ts | 27 ++++++++--
+ .../codearts-bridge/src/core/transport/shared.ts   | 16 ++++--
+ .../codearts-bridge/test/transport-tmux.test.ts    | 63 ++++++++++++++++++++++
+ 3 files changed, 99 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+index 54fd30ea43..54fc35d2b3 100644
+--- a/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
++++ b/plugins/codearts-bridge/src/core/transport/pty-tmux.ts
+@@ -37,22 +37,28 @@
+  * - 会话命名 `codearts-<slug>-<hash8(installDir)>`：slug = installDir 基名转写
+  *   （非 [a-zA-Z0-9] → '-'，截 24 字符）；hash8 = installDir sha256 前 8 位十六
+  *   进制。同 cfg 确定性同名（跨守护重启重连锚点，spec §宿主重启对账），不同
+  *   安装目录不碰撞。
+  * - ref.id 即 tmux 会话名；tmux 服务器为状态真相。start(ref) **不要求** ref 曾
+  *   在本实例注册（跨守护重启后从 state 恢复的 ref 可直接重连/重建，T3-04 对账
+  *   依赖此语义）；其余方法仍要求注册（SESSION_UNKNOWN，与 Fake/script 对齐）。
+  * - start(ref) 对已亡会话 = 同名重建（spec："tmux 存活则重连；否则重启会话"），
+  *   用当前 cfg 的 installDir；重建时显式清空队列与捕获基线（pane 已更换，旧
+  *   输出不属新生命期）、复位 closed/doneEmitted，日志计数保留（本传输账目）。
+- *   重建时的活跃观察者（如有）随会话名延续：下一轮存活探测转真、以新 pane
+- *   重建捕获基线（观察者语义 = 跟随会话名，非跟随具体 pane 实例）。
++ *   重建时的活跃观察者（如有）按 **stop 语义** 终止（置旧状态对象 closed 并
++ *   唤醒——观察循环见 closed 即静默返回，不产 done 信号；与 tmux kill-session
++ *   的会话级行为一致：会话消亡则其上一切观察随之终止）。新状态对象以
++ *   observer/waiters 干净起步——否则旧观察者结束时只能清到旧对象，新对象上
++ *   残留的陈旧观察者标记会令后续 observe(ref) 永远 OBSERVER_ACTIVE（评审
++ *   I1）。日志可用性在新旧对象间显式同步：两对象共享同一 log 状态对象且
++ *   shared.ts 全部原地变更（见 shared.ts I1 注），旧观察者结束（close→不可用
++ *   态）对新对象的 snapshot 立即可见，不产生分叉的陈旧 meta。
+  * - observe = 生成器体内轮询 `capture-pane -p`（注入时钟，POLL_MS）：基线在
+  *   首轮捕获确定（基线前内容不交付，与日志 tailer statSync 基线同理）；差分
+  *   规则：新内容前缀演进 → 交付增量；非前缀演进（TUI 重绘）→ 全量如实转达。
+  *   生产者仅在生成器体内运行（与 script 的 onData 独立生产者不同），残存保留
+  *   语义由会话队列跨观察持久承担（测试钉死）。pane 捕获在 observe() 返回后
+  *   才异步进行（tmux 探测为异步），故存活校验发生在首次 next（显式
+  *   SESSION_NOT_ALIVE，与 script 的同步抛错时点差异已注明）。
+  * - snapshot.raw = 即时 capture-pane 输出；会话亡故 → raw=""（无 pane 可捕获）。
+  * - 一次性 done 语义：observe 期间会话外部消亡 → 产一次 done 后迭代结束
+  *   （对齐 script 进程自然退出）；本传输 stop() 终止则不产 done（与 Fake 同态）。
+@@ -295,22 +301,27 @@ export function createTmuxTransport(
+     wakeAll(s);
+   }
+ 
+   /** 新建/同名重建后的会话状态（重建保留日志计数，清空 pane 侧痕迹）。 */
+   function freshSession(target: string, prev?: TmuxSession): TmuxSession {
+     const created: SessionRef = { kind, id: target };
+     const s: TmuxSession = {
+       ref: created,
+       target,
+       queue: [],
+-      waiters: prev?.waiters ?? [],
+-      observer: prev?.observer ?? null,
++      // I1：waiters/observer 一律干净起步。重建路径在调用本函数前已对旧对象
++      // wakeAll（waiters 全数摘除、旧观察者按 stop 语义终止于旧对象），新对象
++      // 继承旧 observer 标记会让旧观察者的收尾清不到它，后续 observe 永远
++      // OBSERVER_ACTIVE。log 引用继承保留（与旧对象共享同一状态对象，可用性
++      // 经 shared.ts 原地变更在两者间显式同步）。
++      waiters: [],
++      observer: null,
+       closed: false,
+       doneEmitted: false,
+       lastCapture: null,
+       log: prev?.log ?? { available: false, file: null, serviceLines: 0 },
+     };
+     return s;
+   }
+ 
+   const transport: CodeartsTransport = {
+     kind,
+@@ -342,20 +353,28 @@ export function createTmuxTransport(
+             `new-session 失败（退出码 ${r.exitCode}）：${r.stderr.trim()}`,
+             { remediation: "检查 installDir/bin/codearts 存在且可执行，以及 tmux 服务器状态。" },
+           );
+         }
+         const prev = sessions.get(target);
+         if (prev === undefined) {
+           sessions.set(target, freshSession(target));
+         } else {
+           // 同名重建：pane 已更换——队列/捕获基线显式清空（旧输出不属新生命期，
+           // 非静默：文档与测试钉死）；日志计数保留（本传输账目）。
++          // I1（评审修复）：重建前先终止旧对象上的活跃观察者——置旧状态对象
++          // closed 并唤醒，旧观察循环见 closed 即按 stop 语义静默结束（不产
++          // done 信号，与 tmux kill-session 的会话级行为一致：会话消亡则其上
++          // 一切观察随之终止）；新对象以 observer/waiters 干净起步（见
++          // freshSession），杜绝旧观察者收尾只清旧对象、新对象永久残留陈旧
++          // 观察者标记的滞留。
++          prev.closed = true;
++          wakeAll(prev);
+           sessions.set(target, freshSession(target, prev));
+         }
+       } else if (!sessions.has(target)) {
+         // 采纳既有会话（跨守护重启重连）：本实例此前未见，从零建账
+         sessions.set(target, freshSession(target));
+       }
+       return { kind, id: target };
+     },
+ 
+     async inject(ref: SessionRef, text: string): Promise<void> {
+diff --git a/plugins/codearts-bridge/src/core/transport/shared.ts b/plugins/codearts-bridge/src/core/transport/shared.ts
+index a71de0467e..afd76b8841 100644
+--- a/plugins/codearts-bridge/src/core/transport/shared.ts
++++ b/plugins/codearts-bridge/src/core/transport/shared.ts
+@@ -3,20 +3,26 @@
+  *
+  * 职责：pty-script（T2-02）与 pty-tmux（T2-03）两宿主的共享实现件，唯一真相源
+  * 在本文件；两宿主只 import、不复制。提取范围以"显著降低重复且不破坏既有测试"
+  * 为限（主控裁定 R-tm5）：
+  * - 日志信号源 tailer（`<kernelDataDir>/log/kernel-*.log` 增量 tail + service=
+  *   行过滤入队，R-p2/R-tm6 同语义）——自 pty-script.ts 原样迁移（逻辑零改动，
+  *   仅把"唤醒会话等待者"从直接调用 wakeAll(s) 改为注入 wake 回调，因唤醒机制
+  *   属各宿主自有状态）；
+  * - shQuote / lookPath / 可注入时钟类型——两宿主同源小助手。
+  *
++ * I1（评审修复，2026-10-31）：log 状态在本文件内一律**原地变更**（不整体替换
++ * s.log 引用）。原因：tmux 同名重建（T2-03 start(ref) 对账语义）时新旧会话
++ * 状态对象共享同一 log 对象，若以引用替换方式更新可用性，旧观察者结束时的
++ * close 只替换到旧对象，新对象读到的 snapshot.meta.log 将永久滞留陈旧值
++ * （分叉）；原地变更使可用性/文件名/计数对所有持有时显式同步。
++ *
+  * 观察循环骨架（队列排空/closed/单观察者/abort 对齐）各宿主差异较大
+  * （script 为同步 child.alive() + onData 独立生产者；tmux 为异步 has-session
+  * 探测 + 生成器体内轮询 capture-pane 生产者），**不做**提取——按 R-tm5 的
+  * "否则最小重复实现"处理，两宿主各自实现并互相标注来源。
+  */
+ 
+ import { accessSync, constants, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
+ import { open } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import * as path from "node:path";
+@@ -122,31 +128,34 @@ export function armLogTailer(
+   let current: string | null = null;
+   let offset = 0;
+   let partial = ""; // 未遇 \n 的行尾残段（跨增量保持）
+   const decoder = new StringDecoder("utf8"); // 文件字节 → 字符（跨增量多字节安全）
+   let closedT = false;
+   let polling = false;
+   let dirty = false;
+   let fileWatcher: FSWatcher | null = null;
+   let dirWatcher: FSWatcher | null = null;
+ 
++  // I1：原地变更（不替换 s.log 引用）——理由见文件头"I1 评审修复"
+   const markUnavailable = (): void => {
+-    s.log = { ...s.log, available: false, file: null };
++    s.log.available = false;
++    s.log.file = null;
+   };
+ 
+   // ── 同步基线（确定性关键：observe 返回时基线已定） ──
+   try {
+     const newest = newestKernelLog(dir);
+     if (newest !== null) {
+       current = newest.path;
+       offset = newest.size;
+-      s.log = { ...s.log, available: true, file: newest.name };
++      s.log.available = true;
++      s.log.file = newest.name;
+     }
+   } catch {
+     markUnavailable(); // 目录缺失等（R-p2：不报错）
+   }
+ 
+   const rearmFileWatcher = (p: string): void => {
+     fileWatcher?.close();
+     fileWatcher = null;
+     try {
+       const w = watch(p, { persistent: false }, () => void tailer.poll());
+@@ -208,21 +217,22 @@ export function armLogTailer(
+       partial = "";
+       markUnavailable();
+       return;
+     }
+     if (newest.path !== current) {
+       // 轮转/首见新文件：从 0 读（新文件内容全部为增量），残段作废
+       rearmFileWatcher(newest.path);
+       current = newest.path;
+       offset = 0;
+       partial = "";
+-      s.log = { ...s.log, available: true, file: newest.name };
++      s.log.available = true; // I1：原地变更（见文件头）
++      s.log.file = newest.name;
+     }
+     if (offset >= newest.size) return; // 无增量
+     const fh = await open(newest.path, "r");
+     try {
+       const len = newest.size - offset;
+       const buf = Buffer.alloc(len);
+       const { bytesRead } = await fh.read(buf, 0, len, offset);
+       offset += bytesRead;
+       partial += decoder.write(buf.subarray(0, bytesRead));
+     } finally {
+diff --git a/plugins/codearts-bridge/test/transport-tmux.test.ts b/plugins/codearts-bridge/test/transport-tmux.test.ts
+index a57aa6cb89..6e0077dd1e 100644
+--- a/plugins/codearts-bridge/test/transport-tmux.test.ts
++++ b/plugins/codearts-bridge/test/transport-tmux.test.ts
+@@ -10,20 +10,24 @@
+  *   未命中 → new-session -d -s <target> <installDir>/bin/codearts（argv 数组，
+  *   禁 shell 字符串拼接）。start(ref) 对已亡会话 = 同名重建（spec 宿主重启
+  *   对账语义："存活重连/否则重启会话"）。
+  * - R-tm3 inject 两段式：send-keys（文本）与 send-keys（Enter）两次独立调用
+  *   且保序；多行文本显式 INJECT_TEXT_MULTILINE（与 T2-02 同码）。
+  * - R-tm4 stop/alive/snapshot：stop=kill-session（不存在→幂等）；
+  *   alive=has-session 退出码；snapshot=capture-pane -p（含 meta）。
+  * - R-tm6 语义对齐：abort=立即放弃（T9 基准，残存保留给下一次 observe）；
+  *   stop 后 observe 终止（不产 done）；日志信号源与 T2-02 同语义
+  *   （kernelDataDir tail service= 行，meta 如实标注可用性）。
++ * - I1 评审修复（2026-10-31）：同名重建时活跃观察者按 stop 语义终止（不产
++ *   done、立即结束），新对象 observer 干净起步——再次 observe 可用（不再
++ *   OBSERVER_ACTIVE）；snapshot log meta 不分叉（旧 tailer 关闭如实转不可用、
++ *   serviceLines 计数保留）。
+  *
+  * 隔离：tmux 命令执行器全部注入 fake（离线、不触真实 HOME/套接字）；本机未装
+  * tmux，真机用例以 describe.skipIf(!HAS_TMUX) 标记（将 skip，有 tmux 环境才跑；
+  * attach 语义不在测试面）。临时落点仅插件 test/.tmp/（用后即删）。
+  */
+ import { afterEach, describe, expect, it } from "bun:test";
+ import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import * as path from "node:path";
+ import { loadConfig } from "../src/core/config";
+ import { BridgeError } from "../src/core/errors";
+@@ -544,20 +548,79 @@ describe("observe：pane 增量信号（gated clock 确定性）", () => {
+   it("会话已亡且未 stop 时 observe → SESSION_NOT_ALIVE（tmux pane 已消失，无缓冲可交付，显式报错）", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec, { clock: slowClock });
+     const ref = await t.start(CFG);
+     fake.setExists(false);
+     const iter = t.observe(ref)[Symbol.asyncIterator]();
+     await expect(iter.next()).rejects.toMatchObject({ code: "SESSION_NOT_ALIVE" });
+   });
+ });
+ 
++describe("I1 评审修复：同名重建时活跃观察者终止与状态干净起步", () => {
++  it("重建=旧观察者按 stop 语义终止（不产 done、立即结束）；再次 observe 成功可用（不再 OBSERVER_ACTIVE）", async () => {
++    const g = makeGatedClock();
++    const fake = makeFakeTmux();
++    const t = createTmuxTransport(fake.exec, { clock: g.clock });
++    const ref = await t.start(CFG);
++    const iter1 = t.observe(ref)[Symbol.asyncIterator]();
++    const p1 = iter1.next();
++    g.tick(); // 基线轮（空 pane）→ 停在门控等待
++    await Promise.race([p1, sleep(30).then(() => null)]);
++    fake.setExists(false); // 会话外部消亡（旧观察者尚不知情、仍挂起）
++    await t.start(CFG, ref); // 同名重建：旧观察者应被 stop 语义终止
++    const r1 = await Promise.race([p1, sleep(3000).then(() => null)]);
++    expect(r1).not.toBeNull(); // 旧观察已终止（超时保护）
++    expect(r1!.done).toBe(true); // 直接落定结束：未交付任何信号（stop 语义不产 done）
++    // 新对象 observer 干净起步：再次 observe 不抛 OBSERVER_ACTIVE 且可正常交付
++    fake.setPane("base");
++    const iter2 = t.observe(ref, { kernelDataDir: path.join(TMP_ROOT, "no-such-dir") })[
++      Symbol.asyncIterator
++    ]();
++    const p2 = iter2.next();
++    g.tick(); // 新 pane 基线轮（base，不产信号）→ 停在门控
++    await Promise.race([p2, sleep(30).then(() => null)]);
++    fake.appendPane("+out");
++    g.tick(); // 差分 → output 信号
++    const r2 = await Promise.race([p2, sleep(3000).then(() => null)]);
++    expect(r2).not.toBeNull(); // 再次观察成功可用（超时保护）
++    expect(r2!.done).toBe(false);
++    expect(r2!.value).toMatchObject({ t: "output", text: "+out" });
++    await iter2.return?.(undefined);
++  });
++
++  it("重建后 snapshot log meta 不分叉：旧 tailer 关闭如实转不可用，serviceLines 计数保留", async () => {
++    const fake = makeFakeTmux();
++    const t = createTmuxTransport(fake.exec, { clock: slowClock });
++    const ref = await t.start(CFG);
++    const kdir = makeKernelDir("reb-");
++    const logDir = path.join(kdir, "log");
++    mkdirSync(logDir, { recursive: true });
++    const logFile = path.join(logDir, "kernel-reb.log");
++    writeFileSync(logFile, "base\n");
++    cleanups.push(async () => rmSync(kdir, { recursive: true, force: true }));
++
++    const iter1 = t.observe(ref, { kernelDataDir: kdir })[Symbol.asyncIterator]();
++    appendFileSync(logFile, "X service=rebuild-1\n");
++    await collectUntil(iter1, (_s, a) => a.includes("rebuild-1")); // 消费一条 service 信号
++    fake.setExists(false);
++    await t.start(CFG, ref); // 同名重建（旧观察者被 stop 语义终止）
++    const r1 = await Promise.race([iter1.next(), sleep(3000).then(() => null)]);
++    expect(r1).not.toBeNull(); // 旧迭代已终止（超时保护）
++    expect(r1!.done).toBe(true); // 不再挂起、不产 done 信号
++    // snapshot log meta：旧 tailer 已 close → 如实不可用（修复前读到分叉的陈旧
++    // available:true）；serviceLines 为本传输账目、跨重建保留
++    const snap = await t.snapshot(ref);
++    expect(snap.meta.log).toMatchObject({ available: false, file: null, serviceLines: 1 });
++    expect(snap.meta).toMatchObject({ alive: true, closed: false }); // snapshot 正常
++  });
++});
++
+ describe("R-tm6 日志信号源（与 T2-02 同语义）", () => {
+   it("追加 service= 行 → output 信号；基线前已存在行不产信号；serviceLines 跨观察累计且结束后 available:false", async () => {
+     const fake = makeFakeTmux();
+     const t = createTmuxTransport(fake.exec, { clock: slowClock });
+     const ref = await t.start(CFG);
+     const kdir = makeKernelDir("log-");
+     const logDir = path.join(kdir, "log");
+     mkdirSync(logDir, { recursive: true });
+     const logFile = path.join(logDir, "kernel-a.log");
+     writeFileSync(logFile, "INFO boot ok\nWARN old service=om-before\n");

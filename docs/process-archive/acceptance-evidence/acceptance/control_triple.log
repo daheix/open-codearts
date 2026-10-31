@@ -1,0 +1,17 @@
+=== 控制三连 2026-10-31T17:44:11+08:00 ===
+--- pause:
+{"state":{"goalId":"gmvw7jb86-e2736735","objective":"在当前目录创建文件 hello-bridge.txt，内容为一行文字：codearts-bridge 真机验收 OK，然后结束","verify":[],"phase":"paused","rounds":1,"steps":[],"strikes":52,"injected":["【/goal 目标契约】\n目标：在当前目录�
+--- pause 后 6s 审计增量（应无新 restart/inject）:
+17:37:18 goal.start 
+17:37:18 goal.inject contract
+17:37:18 goal.error tick-failed
+--- resume:
+{"error":{"code":"SESSION_NOT_ALIVE","message":"会话已结束，拒绝操作：id=script-1","remediation":"script 宿主会话不可复活；请新建会话（start 不带 ref）。"}}
+--- resume 后 7s 审计增量（重启风暴应恢复）:
+17:37:18 goal.start 
+17:37:18 goal.inject contract
+17:37:18 goal.error tick-failed
+--- stop:
+{"state":{"goalId":"gmvw7jb86-e2736735","objective":"在当前目录创建文件 hello-bridge.txt，内容为一行文字：codearts-bridge 真机验收 OK，然后结束","verify":[],"phase":"stopped","rounds":2,"steps":[],"strikes":53,"injected":["【/goal 目标契约】\n目标：在当前目录
+--- stop 后目标状态（GET 应为 stopped / 出册读盘）:
+phase= stopped rounds= 2 strikes= 53

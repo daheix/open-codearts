@@ -1,0 +1,9 @@
+=== 控制三连 18:22:53 ===
+-- [pause 已完成 phase=paused]
+-- 杀死 paused 目标的会话进程 pid=602838
+会话已死（paused 期间不自动重建=预期）
+-- resume（缺陷⑤：死会话 resume 应走重建路径）
+resume→ active rounds 3 strikes 2
+-- resume 后 TUI 进程（应已重建）
+603565 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+603566 /home/wsc/.codeartsdoer/installers/bin/codearts

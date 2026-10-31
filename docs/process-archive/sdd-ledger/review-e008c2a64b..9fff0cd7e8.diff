@@ -1,0 +1,1123 @@
+# Review package: e008c2a64b..9fff0cd7e8
+
+## Commits
+9fff0cd7e8 codearts-bridge(T1-04): 备份与自愈 — 原子写/同数据集检查/copy 部署/显式错误分支/autoupdate 修正
+
+## Files changed
+ plugins/codearts-bridge/src/core/fsx.ts      | 115 +++++++-
+ plugins/codearts-bridge/src/core/install.ts  | 413 ++++++++++++++++++++++++++-
+ plugins/codearts-bridge/test/fsx.test.ts     | 173 ++++++++++-
+ plugins/codearts-bridge/test/install.test.ts | 244 +++++++++++++++-
+ 4 files changed, 928 insertions(+), 17 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/fsx.ts b/plugins/codearts-bridge/src/core/fsx.ts
+index 8b6b951959..58b9cd7055 100644
+--- a/plugins/codearts-bridge/src/core/fsx.ts
++++ b/plugins/codearts-bridge/src/core/fsx.ts
+@@ -1,24 +1,33 @@
+ /**
+  * codearts-bridge 文件原语（T1-03 起；R-b 主控裁定：fsx 提前）。
+  *
+- * 本任务仅实现 `sha256File`（node:crypto 流式哈希）；T1-04 将在同一文件扩展
+- * sameDevice / copyDeploy / atomicWriteFile。全仓库只允许这一处文件哈希实现，
+- * 禁止任何调用方自带第二份哈希逻辑（裁定 R-b：禁止哈希两处重复实现）。
++ * T1-03：`sha256File`（node:crypto 流式哈希）；
++ * T1-04（R-fx1/R-fx2）：`sameDevice`（st_dev 比较）/ `atomicWriteFile`（同目录
++ * tmp+rename）/ `copyDeploy`（同目录 tmp 写全 + fsync + rename 的原子替换部署）。
++ * 全仓库只允许这一处文件哈希实现，禁止任何调用方自带第二份哈希逻辑
++ * （裁定 R-b：禁止哈希两处重复实现）。
+  *
+  * 错误纪律（禁静默兜底）：任何读取失败（含 ENOENT）都显式抛
+  * BridgeError("FS_READ_FAILED")，消息含路径与原因码，原始错误挂 cause。
+  * ENOENT 的"缺失属正常态"语义由调用方（如 probeInstall 的 stat 预检）负责，
+  * 本原语不代判——哈希目标理应存在，读不到就是异常。
++ *
++ * 写侧错误纪律（T1-04）：写/改名/同步失败统一抛 BridgeError("FS_WRITE_FAILED")，
++ * 消息含操作、源/目标路径与 errno 原因码；失败时目标文件保持旧内容原位、
++ * 本函数创建的临时件一律清理（R-fx1：失败时旧文件原位、临时件清理）。
+  */
+-import { createHash } from "node:crypto";
+-import { createReadStream } from "node:fs";
++import { createHash, randomBytes } from "node:crypto";
++import { createReadStream, createWriteStream } from "node:fs";
++import { open as fsOpen, chmod, rename, rm, stat } from "node:fs/promises";
++import { pipeline } from "node:stream/promises";
++import * as path from "node:path";
+ import { BridgeError } from "./errors";
+ 
+ /** 从错误对象提取 errno 形态的 code（如 ENOENT/EACCES）；无则 undefined。 */
+ export function errnoOf(e: unknown): string | undefined {
+   if (typeof e === "object" && e !== null && "code" in e) {
+     const code = (e as { code?: unknown }).code;
+     if (typeof code === "string") return code;
+   }
+   return undefined;
+ }
+@@ -42,10 +51,106 @@ export async function sha256File(filePath: string): Promise<string> {
+       );
+     });
+     stream.on("data", (chunk: unknown) => {
+       hash.update(chunk as Buffer);
+     });
+     stream.on("end", () => {
+       resolve(hash.digest("hex"));
+     });
+   });
+ }
++
++/* ───── 写侧原语（T1-04，R-fx1/R-fx2） ───── */
++
++/** 统一写侧错误出口：保原因码（errno）与原始错误 cause。 */
++function writeError(operation: string, detail: string, e: unknown): BridgeError {
++  const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++  return new BridgeError("FS_WRITE_FAILED", `${operation}失败：${detail} reason=${reason}`, {
++    cause: e,
++  });
++}
++
++/** 失败路径的临时件清理（尽力而为）：主错误照常上抛，此处只负责不留垃圾件。 */
++async function cleanupTmp(tmpPath: string): Promise<void> {
++  await rm(tmpPath, { force: true }).catch(() => undefined);
++}
++
++/**
++ * st_dev 比较（任务书接口：sameDevice）。两个路径都必须存在——
++ * 不存在的路径无法给出设备号，显式报错（禁止静默假定同/异设备）。
++ * 用途：T1-05 升级暂存目录选址（暂存与 bin 必须同文件系统才能安全 rename）。
++ */
++export async function sameDevice(a: string, b: string): Promise<boolean> {
++  const statOne = async (p: string): Promise<{ dev: number }> => {
++    try {
++      return await stat(p);
++    } catch (e) {
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      throw new BridgeError("FS_STAT_FAILED", `stat 失败：path=${p} reason=${reason}`, {
++        cause: e,
++      });
++    }
++  };
++  const [sa, sb] = await Promise.all([statOne(a), statOne(b)]);
++  return sa.dev === sb.dev;
++}
++
++/**
++ * 原子写文件（R-fx2）：同目录 `.<名>.atomic-tmp-<rand>` 写全 + fsync + rename。
++ *
++ * - 支持 `string`（UTF-8）与 `Uint8Array` 两种载荷；
++ * - `mode` 可选：给定则显式 chmod（umask 无关）；未给定则沿用创建掩码产生的常规权限；
++ * - 崩溃/失败中断时目标文件保持原状（目标只经同目录 rename 变更，绝无半写）；
++ *   失败路径清理本函数创建的临时件。
++ */
++export async function atomicWriteFile(p: string, data: string | Uint8Array, mode?: number): Promise<void> {
++  const tmpPath = path.join(
++    path.dirname(p),
++    `.${path.basename(p)}.atomic-tmp-${randomBytes(6).toString("hex")}`,
++  );
++  try {
++    const fh = await fsOpen(tmpPath, "wx", 0o644); // wx：独占创建，防误伤同名件
++    try {
++      await fh.writeFile(data); // string 按 UTF-8 编码
++      await fh.sync(); // 落盘后 rename（裁定 R-fx2/R-fx1 同机制）
++      if (mode !== undefined) await fh.chmod(mode); // 显式 chmod，umask 无关
++    } finally {
++      await fh.close();
++    }
++    await rename(tmpPath, p); // 同目录同文件系统，原子替换
++  } catch (e) {
++    await cleanupTmp(tmpPath);
++    throw writeError("原子写文件", `path=${p}`, e);
++  }
++}
++
++/**
++ * copy 部署（R-fx1 原子替换语义）：目标文件要么是旧内容要么是新内容，绝无半写。
++ *
++ * 机制（主控裁定 R-fx1）：同目录 `.<名>.deploy-tmp-<rand>` 流式写全（不从 src
++ * 整读入内存——安装二进制可达数十 MB）→ fsync → 显式 chmod → rename。
++ * rename 发生在同目录（同文件系统），天然满足"禁止跨文件系统 rename"约束。
++ *
++ * - `mode` 默认 0o755（二进制部署惯例），显式 chmod 与 umask 无关；
++ * - 失败时旧文件原位、临时件清理、错误显式上抛（含 src/dst 与 errno）。
++ */
++export async function copyDeploy(src: string, dst: string, mode = 0o755): Promise<void> {
++  const tmpPath = path.join(
++    path.dirname(dst),
++    `.${path.basename(dst)}.deploy-tmp-${randomBytes(6).toString("hex")}`,
++  );
++  try {
++    // 流式拷贝：src → 同目录 tmp（wx 独占创建）
++    await pipeline(createReadStream(src), createWriteStream(tmpPath, { flags: "wx" }));
++    await chmod(tmpPath, mode); // 显式 chmod（裁定：mode 默认 755，chmod 显式）
++    const fh = await fsOpen(tmpPath, "r+");
++    try {
++      await fh.sync(); // 数据落盘后再 rename（裁定 R-fx1）
++    } finally {
++      await fh.close();
++    }
++    await rename(tmpPath, dst); // 原子替换：目标要么旧内容要么新内容
++  } catch (e) {
++    await cleanupTmp(tmpPath);
++    throw writeError("copy 部署", `src=${src} dst=${dst}`, e);
++  }
++}
+diff --git a/plugins/codearts-bridge/src/core/install.ts b/plugins/codearts-bridge/src/core/install.ts
+index a9948e840e..f1dc6e3b87 100644
+--- a/plugins/codearts-bridge/src/core/install.ts
++++ b/plugins/codearts-bridge/src/core/install.ts
+@@ -1,45 +1,66 @@
+ /**
+- * codearts-bridge 安装管家——安装状态探测（T1-03）。
++ * codearts-bridge 安装管家——安装状态探测（T1-03）与备份自愈修复（T1-04）。
+  *
+- * 职责（本任务）：`probeInstall` 只读采集 codearts CLI 安装态：
++ * T1-03 职责：`probeInstall` 只读采集 codearts CLI 安装态：
+  * 二进制存在性 / --version / sha256 / 备份有效性 / autoupdate 开关 / 钉版一致性。
+- * repair / upgrade / guard 由 T1-04 / T1-05 在本文件扩展。
++ *
++ * T1-04 职责（本任务）：
++ * - `repairInstall`：备份发现（期望版本命名 → 扫描 codearts.bak-*）→ 校验
++ *   （哈希 vs 钉版口径 + --version 可执行）→ copyDeploy 原子替换部署 → 复验
++ *   （哈希+版本）→ 审计；可选 `fixAutoupdate` 显式关停自动升级。
++ * - `ensureBackup`：备份是派生物可安全刷新——二进制有效且备份缺失/失效 →
++ *   从二进制 copyDeploy 刷新 `codearts.bak-<版本>` + 审计；二进制无效 → 显式报错。
++ * - 审计（R-fx6）：`<stateDir>/audit/install.jsonl` 追加写，auditId 形如
++ *   `rep-<时间戳>-<随机短码>`。
++ *
++ * 背景事故（remediation 文案依据）：升级流程"先改名（codearts→codearts.delete）
++ * 后部署"，部署失败会静默遗留 .delete 残局；备份命名实例 `codearts.bak-26.10.9`；
++ * 官方接入/升级入口 https://codearts.huaweicloud.com/portal/settings/cli-auth。
+  *
+  * 主控裁定依据（SDD 2026-10-31，逐条落实）：
+  * - R-a 钉版状态显式化：`pinState` 三态（unpinned/consistent/drift）——
+  *   pinned.json 缺失时 drift=false 不得掩盖"未钉版"，调用方以 pinState 区分
+  *   "未钉版"与"已钉且一致"，禁止静默假定。
+  * - R-c autoupdate 读取：路径派生 `<installDir>/../codearts_cli.json`；
+  *   文件缺失 → autoupdateFlag=undefined（显式"未知"）；JSON 解析失败或字段
+  *   类型非法 → 抛出（显式，不静默 undefined）。
+  * - R-d probeInstall 语义：只读状态采集——业务态（缺失/坏哈希/无法执行/版本不符）
+  *   以状态字段如实表达、不抛业务错误；文件系统意外错误（非 ENOENT，如 EACCES）
+  *   → 抛出（消息含路径与原因）。`--version` 解析取输出首个 `/^\d+\.\d+\.\d+/m`
+  *   匹配；exec 失败 → version=undefined（状态可见）。
+  * - R-e 隔离：Exec 注入接口 + 默认 node 实现；测试绝不真跑 codearts 二进制、
+  *   绝不触碰真实 HOME。
++ * - R-fx3 ensureBackup 语义：备份可安全刷新；源二进制无效 → 显式 BridgeError
++ *   （无备份可做，不静默）。
++ * - R-fx4 repair 备份发现顺序与恢复步骤：校验 → copyDeploy → 复验 → 审计；
++ *   全无备份 → BIN_MISSING_NO_BACKUP（remediation 含 .delete 残留检查/官方重装/
++ *   备份恢复指引/官方入口链接）；候选存在但均无效 → BACKUP_INVALID_HASH。
++ * - R-fx5 fixAutoupdate：显式开关（默认不执行）；仅改 autoupdate 字段，
++ *   保留其余字段（含未知字段）；解析失败 → AUTOUPDATE_INVALID 且不触碰文件。
+  *
+  * 漂移判定口径（哈希为内容身份，版本为可读复核）：
+  * - 已钉时：二进制缺失、或 sha256 与钉版不符 → drift；
+  *   版本仅在"可解析且不等"时参与判定（exec 失败导致版本未知不算版本漂移，
+  *   版本未知本身已由 version=undefined 如实呈现）。
+  * - 备份有效性 backupValid：备份存在且为非空常规文件；有钉版时还须哈希与钉版
+  *   一致（修复源强校验），无钉版时仅要求存在且非空（无比对基准）。
+  */
+ import { spawn } from "node:child_process";
+-import { readFile, stat } from "node:fs/promises";
++import { randomBytes } from "node:crypto";
++import { appendFile, readFile, readdir, stat } from "node:fs/promises";
+ import type { Stats } from "node:fs";
+ import * as path from "node:path";
+ import type { BridgeConfig } from "./config";
++import { ensureStateDirs } from "./config";
+ import { BridgeError } from "./errors";
+-import { errnoOf, sha256File } from "./fsx";
++import { atomicWriteFile, copyDeploy, errnoOf, sha256File } from "./fsx";
+ 
+ /* ───── 路径派生（单一出口，T1-04/05 复用） ───── */
+ 
+ /** 二进制绝对路径：<installDir>/bin/codearts。 */
+ export function binPathOf(installDir: string): string {
+   return path.join(installDir, "bin", "codearts");
+ }
+ 
+ /** 钉版记录路径：<stateDir>/pinned.json。 */
+ export function pinnedJsonPath(stateDir: string): string {
+@@ -409,10 +430,392 @@ export async function probeInstall(
+     version,
+     sha256,
+     backupPath,
+     backupValid,
+     autoupdateFlag,
+     pinState,
+     drift: pinState === "drift",
+     pinned: pin,
+   };
+ }
++
++/* ───── 审计（R-fx6：install.jsonl 追加写） ───── */
++
++/** auditId 形如 rep-<epoch 毫秒>-<6 位随机十六进制>（R-fx6）。 */
++function newRepairAuditId(): string {
++  return `rep-${Date.now()}-${randomBytes(3).toString("hex")}`;
++}
++
++/**
++ * 追加一条审计到 <stateDir>/audit/install.jsonl（R-fx6）。
++ * 先 ensureStateDirs（audit/ 目录 0700）；追加失败显式抛 FS_WRITE_FAILED（含路径）。
++ */
++async function appendInstallAudit(cfg: BridgeConfig, entry: Record<string, unknown>): Promise<void> {
++  await ensureStateDirs(cfg);
++  const file = path.join(cfg.stateDir, "audit", "install.jsonl");
++  try {
++    await appendFile(file, `${JSON.stringify(entry)}\n`, "utf8");
++  } catch (e) {
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_WRITE_FAILED", `追加审计失败：path=${file} reason=${reason}`, {
++      cause: e,
++    });
++  }
++}
++
++/* ───── 备份候选发现与校验（R-fx4） ───── */
++
++/** 备份命名契约：bin 同目录下 codearts.bak-<任意后缀>（实例 codearts.bak-26.10.9）。 */
++const BACKUP_NAME_RE = /^codearts\.bak-.+/;
++
++/** 备份候选校验结果：ok 时携带内容哈希与可读版本；失败时携带机器可读原因。 */
++type BackupValidation =
++  | { ok: true; sha256: string; version: string }
++  | { ok: false; reason: string };
++
++/**
++ * 校验单个备份候选（R-fx4 恢复步骤第 1 步）：
++ * - 存在且为非空常规文件（与 T1-03 backupValid 口径一致）；
++ * - 哈希校验："备份自身记录口径"= 有钉版时 sha256 须与钉版一致（内容身份），
++ *   无钉版时无比对基准（仅要求非空常规文件）；
++ * - `--version` 可执行且可解析（备份必须能跑起来才有恢复价值）。
++ * 单个候选的 stat/读取失败按"该候选无效"记录原因并继续（候选枚举容错：
++ * 扫描目录里可能有垃圾件，不应让单个坏候选中断整个发现过程；
++ * 全部无效时由调用方汇总原因显式报错，无静默）。
++ */
++async function validateBackupCandidate(
++  backupPath: string,
++  pin: PinnedRecord | undefined,
++  exec: Exec,
++): Promise<BackupValidation> {
++  let st: Stats | undefined;
++  try {
++    st = await statOrEnoent(backupPath);
++  } catch (e) {
++    return { ok: false, reason: `stat-failed(${e instanceof Error ? e.message : String(e)})` };
++  }
++  if (st === undefined) return { ok: false, reason: "missing" };
++  if (!st.isFile()) return { ok: false, reason: "not-file" };
++  if (st.size === 0) return { ok: false, reason: "empty" };
++
++  let sha: string;
++  try {
++    sha = await sha256File(backupPath);
++  } catch (e) {
++    return { ok: false, reason: `read-failed(${e instanceof Error ? e.message : String(e)})` };
++  }
++  if (pin !== undefined && sha !== pin.sha256) return { ok: false, reason: "hash-mismatch" };
++
++  const version = await detectVersion(exec, backupPath);
++  if (version === undefined) return { ok: false, reason: "not-runnable" };
++  return { ok: true, sha256: sha, version };
++}
++
++/** 列出 bin 目录文件名；目录不存在 → 空数组（无候选是显式状态）；其他错误显式抛。 */
++async function listBinDirNames(binDir: string): Promise<string[]> {
++  try {
++    return await readdir(binDir);
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return [];
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取目录失败：path=${binDir} reason=${reason}`, {
++      cause: e,
++    });
++  }
++}
++
++/** 当前二进制的可读版本（仅 present 且为常规文件时探测；否则 undefined）。 */
++async function currentBinVersion(exec: Exec, binPath: string): Promise<string | undefined> {
++  const st = await statOrEnoent(binPath);
++  if (st === undefined || !st.isFile()) return undefined;
++  return detectVersion(exec, binPath);
++}
++
++/** BIN_MISSING_NO_BACKUP 的统一出口：remediation 含真实事故四要素（R-fx4）。 */
++function noBackupError(binPath: string, binDir: string): BridgeError {
++  return new BridgeError(
++    "BIN_MISSING_NO_BACKUP",
++    `二进制缺失且找不到任何可用备份：bin=${binPath} binDir=${binDir}`,
++    {
++      remediation:
++        `1) 检查 ${binDir} 下是否存在 codearts.delete 等升级中断残留` +
++        `（升级流程"先改名后部署"，部署失败会遗留 .delete 残局）；` +
++        `2) 从官方安装包重装 codearts CLI；` +
++        `3) 若其他位置留有 codearts.bak-* 备份，手工复制到 ${binDir}/codearts.bak-<版本> 后重试恢复；` +
++        `4) 官方接入/升级入口：https://codearts.huaweicloud.com/portal/settings/cli-auth`,
++    },
++  );
++}
++
++/* ───── repairInstall（T1-04 核心：备份恢复自愈） ───── */
++
++/** 修复结果（任务书接口）：action 固定 restore-from-backup，from 显式记录所用备份文件名。 */
++export interface RepairResult {
++  action: "restore-from-backup";
++  from: string;
++  to: string;
++  sha256: string;
++  auditId: string;
++}
++
++/**
++ * 自愈修复（R-fx4）：从备份恢复二进制，可选显式关停 autoupdate。
++ *
++ * 执行顺序：
++ * 1. fixAutoupdate=true 时先关停自动升级（止血优先：即便恢复失败，
++ *    也不再被自动升级破坏；该动作独立审计，幂等可重试）；
++ * 2. 备份发现（R-fx4 顺序）：① `<bin>.bak-<期望版本>`（期望版本=钉版版本，
++ *    未钉版取当前二进制 probe 版本）→ ② 扫描 `codearts.bak-*` 取任一有效备份；
++ * 3. 逐候选校验（哈希 vs 钉版口径 + --version 可执行），取首个有效者；
++ * 4. copyDeploy 原子替换部署（R-fx1：目标要么旧内容要么新内容）；
++ * 5. 复验（哈希 vs 钉版/备份基线 + --version 可执行）；
++ * 6. 审计（kind=repair，含 auditId）并返回 RepairResult。
++ *
++ * 失败分支（显式，无静默）：
++ * - 无任何候选 → BIN_MISSING_NO_BACKUP（remediation 四要素，见 noBackupError）；
++ * - 候选存在但全部无效（含哈希不符）→ BACKUP_INVALID_HASH；
++ * - 部署后复验不过 → REPAIR_VERIFY_FAILED（不谎报成功）；
++ * - FS/权限失败 → FS_WRITE_FAILED（含路径与 errno，见 copyDeploy）。
++ */
++export async function repairInstall(
++  cfg: BridgeConfig,
++  exec: Exec,
++  opts: { fixAutoupdate?: boolean } = {},
++): Promise<RepairResult> {
++  // 1) 显式开关（R-fx5）：默认不执行；开启才修正 autoupdate
++  if (opts.fixAutoupdate === true) {
++    await fixAutoupdateFlag(cfg);
++  }
++
++  const binPath = binPathOf(cfg.installDir);
++  const binDir = path.dirname(binPath);
++  const pin = await readPinned(cfg.stateDir);
++
++  // 2) 候选发现：期望版本命名优先，其次扫描 codearts.bak-*
++  const candidates: string[] = [];
++  const expectedVersion = pin?.version ?? (await currentBinVersion(exec, binPath));
++  if (expectedVersion !== undefined) {
++    candidates.push(path.join(binDir, `codearts.bak-${expectedVersion}`));
++  }
++  const seen = new Set(candidates);
++  for (const name of (await listBinDirNames(binDir)).sort()) {
++    if (!BACKUP_NAME_RE.test(name)) continue;
++    const full = path.join(binDir, name);
++    if (!seen.has(full)) {
++      seen.add(full);
++      candidates.push(full);
++    }
++  }
++
++  // 3) 逐候选校验，取首个有效备份；全无效则按是否含哈希不符细分错误码。
++  //    "候选名不存在"是正常态（期望版本名没有对应备份），不计入失败候选——
++  //    只有真实存在的候选文件全部无效才算"有备份但都坏"（否则 only-delete
++  //    残局会误报 BACKUP_INVALID 而非 BIN_MISSING_NO_BACKUP）。
++  const failures: string[] = [];
++  let sawHashMismatch = false;
++  let existingCount = 0;
++  let chosen: { path: string; sha256: string; version: string } | undefined;
++  for (const candidate of candidates) {
++    const verdict = await validateBackupCandidate(candidate, pin, exec);
++    if (verdict.ok) {
++      chosen = { path: candidate, sha256: verdict.sha256, version: verdict.version };
++      break;
++    }
++    if (verdict.reason === "missing") continue;
++    existingCount++;
++    if (verdict.reason === "hash-mismatch") sawHashMismatch = true;
++    failures.push(`${candidate}: ${verdict.reason}`);
++  }
++  if (chosen === undefined) {
++    if (existingCount === 0) throw noBackupError(binPath, binDir);
++    if (sawHashMismatch) {
++      throw new BridgeError(
++        "BACKUP_INVALID_HASH",
++        `所有候选备份均无效（含哈希与钉版不符）：${failures.join("; ")}`,
++        { remediation: "备份文件已损坏：从官方安装包重装，或提供与钉版记录一致的备份后重试" },
++      );
++    }
++    throw new BridgeError(
++      "BACKUP_INVALID",
++      `所有候选备份均无效（非常规文件/为空/不可执行）：${failures.join("; ")}`,
++      { remediation: "备份不可执行无恢复价值：从官方安装包重装后重试" },
++    );
++  }
++
++  // 4) 原子替换部署（R-fx1；mode 默认 0755）
++  await copyDeploy(chosen.path, binPath, 0o755);
++
++  // 5) 复验（哈希+版本）：哈希基线=钉版 ?? 所用备份内容；版本须可解析（可读复核）
++  const expectedSha = pin?.sha256 ?? chosen.sha256;
++  const deployedSha = await sha256File(binPath);
++  const deployedVersion = await detectVersion(exec, binPath);
++  if (deployedSha !== expectedSha || deployedVersion === undefined) {
++    throw new BridgeError(
++      "REPAIR_VERIFY_FAILED",
++      `恢复后复验失败：bin=${binPath} sha256 一致=${deployedSha === expectedSha} 版本可解析=${deployedVersion !== undefined}`,
++      { remediation: "恢复部署未通过复验：检查备份文件与磁盘状态后重试，或从官方安装包重装" },
++    );
++  }
++
++  // 6) 审计 + 返回（auditId 显式回传调用方，可跨系统对账）
++  const auditId = newRepairAuditId();
++  await appendInstallAudit(cfg, {
++    ts: new Date().toISOString(),
++    auditId,
++    kind: "repair",
++    from: chosen.path,
++    to: binPath,
++    sha256: deployedSha,
++    result: "restored",
++  });
++  return { action: "restore-from-backup", from: chosen.path, to: binPath, sha256: deployedSha, auditId };
++}
++
++/* ───── fixAutoupdate（R-fx5：显式开关修正） ───── */
++
++/**
++ * 把 codearts_cli.json 的 autoupdate 修正为 false（R-fx5）：
++ * - 解析失败 / 顶层非对象 → BridgeError(AUTOUPDATE_INVALID)，不触碰文件；
++ * - 文件缺失 → 视为空对象，写入仅含 autoupdate:false 的新文件（显式动作，
++ *   审计 before=null 记录"原本缺失"）；
++ * - 仅改 autoupdate 字段，其余字段（含未知字段）原样保留；
++ * - 写回格式：JSON.stringify(obj, null, 2) + 末尾换行（R-fx5 指定）；
++ * - 已存在文件保留原 mode（外来用户文件不越权改权限），新建用 0644；
++ * - 已是 false → 幂等不重写，审计记录 already-off。
++ */
++async function fixAutoupdateFlag(cfg: BridgeConfig): Promise<void> {
++  const file = codeartsCliJsonPath(cfg.installDir);
++
++  let text: string | undefined;
++  try {
++    text = await readFile(file, "utf8");
++  } catch (e) {
++    if (errnoOf(e) !== "ENOENT") {
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      throw new BridgeError("FS_READ_FAILED", `读取文件失败：path=${file} reason=${reason}`, {
++        cause: e,
++      });
++    }
++    text = undefined; // 缺失是显式状态（与 probe 的 autoupdateFlag=undefined 同口径）
++  }
++
++  let raw: Record<string, unknown>;
++  if (text === undefined) {
++    raw = {};
++  } else {
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(text);
++    } catch (e) {
++      throw new BridgeError("AUTOUPDATE_INVALID", `codearts_cli.json 解析失败：path=${file}`, {
++        remediation: "修正该文件的 JSON 语法（该文件属 codearts CLI 用户配置）",
++        cause: e,
++      });
++    }
++    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
++      throw new BridgeError("AUTOUPDATE_INVALID", `codearts_cli.json 顶层须为 JSON 对象：path=${file}`);
++    }
++    raw = parsed as Record<string, unknown>;
++  }
++
++  const before = raw["autoupdate"]; // 可能缺失/布尔/其他类型；repair 一律规整为 false
++  const auditId = newRepairAuditId();
++
++  if (text !== undefined && before === false) {
++    // 幂等：已是 false 无需写；审计照记（审计是"动作发生过"的台账，非"值变化"的台账）
++    await appendInstallAudit(cfg, {
++      ts: new Date().toISOString(),
++      auditId,
++      kind: "fix-autoupdate",
++      file,
++      before: false,
++      after: false,
++      changed: false,
++      result: "already-off",
++    });
++    return;
++  }
++
++  raw["autoupdate"] = false;
++  const mode =
++    text !== undefined ? (await stat(file)).mode & 0o777 : 0o644; // 保留原权限；新建 0644
++  await atomicWriteFile(file, `${JSON.stringify(raw, null, 2)}\n`, mode);
++  await appendInstallAudit(cfg, {
++    ts: new Date().toISOString(),
++    auditId,
++    kind: "fix-autoupdate",
++    file,
++    before: before === undefined ? null : before,
++    after: false,
++    changed: true,
++    result: "fixed",
++  });
++}
++
++/* ───── ensureBackup（R-fx3：备份是派生物，可安全刷新） ───── */
++
++/**
++ * 确保备份在场且新鲜（R-fx3）：
++ * - 备份源有效性显式校验（禁静默）：存在 + 非空常规文件 + `--version` 可执行；
++ *   有钉版时哈希须与钉版一致——拒绝把漂移内容固化为备份；
++ * - 目标 `codearts.bak-<版本>`（版本名=钉版版本 ?? 当前解析版本；
++ *   源有效性校验已保证版本可解析，"unknown" 占位名在此路径不可能出现）；
++ * - 备份已与当前二进制一致（哈希相等）→ 不重写（派生物幂等），审计 up-to-date；
++ * - 缺失/失效 → copyDeploy 刷新（原子替换），审计 refreshed。
++ *
++ * 审计字段（R-fx6）：{ ts, auditId, kind:"ensure-backup", from, to, sha256, result }。
++ */
++export async function ensureBackup(cfg: BridgeConfig, exec: Exec): Promise<void> {
++  const binPath = binPathOf(cfg.installDir);
++  const pin = await readPinned(cfg.stateDir);
++
++  // 源有效性：缺失/非常规文件/空文件 → 显式报错（无备份可做，不静默）
++  const st = await statOrEnoent(binPath);
++  if (st === undefined || !st.isFile() || st.size === 0) {
++    throw new BridgeError("BACKUP_SOURCE_INVALID", `备份源无效（缺失/非常规文件/空文件）：path=${binPath}`, {
++      remediation: "先执行 codearts_repair 从备份恢复二进制，或从官方安装包重装后再试",
++    });
++  }
++  const version = await detectVersion(exec, binPath);
++  if (version === undefined) {
++    throw new BridgeError("BACKUP_SOURCE_INVALID", `备份源不可执行（--version 无有效输出）：path=${binPath}`, {
++      remediation: "不可执行的二进制无备份价值：先执行 codearts_repair 修复，或从官方安装包重装",
++    });
++  }
++  const sha = await sha256File(binPath);
++  if (pin !== undefined && sha !== pin.sha256) {
++    throw new BridgeError(
++      "BACKUP_SOURCE_INVALID",
++      `备份源 sha256 与钉版记录不符，拒绝把漂移内容固化为备份：path=${binPath}`,
++      { remediation: "先执行 codearts_repair 恢复与钉版一致的内容，再刷新备份" },
++    );
++  }
++
++  const backupPath = path.join(path.dirname(binPath), `codearts.bak-${pin?.version ?? version}`);
++  const auditId = newRepairAuditId();
++
++  // 已在场且与当前二进制一致 → 不重写（mtime 不变）
++  const existing = await statOrEnoent(backupPath);
++  if (existing !== undefined && existing.isFile() && existing.size > 0 && (await sha256File(backupPath)) === sha) {
++    await appendInstallAudit(cfg, {
++      ts: new Date().toISOString(),
++      auditId,
++      kind: "ensure-backup",
++      from: binPath,
++      to: backupPath,
++      sha256: sha,
++      result: "up-to-date",
++    });
++    return;
++  }
++
++  await copyDeploy(binPath, backupPath, 0o755);
++  await appendInstallAudit(cfg, {
++    ts: new Date().toISOString(),
++    auditId,
++    kind: "ensure-backup",
++    from: binPath,
++    to: backupPath,
++    sha256: sha,
++    result: "refreshed",
++  });
++}
+diff --git a/plugins/codearts-bridge/test/fsx.test.ts b/plugins/codearts-bridge/test/fsx.test.ts
+index db30ff7588..a3d6826820 100644
+--- a/plugins/codearts-bridge/test/fsx.test.ts
++++ b/plugins/codearts-bridge/test/fsx.test.ts
+@@ -1,21 +1,25 @@
+ /**
+- * T1-03 fsx 文件原语测试（R-b：本任务仅 sha256File；T1-04 在同文件扩展原语）。
++ * T1-03/T1-04 fsx 文件原语测试。
++ *
++ * T1-03（R-b）：sha256File；
++ * T1-04（R-fx1/R-fx2）：sameDevice（st_dev 比较）/ atomicWriteFile（同目录 tmp+rename）/
++ * copyDeploy（同目录 tmp 写全 + fsync + rename 的原子替换部署）。
+  *
+  * 纪律：FS 落点在插件 .tmp/fsx-test/ 之下，beforeEach 重建、afterAll 清理；
+  * 期望哈希用 node:crypto createHash 独立计算（测试侧 oracle，与被测实现分列）。
+  */
+ import { afterAll, beforeEach, describe, expect, it } from "bun:test";
+ import { createHash } from "node:crypto";
+-import { mkdir, rm, writeFile } from "node:fs/promises";
++import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+ import * as path from "node:path";
+-import { sha256File } from "../src/core/fsx";
++import { atomicWriteFile, copyDeploy, sameDevice, sha256File } from "../src/core/fsx";
+ 
+ const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
+ const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "fsx-test");
+ 
+ beforeEach(async () => {
+   await rm(TEST_ROOT, { recursive: true, force: true });
+   await mkdir(TEST_ROOT, { recursive: true });
+ });
+ 
+ afterAll(async () => {
+@@ -56,10 +60,173 @@ describe("sha256File", () => {
+       () => null,
+       (e: unknown) => e,
+     );
+     expect(err).toBeInstanceOf(Error);
+     expect((err as Error).name).toBe("BridgeError");
+     expect((err as { code?: string }).code).toBe("FS_READ_FAILED");
+     expect((err as Error).message).toContain(file);
+     expect((err as Error).message).toContain("ENOENT");
+   });
+ });
++
++describe("sameDevice（st_dev 比较；T1-05 暂存目录选址依据）", () => {
++  it("同目录树下两个路径 → true", async () => {
++    const a = path.join(TEST_ROOT, "a.txt");
++    const b = path.join(TEST_ROOT, "sub", "b.txt");
++    await mkdir(path.dirname(b), { recursive: true });
++    await writeFile(a, "a", "utf8");
++    await writeFile(b, "b", "utf8");
++    expect(await sameDevice(a, b)).toBe(true);
++  });
++
++  it("/tmp 与仓库 .tmp 分属 ZFS 双数据集 → false（本机实测 st_dev 不同）", async () => {
++    // 前提自检：若本机两路径恰在同设备，该用例前提失效（显式失败而非静默通过）
++    const devTmp = (await stat("/tmp")).dev;
++    const devRepo = (await stat(TEST_ROOT)).dev;
++    expect(devTmp).not.toBe(devRepo);
++    expect(await sameDevice("/tmp", TEST_ROOT)).toBe(false);
++  });
++
++  it("任一路径不存在 → 抛 BridgeError（显式，禁止静默假定同/异设备）", async () => {
++    const err: unknown = await sameDevice(TEST_ROOT, path.join(TEST_ROOT, "nope")).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(Error);
++    expect((err as Error).name).toBe("BridgeError");
++    expect((err as { code?: string }).code).toBe("FS_STAT_FAILED");
++    expect((err as Error).message).toContain("nope");
++  });
++});
++
++describe("atomicWriteFile（R-fx2：同目录 tmp+rename，崩溃中断目标保持原状）", () => {
++  it("写入 string：内容一致，显式 mode 生效（0o667 不被 umask 0002 掩蔽 → 证明显式 chmod）", async () => {
++    const file = path.join(TEST_ROOT, "state.json");
++    await atomicWriteFile(file, '{"a":1}\n', 0o667);
++    const content = await readFile(file, "utf8");
++    expect(content).toBe('{"a":1}\n');
++    const mode = (await stat(file)).mode & 0o777;
++    expect(mode).toBe(0o667); // umask 0002 下 open mode 只会得到 0o665；0o667 证明显式 chmod 生效
++  });
++
++  it("写入 Uint8Array：字节级一致", async () => {
++    const file = path.join(TEST_ROOT, "blob.bin");
++    const data = new Uint8Array([0, 1, 2, 250, 251, 255]);
++    await atomicWriteFile(file, data, 0o644);
++    const raw = new Uint8Array(await readFile(file));
++    expect(Array.from(raw)).toEqual([0, 1, 2, 250, 251, 255]);
++  });
++
++  it("覆盖旧文件：新内容完整、目录无 *.tmp-* 残留（rename 收尾干净）", async () => {
++    const file = path.join(TEST_ROOT, "target.txt");
++    await writeFile(file, "old-content", "utf8");
++    await atomicWriteFile(file, "new-content-complete", 0o644);
++    expect(await readFile(file, "utf8")).toBe("new-content-complete");
++    const leftovers = (await readdir(TEST_ROOT)).filter((n) => n.includes(".tmp-"));
++    expect(leftovers).toEqual([]);
++  });
++
++  it("崩溃注入：手工构造半写 tmp 残留（模拟写 tmp 后进程中断）→ 目标文件保持原状，且后续写入照常成功", async () => {
++    const file = path.join(TEST_ROOT, "target.txt");
++    await writeFile(file, "old-content", "utf8");
++    // 模拟崩溃残留：tmp 已写出但 rename 未发生（进程在此刻被杀死）
++    await writeFile(path.join(TEST_ROOT, ".target.txt.atomic-tmp-deadbeef"), "half-written", "utf8");
++    // 崩溃后目标仍为旧内容（tmp+rename 语义：目标只经 rename 变更）
++    expect(await readFile(file, "utf8")).toBe("old-content");
++    // 后续写入不受残留影响：成功、内容正确、自身 tmp 收尾
++    await atomicWriteFile(file, "recovered-content", 0o644);
++    expect(await readFile(file, "utf8")).toBe("recovered-content");
++  });
++
++  it("失败注入（目录只读，tmp 无法创建）→ 抛 BridgeError(FS_WRITE_FAILED) 含路径与 EACCES；目标保持旧内容", async () => {
++    const dir = path.join(TEST_ROOT, "ro-dir");
++    const file = path.join(dir, "target.txt");
++    await mkdir(dir, { recursive: true });
++    await writeFile(file, "old-content", "utf8");
++    await chmod(dir, 0o555); // 非 root（uid 1000）：写 tmp 必 EACCES
++    try {
++      const err: unknown = await atomicWriteFile(file, "new", 0o644).then(
++        () => null,
++        (e: unknown) => e,
++      );
++      expect(err).toBeInstanceOf(Error);
++      expect((err as Error).name).toBe("BridgeError");
++      expect((err as { code?: string }).code).toBe("FS_WRITE_FAILED");
++      expect((err as Error).message).toContain(file);
++      expect((err as Error).message).toContain("EACCES");
++      expect(await readFile(file, "utf8")).toBe("old-content"); // 中断不伤目标
++    } finally {
++      await chmod(dir, 0o755); // 还原以便 afterAll 清理
++    }
++  });
++});
++
++describe("copyDeploy（R-fx1：原子替换部署——目标要么旧内容要么新内容，绝无半写）", () => {
++  it("部署后目标哈希与源一致、mode 默认 0o755 显式生效", async () => {
++    const src = path.join(TEST_ROOT, "src.bin");
++    const dst = path.join(TEST_ROOT, "bin", "codearts");
++    const content = "fake codearts binary payload v26.10.9\n";
++    await mkdir(path.dirname(dst), { recursive: true });
++    await writeFile(src, content, "utf8");
++    await copyDeploy(src, dst);
++    expect(await sha256File(dst)).toBe(createHash("sha256").update(content, "utf8").digest("hex"));
++    expect((await stat(dst)).mode & 0o777).toBe(0o755);
++  });
++
++  it("自定义 mode（0o667）生效（umask 0002 下证明 chmod 显式而非继承创建掩码）", async () => {
++    const src = path.join(TEST_ROOT, "src2.bin");
++    const dst = path.join(TEST_ROOT, "dst2.bin");
++    await writeFile(src, "x", "utf8");
++    await copyDeploy(src, dst, 0o667);
++    expect((await stat(dst)).mode & 0o777).toBe(0o667);
++  });
++
++  it("覆盖已有目标：原子替换完成、无 *.tmp-* 残留、目标哈希=新源", async () => {
++    const src = path.join(TEST_ROOT, "src3.bin");
++    const dst = path.join(TEST_ROOT, "bin3", "codearts");
++    await mkdir(path.dirname(dst), { recursive: true });
++    await writeFile(dst, "old-binary", "utf8");
++    await writeFile(src, "new-binary", "utf8");
++    await copyDeploy(src, dst);
++    expect(await readFile(dst, "utf8")).toBe("new-binary");
++    const leftovers = (await readdir(path.dirname(dst))).filter((n) => n.includes(".tmp-"));
++    expect(leftovers).toEqual([]);
++  });
++
++  it("源缺失 → 抛 BridgeError(FS_WRITE_FAILED) 含源路径与 ENOENT；目标不受影响", async () => {
++    const dst = path.join(TEST_ROOT, "dst4.bin");
++    await writeFile(dst, "keep-old", "utf8");
++    const err: unknown = await copyDeploy(path.join(TEST_ROOT, "no-such-src"), dst).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(Error);
++    expect((err as Error).name).toBe("BridgeError");
++    expect((err as { code?: string }).code).toBe("FS_WRITE_FAILED");
++    expect((err as Error).message).toContain("no-such-src");
++    expect(await readFile(dst, "utf8")).toBe("keep-old");
++  });
++
++  it("目标目录只读 → 抛 BridgeError(FS_WRITE_FAILED) 含目标路径与 EACCES（Review-Focus-1 同源：结构化 IO 错误含路径与原因）；目标保持旧内容", async () => {
++    const dir = path.join(TEST_ROOT, "ro-bin");
++    const dst = path.join(dir, "codearts");
++    const src = path.join(TEST_ROOT, "src5.bin");
++    await mkdir(dir, { recursive: true });
++    await writeFile(dst, "old-binary", "utf8");
++    await writeFile(src, "new-binary", "utf8");
++    await chmod(dir, 0o555);
++    try {
++      const err: unknown = await copyDeploy(src, dst).then(
++        () => null,
++        (e: unknown) => e,
++      );
++      expect(err).toBeInstanceOf(Error);
++      expect((err as Error).name).toBe("BridgeError");
++      expect((err as { code?: string }).code).toBe("FS_WRITE_FAILED");
++      expect((err as Error).message).toContain(dst);
++      expect((err as Error).message).toContain("EACCES");
++      expect(await readFile(dst, "utf8")).toBe("old-binary"); // 失败时旧文件原位（裁定 R-fx1）
++    } finally {
++      await chmod(dir, 0o755);
++    }
++  });
++});
+diff --git a/plugins/codearts-bridge/test/install.test.ts b/plugins/codearts-bridge/test/install.test.ts
+index 23ccd666bf..f203238083 100644
+--- a/plugins/codearts-bridge/test/install.test.ts
++++ b/plugins/codearts-bridge/test/install.test.ts
+@@ -1,28 +1,32 @@
+ /**
+- * T1-03 安装状态探测测试（bun:test）。
++ * T1-03/T1-04 安装管家测试（bun:test）。
+  *
+- * 纪律（主控裁定 R-a/R-c/R-d/R-e）：
++ * T1-03：probeInstall 只读探测；T1-04：repairInstall（备份恢复自愈）/
++ * ensureBackup（备份刷新）/ fixAutoupdate（显式开关修正）。
++ *
++ * 纪律（主控裁定 R-a/R-c/R-d/R-e + T1-04 隔离裁定）：
+  * - 绝不真跑 codearts 二进制：exec 一律注入 fake（唯一例外用 /bin/sh 脚本测真实 exec 原语）；
+  * - 绝不触碰真实 HOME：cfg 经 loadConfig 注入 .tmp/install-test/ 下的绝对路径；
+  * - probeInstall 只读状态采集：业务态以字段如实表达（不抛业务错）；
+  *   FS 意外错误（非 ENOENT）与配置文件损坏 → 显式抛 BridgeError；
+  * - afterAll 清理临时目录（用后即删）。
+  */
+ import { existsSync } from "node:fs";
+ import { afterAll, beforeEach, describe, expect, it } from "bun:test";
+-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
++import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+ import * as path from "node:path";
+ import { loadConfig } from "../src/core/config";
+ import { BridgeError } from "../src/core/errors";
+ import { sha256File } from "../src/core/fsx";
+-import { createNodeExec, probeInstall } from "../src/core/install";
++import { createNodeExec, ensureBackup, probeInstall, repairInstall } from "../src/core/install";
++import type { Exec } from "../src/core/install";
+ import type { BridgeConfig } from "../src/core/config";
+ import {
+   BIN_CONTENT,
+   PINNED_VERSION,
+   fakeExec,
+   makeBinExecutableShScript,
+   makeInstallFixture,
+   throwingExec,
+   writePinnedFile,
+ } from "./fixtures/install-fixtures";
+@@ -373,10 +377,242 @@ describe("createNodeExec（默认 exec 原语；真实进程仅用 /bin/sh，绝
+     expect(existsSync(marker)).toBe(false);
+   });
+ 
+   it("正常捕获 stdout 与退出码", async () => {
+     const exec = createNodeExec({ timeoutMs: 5000 });
+     const result = await exec.run(["sh", "-c", "printf '26.10.9'; exit 3"]);
+     expect(result.code).toBe(3);
+     expect(result.stdout).toBe("26.10.9");
+   });
+ });
++
++/* ───── T1-04：备份与自愈修复 ───── */
++
++/** 读取审计文件（install.jsonl）为对象数组；空行跳过；供各断言复用。 */
++async function readAuditLines(stateDir: string): Promise<Array<Record<string, unknown>>> {
++  const text = await readFile(path.join(stateDir, "audit", "install.jsonl"), "utf8");
++  return text
++    .split("\n")
++    .filter((line) => line.trim().length > 0)
++    .map((line) => JSON.parse(line) as Record<string, unknown>);
++}
++
++const AUDIT_ID_RE = /^rep-\d+-[0-9a-f]{6,}$/;
++
++describe("T1-04 repairInstall（备份恢复自愈）", () => {
++  it("missing（.delete 残局但有有效备份）→ 从备份恢复成功：哈希+版本复验、auditId、审计行", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-ok"), "missing");
++    const result = await repairInstall(cfgOf(fx), fx.exec);
++
++    // 返回契约（任务书 RepairResult）
++    expect(result.action).toBe("restore-from-backup");
++    expect(result.from).toBe(fx.backupPath); // R-fx4：显式记录所用备份文件名
++    expect(result.to).toBe(fx.binPath);
++    expect(result.sha256).toBe(fx.pinnedSha256);
++    expect(result.auditId).toMatch(AUDIT_ID_RE);
++
++    // 恢复后二进制内容与钉版一致、可执行探测通过（fake exec 输出 26.10.9）
++    expect(await sha256File(fx.binPath)).toBe(fx.pinnedSha256);
++    // exec 恰好两次：备份校验 --version + 部署后复验 --version
++    expect(fx.execCalls).toEqual([
++      [fx.backupPath, "--version"],
++      [fx.binPath, "--version"],
++    ]);
++
++    // 审计（R-fx6）：<stateDir>/audit/install.jsonl 一条 kind=repair，字段齐全
++    const lines = await readAuditLines(fx.stateDir);
++    const entry = lines.find((l) => l["kind"] === "repair");
++    expect(entry).toBeDefined();
++    expect(entry?.["auditId"]).toBe(result.auditId);
++    expect(entry?.["from"]).toBe(fx.backupPath);
++    expect(entry?.["to"]).toBe(fx.binPath);
++    expect(entry?.["sha256"]).toBe(fx.pinnedSha256);
++    expect(typeof entry?.["ts"]).toBe("string");
++  });
++
++  it("修复后的安装经 probeInstall 复核为 consistent（恢复闭环）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-reprobe"), "missing");
++    await repairInstall(cfgOf(fx), fx.exec);
++    const status = await probeInstall(cfgOf(fx), { exec: fx.exec });
++    expect(status.present).toBe(true);
++    expect(status.pinState).toBe("consistent");
++    expect(status.drift).toBe(false);
++  });
++
++  it("only-delete（无任何备份）→ BridgeError(BIN_MISSING_NO_BACKUP)，remediation 含 .delete 残留检查/官方重装/备份恢复指引/官方入口链接", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-nobak"), "only-delete");
++    const err: unknown = await repairInstall(cfgOf(fx), fx.exec).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    const be = err as BridgeError;
++    expect(be.code).toBe("BIN_MISSING_NO_BACKUP");
++    expect(be.remediation).toBeDefined();
++    // 真实事故背景四要素（任务书裁定 R-fx4）：.delete 残留 / 官方重装 / 备份恢复 / 官方入口
++    expect(be.remediation).toContain("codearts.delete");
++    expect(be.remediation).toContain("重装");
++    expect(be.remediation).toContain("备份");
++    expect(be.remediation).toContain("https://codearts.huaweicloud.com/portal/settings/cli-auth");
++  });
++
++  it("备份存在但哈希与钉版不符 → BridgeError(BACKUP_INVALID_HASH)，消息含备份路径", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-badhash"), "missing");
++    await writeFile(fx.backupPath, "corrupted backup bytes\n", "utf8");
++    const err: unknown = await repairInstall(cfgOf(fx), fx.exec).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as BridgeError).code).toBe("BACKUP_INVALID_HASH");
++    expect((err as Error).message).toContain(fx.backupPath);
++  });
++
++  it("恢复步骤 ②：期望版本名备份缺失、旧版本名备份有效 → 扫描发现并恢复，RepairResult.from 为扫描所得", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-scan"), "healthy");
++    await rm(fx.backupPath); // 摘掉期望版本名的备份（步骤①落空）
++    const oldBackup = path.join(path.dirname(fx.binPath), "codearts.bak-26.10.8");
++    await writeFile(oldBackup, BIN_CONTENT, "utf8"); // 旧版本名但内容哈希与钉版一致 → 有效
++    const result = await repairInstall(cfgOf(fx), fx.exec);
++    expect(result.from).toBe(oldBackup);
++    expect(result.sha256).toBe(fx.pinnedSha256);
++    expect(await sha256File(fx.binPath)).toBe(fx.pinnedSha256);
++  });
++
++  it("恢复后复验失败（版本探测不通过）→ BridgeError(REPAIR_VERIFY_FAILED)，不谎报成功", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-verify"), "missing");
++    // 脚本化 fake exec：第 1 次（备份校验 --version）通过，此后全部失败（部署后复验落入）
++    const calls: string[][] = [];
++    const exec: Exec = {
++      run: async (cmd: string[]) => {
++        calls.push(cmd);
++        if (calls.length === 1) return { code: 0, stdout: `${PINNED_VERSION}\n`, stderr: "" };
++        return { code: 1, stdout: "", stderr: "boom" };
++      },
++    };
++    const err: unknown = await repairInstall(cfgOf(fx), exec).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as BridgeError).code).toBe("REPAIR_VERIFY_FAILED");
++    expect(calls.length).toBe(2); // 校验一次 + 复验一次
++  });
++
++  it("Review-Focus-1：bin 目录只读 → 结构化 IO 错误（FS_WRITE_FAILED）含目标路径与 EACCES 原因", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-ro"), "healthy");
++    const binDir = path.dirname(fx.binPath);
++    await chmod(binDir, 0o555); // 非 root（uid 1000）：写 tmp 必 EACCES
++    try {
++      const err: unknown = await repairInstall(cfgOf(fx), fx.exec).then(
++        () => null,
++        (e: unknown) => e,
++      );
++      expect(err).toBeInstanceOf(BridgeError);
++      expect((err as BridgeError).code).toBe("FS_WRITE_FAILED");
++      expect((err as Error).message).toContain(fx.binPath);
++      expect((err as Error).message).toContain("EACCES");
++    } finally {
++      await chmod(binDir, 0o755); // 还原以便清理
++    }
++  });
++
++  it("fixAutoupdate=true：autoupdate true 修正为 false，未知字段保留，审计含 before/after", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-au"), "healthy");
++    await writeFile(fx.cliPath, JSON.stringify({ autoupdate: true, unknownKeep: 42 }), "utf8");
++    await repairInstall(cfgOf(fx), fx.exec, { fixAutoupdate: true });
++
++    // 写回（R-fx5）：仅改 autoupdate 字段；2 空格缩进 + 末尾换行；未知字段原样保留
++    const text = await readFile(fx.cliPath, "utf8");
++    const parsed = JSON.parse(text) as Record<string, unknown>;
++    expect(parsed["autoupdate"]).toBe(false);
++    expect(parsed["unknownKeep"]).toBe(42);
++    expect(text.endsWith("\n")).toBe(true);
++    expect(text).toContain('\n  "unknownKeep"'); // 2 空格缩进格式
++
++    // 审计含 before/after
++    const lines = await readAuditLines(fx.stateDir);
++    const entry = lines.find((l) => l["kind"] === "fix-autoupdate");
++    expect(entry).toBeDefined();
++    expect(entry?.["before"]).toBe(true);
++    expect(entry?.["after"]).toBe(false);
++  });
++
++  it("fixAutoupdate=true 但 codearts_cli.json 损坏 → BridgeError(AUTOUPDATE_INVALID) 且文件一个字节都不动", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-au-corrupt"), "healthy");
++    const broken = "{ not json !!!";
++    await writeFile(fx.cliPath, broken, "utf8");
++    const err: unknown = await repairInstall(cfgOf(fx), fx.exec, { fixAutoupdate: true }).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as BridgeError).code).toBe("AUTOUPDATE_INVALID");
++    expect(await readFile(fx.cliPath, "utf8")).toBe(broken); // 不触碰文件
++  });
++
++  it("fixAutoupdate 缺省（undefined）→ 不执行修正动作（显式开关默认不执行，裁定 R-fx5）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "repair-au-default"), "healthy");
++    await writeFile(fx.cliPath, JSON.stringify({ autoupdate: true }), "utf8");
++    await repairInstall(cfgOf(fx), fx.exec);
++    const parsed = JSON.parse(await readFile(fx.cliPath, "utf8")) as Record<string, unknown>;
++    expect(parsed["autoupdate"]).toBe(true); // 未显式开启 → 原值不动
++    const lines = await readAuditLines(fx.stateDir);
++    expect(lines.find((l) => l["kind"] === "fix-autoupdate")).toBeUndefined();
++  });
++});
++
++describe("T1-04 ensureBackup（备份是派生物，可安全刷新）", () => {
++  it("备份缺失 → 从当前有效二进制 copyDeploy 刷新 codearts.bak-<版本> + 审计 refreshed", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-refresh"), "healthy");
++    await rm(fx.backupPath); // 制造"备份缺失"
++    await ensureBackupOf(fx);
++    // 备份已补齐：内容与二进制一致、mode 0755
++    expect(await sha256File(fx.backupPath)).toBe(fx.pinnedSha256);
++    expect(((await stat(fx.backupPath)).mode) & 0o777).toBe(0o755);
++    const lines = await readAuditLines(fx.stateDir);
++    const entry = lines.find((l) => l["kind"] === "ensure-backup");
++    expect(entry).toBeDefined();
++    expect(entry?.["result"]).toBe("refreshed");
++    expect(entry?.["from"]).toBe(fx.binPath);
++    expect(entry?.["to"]).toBe(fx.backupPath);
++    expect(entry?.["sha256"]).toBe(fx.pinnedSha256);
++  });
++
++  it("备份已有效 → 不重写（mtime 不变）+ 审计 up-to-date", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-uptodate"), "healthy");
++    const before = await stat(fx.backupPath);
++    await ensureBackupOf(fx);
++    const after = await stat(fx.backupPath);
++    expect(after.mtimeMs).toBe(before.mtimeMs); // 未重写
++    const lines = await readAuditLines(fx.stateDir);
++    const entry = lines.find((l) => l["kind"] === "ensure-backup");
++    expect(entry?.["result"]).toBe("up-to-date");
++  });
++
++  it("二进制缺失 → BridgeError(BACKUP_SOURCE_INVALID)：无有效备份源，显式报错不静默（裁定 R-fx3）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-nobin"), "missing");
++    const err: unknown = await ensureBackupOf(fx).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as BridgeError).code).toBe("BACKUP_SOURCE_INVALID");
++    expect((err as Error).message).toContain(fx.binPath);
++  });
++
++  it("二进制哈希与钉版漂移 → 拒绝把漂移内容固化为备份（BACKUP_SOURCE_INVALID）", async () => {
++    const fx = await makeInstallFixture(path.join(TEST_ROOT, "bak-drift"), "bad-hash");
++    const err: unknown = await ensureBackupOf(fx).then(
++      () => null,
++      (e: unknown) => e,
++    );
++    expect(err).toBeInstanceOf(BridgeError);
++    expect((err as BridgeError).code).toBe("BACKUP_SOURCE_INVALID");
++    expect((err as Error).message).toContain("sha256");
++  });
++
++  /** ensureBackup 便捷封装（被测函数签名：cfg + exec）。 */
++  function ensureBackupOf(fx: { installDir: string; stateDir: string; exec: Exec }): Promise<void> {
++    return ensureBackup(cfgOf(fx), fx.exec);
++  }
++});

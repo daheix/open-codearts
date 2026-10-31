@@ -1,0 +1,1516 @@
+# Review package: dab56deae7..b13e72fae1
+
+## Commits
+b13e72fae1 codearts-bridge(T1-08): M1 工具接线与验收 — 五工具+权限门+结构化错误，M1 全绿 — server.ts 升级为正式接线：codearts_status(probe+aksk+健康摘要+传输占位)/repair(权限门→R-t3 幂等→repairInstall→ensureBackup，fixAutoupdate 两路径透传)/upgrade(权限门→upgradeInstall)/health(collectHealth 快照)/hygiene(plan→apply=true 权限门→applyHygiene)；R-t1 错误一律 content 结构化返回(BridgeError→code/message/remediation，未知→INTERNAL+tool.internal-error 审计警告)，R-t2 权限门 action=codearts.manage resources/save=install|state 被拒返回 PERMISSION_DENIED 不执行、权限域缺失显式 PERMISSION_GATE_UNAVAILABLE 禁旁路；R-t6 单文件 619 行<1000；schema 严格 additionalProperties:false；buildPlugin(deps) 注入式装配(fake ctx 捕获 editor 直调 execute，绝不触碰真实 HOME/联网/真跑二进制)；install.ts 仅共享导出 fixAutoupdateFlag(健康路径响应显式 fixAutoupdate 请求)；22 个验收测试含 R-t4 .delete 残局+有效备份组合场景(哈希+auditId)，全量 156 绿+typecheck 零错误
+
+## Files changed
+ plugins/codearts-bridge/src/core/install.ts        |   7 +-
+ plugins/codearts-bridge/src/server.ts              | 660 +++++++++++++++++++--
+ plugins/codearts-bridge/test/m1-acceptance.test.ts | 627 ++++++++++++++++++++
+ plugins/codearts-bridge/test/server.test.ts        |  85 +--
+ 4 files changed, 1284 insertions(+), 95 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/install.ts b/plugins/codearts-bridge/src/core/install.ts
+index 5f69d7fecb..185ebceee9 100644
+--- a/plugins/codearts-bridge/src/core/install.ts
++++ b/plugins/codearts-bridge/src/core/install.ts
+@@ -677,22 +677,27 @@ export async function repairInstall(
+ 
+ /**
+  * 把 codearts_cli.json 的 autoupdate 修正为 false（R-fx5）：
+  * - 解析失败 / 顶层非对象 → BridgeError(AUTOUPDATE_INVALID)，不触碰文件；
+  * - 文件缺失 → 视为空对象，写入仅含 autoupdate:false 的新文件（显式动作，
+  *   审计 before=null 记录"原本缺失"）；
+  * - 仅改 autoupdate 字段，其余字段（含未知字段）原样保留；
+  * - 写回格式：JSON.stringify(obj, null, 2) + 末尾换行（R-fx5 指定）；
+  * - 已存在文件保留原 mode（外来用户文件不越权改权限），新建用 0644；
+  * - 已是 false → 幂等不重写，审计记录 already-off。
++ *
++ * T1-08 共享导出说明：工具层（server.ts）的 already-healthy 幂等路径需要在
++ * 不走 repairInstall 的前提下响应显式 fixAutoupdate 请求（R-t3：fixAutoupdate
++ * 透传，健康短路不得丢弃用户显式动作），故本函数自 T1-08 起对外导出；
++ * 语义不变：显式开关、幂等、独立审计。
+  */
+-async function fixAutoupdateFlag(cfg: BridgeConfig): Promise<void> {
++export async function fixAutoupdateFlag(cfg: BridgeConfig): Promise<void> {
+   const file = codeartsCliJsonPath(cfg.installDir);
+ 
+   let text: string | undefined;
+   try {
+     text = await readFile(file, "utf8");
+   } catch (e) {
+     if (errnoOf(e) !== "ENOENT") {
+       const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
+       throw new BridgeError("FS_READ_FAILED", `读取文件失败：path=${file} reason=${reason}`, {
+         cause: e,
+diff --git a/plugins/codearts-bridge/src/server.ts b/plugins/codearts-bridge/src/server.ts
+index 7a9f7411e7..1a88e4822c 100644
+--- a/plugins/codearts-bridge/src/server.ts
++++ b/plugins/codearts-bridge/src/server.ts
+@@ -1,72 +1,618 @@
+ /**
+- * codearts-bridge opencode 插件入口（薄壳，T1-01）。
++ * codearts-bridge opencode 插件入口与 M1 工具接线（T1-08）。
+  *
+- * 职责边界：仅做插件定义与工具注册冒烟验证；
+- * 安装管家/传输/目标引擎等核心能力由后续任务卡在 src/core/ 内落地。
++ * 职责边界：插件定义、五个 M1 管理工具的注册与编排（薄编排层）；
++ * 安装探测/修复/升级/健康/治理的业务逻辑全部在 src/core/*（T1-02~T1-07），
++ * 本文件不做任何业务判断——只做 参数归一 → 权限门 → 调 core → 结构化返回。
+  *
+- * 契约（@opencode/plugin 2.2.3，实测 dist 类型）：
+- * - Plugin.define({ id, setup })：恒等形状检查（define 原样返回入参）；
+- * - setup(context) 内经 context.tool.transform(callback) 拿到 ToolEditor，
+- *   editor.add({ name, input, description, execute, options }) 注册工具；
+- * - options.namespace = "codearts" + name = "status" ⇒ 对外有效名 codearts_status。
++ * 工具集（全部经 T1-02~T1-07 模块接线；对外有效名 = namespace + "_" + name）：
++ * - codearts_status            → probeInstall + readAksk + collectHealth 摘要 + 传输/守护占位
++ * - codearts_repair            → 权限门 → probeInstall 幂等检查（R-t3）→ repairInstall → ensureBackup
++ * - codearts_upgrade           → 权限门 → upgradeInstall（fetcher/extract 可注入）
++ * - codearts_health            → collectHealth 快照（真实环境全量扫日志，实测约 14s/次，见 health.ts 头注）
++ * - codearts_hygiene({apply?}) → planHygiene（只读）→ apply=true 时权限门 → applyHygiene
++ *
++ * 主控裁定落点（SDD 2026-10-31，逐条）：
++ * - R-t1（错误以 content 返回）：工具 execute 的业务错误不抛裸异常——统一经
++ *   toErrorPayload 以 { error:{code,message,remediation?} } 结构化进 content；
++ *   BridgeError 映射自身字段；未知异常 → code="INTERNAL" 并尽力写一条
++ *   tool.internal-error 审计警告（审计失败不掩盖返回给调用方的结构化错误，
++ *   与 upgrade.ts 失败审计同纪律）。宿主侧 schema 校验失败由宿主自行报错，
++ *   不在本层伪造兜底。
++ * - R-t2（权限门）：repair / upgrade / hygiene(apply=true) 必须先经
++ *   permission.assert({sessionID, agent, action:"codearts.manage",
++ *   resources, save, source:{type:"tool",messageID,id}})；resources/save：
++ *   repair/upgrade→["install"]，hygiene→["state"]。被拒 → 捕获断言错误并
++ *   以 PERMISSION_DENIED 结构化 content 返回、绝不执行（宿主文档建议 rethrow，
++ *   本裁定显式选择结构化返回：AI 调用方可见拒绝原因并可引导用户授权，裁定优先）。
++ *   permission 域缺失（非宿主调用）→ PERMISSION_GATE_UNAVAILABLE 显式报错，
++ *   禁止任何"跳过权限"的静默旁路。
++ * - R-t3（repair 幂等）：bin 健康（present ∧ 未漂移 ∧ 备份有效）时返回
++ *   already-healthy 结构化结果（非错误）；显式 fixAutoupdate 请求在幂等路径
++ *   同样生效（fixAutoupdateFlag 独立审计，透传不丢弃）；无备份场景的
++ *   BIN_MISSING_NO_BACKUP 由 repairInstall 抛出、经 R-t1 以 content 返回。
++ * - R-t6（文件组织）：本文件单文件实现五工具（约 500 行），远低于 1000 行红线。
++ *
++ * 可注入依赖（ToolDeps，测试与宿主两种装配路径）：
++ * - 生产：default 导出 buildPlugin()——config 取 loadConfig()（环境变量/默认值），
++ *   permission 取宿主注入的 context.permission；
++ * - 测试：buildPlugin(deps) 注入 configOverrides/exec/fetcher/extract/kernelDataDir，
++ *   配合 fake ctx（捕获 editor + fake permission）直调 execute，绝不触碰真实 HOME、
++ *   绝不联网、绝不真跑 codearts 二进制。
++ *
++ * 宿主契约（@opencode/plugin 2.2.3，实测 dist 类型）：
++ * - Plugin.define({ id, setup })；setup(context) 内经 context.tool.transform 拿到
++ *   ToolEditor，editor.add({ name, input, description, execute, options }) 注册工具；
++ * - options.namespace = "codearts" + name ⇒ 对外有效名 codearts_<name>；
++ * - execute 返回 Tool.Result：本插件统一返回 { content: [JSON 摘要, 人类可读文本] }
++ *   （content[0]=机器可读 JSON，content[1]=中文简报），不用 output 字段。
+  */
+ import { Plugin } from "@opencode/plugin";
++import type { BridgeConfig } from "./core/config";
++import { PLUGIN_ID, PLUGIN_VERSION, TOOL_NAMESPACE, loadConfig, readAksk } from "./core/config";
++import { BridgeError } from "./core/errors";
+ import {
+-  PLUGIN_ID,
+-  PLUGIN_VERSION,
+-  SMOKE_TOOL_NAME,
+-  TOOL_NAMESPACE,
+-} from "./core/config";
+-
+-/** 冒烟工具的输出 JSON Schema（结构化契约：ok + version，均必填）。 */
+-const STATUS_OUTPUT_SCHEMA = {
++  collectHealth,
++  applyHygiene,
++  planHygiene,
++} from "./core/health";
++import {
++  createNodeExec,
++  ensureBackup,
++  fixAutoupdateFlag,
++  probeInstall,
++  repairInstall,
++} from "./core/install";
++import type { Exec } from "./core/install";
++import { appendInstallAudit } from "./core/install";
++import { httpFetcher, upgradeInstall } from "./core/upgrade";
++import type { Fetcher } from "./core/upgrade";
++
++/* ───── 工具层类型（最小结构；与宿主类型结构兼容） ───── */
++
++/** 权限门所需的最小结构（@opencode/plugin 2.2.3 PermissionDomain.assert 子集）。 */
++export interface PermissionGate {
++  assert(input: {
++    sessionID: string;
++    agent?: string;
++    action: string;
++    resources: string[];
++    save?: string[];
++    metadata?: Record<string, unknown>;
++    source?: { type: "tool"; messageID: string; id: string };
++  }): Promise<void>;
++}
++
++/** 工具执行上下文的 M1 关心子集（宿主 ToolContext 的超集可结构赋值）。 */
++interface ToolCtxLike {
++  readonly sessionID: string;
++  readonly agent?: string;
++  readonly messageID: string;
++  readonly id: string;
++}
++
++/** 单个文本 content 项。 */
++interface ToolTextContent {
++  type: "text";
++  text: string;
++}
++
++/** 本插件工具的统一定义形状（结构兼容宿主 Tool.Info；execute 返回 content）。 */
++export interface BridgeToolDef {
++  name: string;
++  description: string;
++  input: Record<string, unknown>;
++  options: { namespace: string };
++  execute: (input: unknown, context: ToolCtxLike) => Promise<{ content: ToolTextContent[] }>;
++}
++
++/** M1 五工具名（注册顺序即此顺序；测试逐名精确断言）。 */
++export const TOOL_NAMES = ["status", "repair", "upgrade", "health", "hygiene"] as const;
++
++/** 权限动作名（R-t2 固定值；后续 M2/M3 若需细分再扩，不在 M1 拆分）。 */
++export const MANAGE_ACTION = "codearts.manage";
++
++/** buildPlugin / createTools 可注入依赖。 */
++export interface ToolDeps {
++  /** 显式配置覆盖（测试注入 fixture 路径；生产可由 opencode options 同名键覆盖）。 */
++  configOverrides?: Partial<BridgeConfig>;
++  /** 命令执行抽象（缺省 createNodeExec；测试注入 fake，绝不真跑二进制）。 */
++  exec?: Exec;
++  /** 升级物料获取（缺省 httpFetcher；测试注入 fake，绝不联网）。 */
++  fetcher?: Fetcher;
++  /** 解压注入（透传 upgradeInstall R-up8；测试注入避免真实 tar）。 */
++  extract?: (packagePath: string, destDir: string) => Promise<void>;
++  /** 内核数据目录（R-h3/R-hy5 传参口径；缺省 collectHealth 内部默认）。 */
++  kernelDataDir?: string;
++  /** 权限域（生产由宿主 context.permission 注入；缺省时管理工具显式报错，见 R-t2）。 */
++  permission?: PermissionGate;
++}
++
++/* ───── content 装配（R-t1） ───── */
++
++function textContent(text: string): ToolTextContent {
++  return { type: "text", text };
++}
++
++/** 统一成功出口：content[0]=JSON 摘要（机器），content[1]=人类可读中文简报。 */
++function toolOk(payload: unknown, human: string): { content: ToolTextContent[] } {
++  return { content: [textContent(JSON.stringify(payload, null, 2)), textContent(human)] };
++}
++
++/** 未知异常 → INTERNAL 结构化（R-t1：message=String(e)）。 */
++function toErrorPayload(e: unknown): { error: { code: string; message: string; remediation?: string } } {
++  if (e instanceof BridgeError) {
++    return {
++      error: {
++        code: e.code,
++        message: e.message,
++        ...(e.remediation !== undefined ? { remediation: e.remediation } : {}),
++      },
++    };
++  }
++  return { error: { code: "INTERNAL", message: String(e) } };
++}
++
++/** 未知异常的审计警告（R-t1：审计留痕；写失败由调用方 catch，不掩盖结构化错误）。 */
++async function auditInternalWarning(cfg: BridgeConfig, tool: string, e: unknown): Promise<void> {
++  await appendInstallAudit(cfg, {
++    ts: new Date().toISOString(),
++    kind: "tool.internal-error",
++    tool,
++    level: "warn",
++    message: e instanceof Error ? (e.stack ?? e.message) : String(e),
++  });
++}
++
++/**
++ * 工具执行包装（R-t1 统一出口）：成功 → toolOk(载荷, 摘要器文本)；
++ * 业务错误（含权限被拒）→ 结构化 error content；未知异常 → INTERNAL + 审计警告。
++ */
++function wrapTool(
++  tool: string,
++  summarize: (payload: Record<string, any>) => string,
++  body: (input: Record<string, unknown> | undefined, ctx: ToolCtxLike) => Promise<unknown>,
++  deps: { cfg: BridgeConfig },
++): BridgeToolDef["execute"] {
++  return async (rawInput, ctx) => {
++    try {
++      const payload = (await body(inputRecord(rawInput), ctx)) as Record<string, any>;
++      return toolOk(payload, summarize(payload));
++    } catch (e) {
++      const payload = toErrorPayload(e);
++      if (!(e instanceof BridgeError)) {
++        // R-t1：未知异常审计警告（尽力而为；审计失败不得掩盖返回给调用方的错误）
++        await auditInternalWarning(deps.cfg, tool, e).catch(() => undefined);
++      }
++      const remediation = payload.error.remediation !== undefined ? `；修复指引：${payload.error.remediation}` : "";
++      return toolOk(payload, `codearts_${tool} 失败 [${payload.error.code}]：${payload.error.message}${remediation}`);
++    }
++  };
++}
++
++/* ───── 输入归一（显式报错，禁静默截断/钳位） ───── */
++
++function inputRecord(raw: unknown): Record<string, unknown> | undefined {
++  if (raw === undefined || raw === null) return undefined;
++  if (typeof raw !== "object" || Array.isArray(raw)) {
++    throw new BridgeError("TOOL_INPUT_INVALID", `工具输入须为 JSON 对象，实际为 ${typeof raw}`);
++  }
++  return raw as Record<string, unknown>;
++}
++
++function optBoolean(input: Record<string, unknown> | undefined, key: string): boolean | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "boolean") {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为布尔值，实际为 ${typeof v}`);
++  }
++  return v;
++}
++
++function optString(input: Record<string, unknown> | undefined, key: string): string | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "string") {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为字符串，实际为 ${typeof v}`);
++  }
++  return v;
++}
++
++function optNonNegativeInt(input: Record<string, unknown> | undefined, key: string): number | undefined {
++  const v = input?.[key];
++  if (v === undefined) return undefined;
++  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
++    throw new BridgeError("TOOL_INPUT_INVALID", `参数 ${key} 须为非负整数，实际为 ${JSON.stringify(v) ?? "undefined"}`);
++  }
++  return v;
++}
++
++/* ───── 权限门（R-t2） ───── */
++
++/**
++ * 管理动作权限门：repair/upgrade 过 ["install"]，hygiene(apply=true) 过 ["state"]。
++ * - permission 域缺失 → PERMISSION_GATE_UNAVAILABLE（显式，禁静默旁路）；
++ * - 断言被拒 → PERMISSION_DENIED（由 wrapTool 以 content 返回，调用不执行）。
++ */
++async function assertManagePermission(
++  permission: PermissionGate | undefined,
++  ctx: ToolCtxLike,
++  resources: readonly string[],
++): Promise<void> {
++  if (permission === undefined) {
++    throw new BridgeError(
++      "PERMISSION_GATE_UNAVAILABLE",
++      "权限域未注入（permission.assert 不可用），拒绝执行管理动作",
++      { remediation: "codearts_repair/upgrade/hygiene(apply=true) 必须经 opencode 宿主调用，由宿主注入权限域后重试" },
++    );
++  }
++  try {
++    await permission.assert({
++      sessionID: ctx.sessionID,
++      agent: ctx.agent,
++      action: MANAGE_ACTION,
++      resources: [...resources],
++      save: [...resources],
++      source: { type: "tool", messageID: ctx.messageID, id: ctx.id },
++    });
++  } catch (e) {
++    // R-t2 裁定：被拒 → 结构化 PERMISSION_DENIED 返回且不执行（裁定优先于宿主 rethrow 建议，见头注）
++    throw new BridgeError(
++      "PERMISSION_DENIED",
++      `权限校验未通过：${e instanceof Error ? e.message : String(e)}`,
++      {
++        remediation: "请在权限设置中允许 codearts.manage 动作，或在批准弹窗中确认后重试",
++        cause: e,
++      },
++    );
++  }
++}
++
++/* ───── 输入 schema（严格封闭：additionalProperties:false） ───── */
++
++const EMPTY_INPUT_SCHEMA = {
++  type: "object",
++  properties: {},
++  additionalProperties: false,
++} as const;
++
++const REPAIR_INPUT_SCHEMA = {
+   type: "object",
+   properties: {
+-    ok: { type: "boolean", description: "插件是否正常加载并响应" },
+-    version: { type: "string", description: "codearts-bridge 插件版本" },
++    fixAutoupdate: {
++      type: "boolean",
++      description: "显式把 codearts_cli.json 的 autoupdate 修正为 false（默认不执行；幂等可重试）",
++    },
+   },
+-  required: ["ok", "version"],
++  additionalProperties: false,
+ } as const;
+ 
+-export default Plugin.define({
+-  id: PLUGIN_ID,
+-  setup: async (context) => {
+-    /**
+-     * 运行时不兼容守卫（依 SDD 台账 Ruling（2026-10-31，修复环 I1））：
+-     * 若宿主注入的上下文不含 tool.transform（如旧版 opencode 的插件契约），
+-     * 显式 throw 拒绝加载——宿主会以 "failed to load plugin" 记录，可见性远优于
+-     * console.error 后静默跳过；同时把 opencode 2.1.4 的兼容性不确定性转化为
+-     * 响亮信号。仓库铁律：出错即显式报错，禁止任何形式的静默退化。
+-     */
+-    const transform = context.tool?.transform;
+-    if (typeof transform !== "function") {
+-      throw new Error(
+-        `[codearts-bridge] 插件上下文不兼容：缺少 context.tool.transform` +
+-          `（插件 id=${PLUGIN_ID}）。期望契约：opencode V2 插件 API` +
+-          `（@opencode/plugin 2.x）注入的 setup(context) 须提供 context.tool.transform；` +
+-          `当前宿主版本过旧或插件加载路径错误，拒绝注册工具。`,
+-      );
++const UPGRADE_INPUT_SCHEMA = {
++  type: "object",
++  properties: {
++    version: {
++      type: "string",
++      description: "目标版本（须与官方 latest 渠道一致；缺省升级到 latest）",
++    },
++  },
++  additionalProperties: false,
++} as const;
++
++const HYGIENE_INPUT_SCHEMA = {
++  type: "object",
++  properties: {
++    apply: {
++      type: "boolean",
++      description: "true=执行治理（走权限门并写审计）；缺省/false=只返回只读计划",
++    },
++    olderThanDays: {
++      type: "integer",
++      minimum: 0,
++      description: "dump-*.heapsnapshot 保留天数（超过才清理；缺省 30）",
++    },
++    logsKeep: {
++      type: "integer",
++      minimum: 0,
++      description: "kernel-*.log 保留个数（按 mtime 保留最近者；缺省 20）",
++    },
++  },
++  additionalProperties: false,
++} as const;
++
++/* ───── 人类可读简报（content[1]） ───── */
++
++function summarizeStatus(p: Record<string, any>): string {
++  const i = p.install as Record<string, any>;
++  return (
++    `codearts_status：二进制在场=${i.present} 版本=${i.version ?? "未知"} 钉版=${i.pinState}` +
++    ` 备份有效=${i.backupValid} autoupdate=${String(i.autoupdateFlag)}` +
++    ` AK/SK=${(p.credentials as Record<string, any>).present ? "已配置" : "未配置"}` +
++    ` 健康(db=${(p.health as Record<string, any>).dbBytes}B)`
++  );
++}
++
++function summarizeRepair(p: Record<string, any>): string {
++  if (p.status === "already-healthy") {
++    return `codearts_repair：二进制健康，无需修复（幂等短路${p.fixAutoupdateApplied ? "；已按请求关停 autoupdate" : ""}）`;
++  }
++  return `codearts_repair：已从备份恢复 ${p.from} → ${p.to}（sha256=${p.sha256}，auditId=${p.auditId}）`;
++}
++
++function summarizeUpgrade(p: Record<string, any>): string {
++  return `codearts_upgrade：${p.from} → ${p.to}（sha256=${p.sha256}，auditId=${p.auditId}）`;
++}
++
++function summarizeHealth(p: Record<string, any>): string {
++  const h = p.health as Record<string, any>;
++  return (
++    `codearts_health：db=${h.dbBytes}B wal=${h.walBytes}B 转储=${h.dumps.files}个/${h.dumps.bytes}B` +
++    ` 日志=${h.logsBytes}B 最近错误=${h.lastErrorsCount}条`
++  );
++}
++
++function summarizeHygiene(p: Record<string, any>): string {
++  const kinds = (p.plan as Array<{ kind: string }>).map((a) => a.kind).join("+") || "无动作";
++  if (p.status === "planned") {
++    return `codearts_hygiene：只读计划（未执行）[${kinds}]`;
++  }
++  return `codearts_hygiene：已执行 [${(p.applied as string[]).join("+")}]（auditId=${p.auditId}）`;
++}
++
++/* ───── opencode options → 配置覆盖（生产可配置路径；合法性由 loadConfig 显式校验） ───── */
++
++const OPTION_CONFIG_KEYS = ["installDir", "stateDir", "akskFile"] as const;
++
++function configOverridesFromOptions(options: unknown): Partial<BridgeConfig> {
++  const out: Partial<BridgeConfig> = {};
++  if (typeof options !== "object" || options === null) return out;
++  const rec = options as Record<string, unknown>;
++  for (const key of OPTION_CONFIG_KEYS) {
++    const v = rec[key];
++    if (v !== undefined) {
++      if (typeof v !== "string") {
++        throw new BridgeError("TOOL_INPUT_INVALID", `插件 options.${key} 须为字符串路径，实际为 ${typeof v}`);
++      }
++      out[key] = v;
+     }
++  }
++  return out;
++}
+ 
+-    const registration = await transform((editor) => {
+-      editor.add({
+-        name: SMOKE_TOOL_NAME,
+-        description:
+-          "codearts-bridge 冒烟工具：返回插件存活状态（T1-01 骨架验证）",
+-        input: { type: "object", properties: {} },
+-        output: STATUS_OUTPUT_SCHEMA,
+-        options: { namespace: TOOL_NAMESPACE },
+-        execute: async () => ({
+-          output: { ok: true, version: PLUGIN_VERSION },
+-        }),
+-      });
+-    });
++/* ───── 工具集装配 ───── */
++
++/**
++ * 构造五个 M1 工具定义（deps 注入；setup 与测试共用同一装配路径）。
++ * 业务编排说明：
++ * - repair 顺序 = 任务书接口：权限门 → 幂等检查（R-t3）→ repairInstall → ensureBackup；
++ *   ensureBackup 在修复成功后刷新备份（派生物幂等），失败如实报错（不掩盖已成功的修复，
++ *   修复本身已留 repair 审计）。
++ * - hygiene：先 planHygiene（纯只读），apply=true 才过权限门并 applyHygiene(同一条计划)
++ *   （R-hy4 执行清单=计划清单由 applyHygiene 的清单执行语义保证）。
++ */
++export function createTools(deps: ToolDeps = {}): BridgeToolDef[] {
++  const cfg = loadConfig(deps.configOverrides ?? {});
++  const exec = deps.exec ?? createNodeExec();
++  const fetcher = deps.fetcher ?? httpFetcher;
++  const permission = deps.permission;
++  const kernelDataDir = deps.kernelDataDir;
++  // R-h3/R-hy5：kernelDataDir 传参口径——未注入时交由 core 层默认（真实 HOME 口径）
++  const healthOpts = (): { kernelDataDir?: string } =>
++    kernelDataDir !== undefined ? { kernelDataDir } : {};
++  const wrap = (
++    tool: string,
++    summarize: (payload: Record<string, any>) => string,
++    body: (input: Record<string, unknown> | undefined, ctx: ToolCtxLike) => Promise<unknown>,
++  ): BridgeToolDef["execute"] => wrapTool(tool, summarize, body, { cfg });
+ 
+-    // 把宿主返回的注册句柄转交为清理回调，供宿主卸载插件时释放
+-    if (registration) {
+-      return async () => {
+-        await registration.dispose();
++  const statusTool: BridgeToolDef = {
++    name: "status",
++    description:
++      "codearts CLI 安装管家状态总览：二进制在场/版本/钉版一致性/备份有效性/autoupdate 开关、" +
++      "AK/SK 配置存在性（只报存在性，绝不回显凭据值）、内核健康摘要（db/WAL/转储/日志/最近错误数）、" +
++      "传输与守护接入状态（M2 占位）。只读工具，不需要权限。",
++    input: EMPTY_INPUT_SCHEMA,
++    options: { namespace: TOOL_NAMESPACE },
++    execute: wrap("status", summarizeStatus, async () => {
++      const probe = await probeInstall(cfg, { exec });
++      const aksk = await readAksk(cfg.akskFile);
++      const health = await collectHealth(cfg, healthOpts());
++      return {
++        bridge: { version: PLUGIN_VERSION },
++        install: {
++          path: probe.path,
++          present: probe.present,
++          version: probe.version,
++          pinState: probe.pinState,
++          drift: probe.drift,
++          pinnedVersion: probe.pinned?.version,
++          backupPath: probe.backupPath,
++          backupValid: probe.backupValid,
++          autoupdateFlag: probe.autoupdateFlag,
++        },
++        credentials: { akskFile: cfg.akskFile, present: aksk !== undefined },
++        health: {
++          dbBytes: health.dbBytes,
++          walBytes: health.walBytes,
++          dumps: health.dumps,
++          logsBytes: health.logs.bytes,
++          lastErrorsCount: health.lastErrors.length,
++          kernelRssFromLog: health.kernelRssFromLog,
++          rssBytes: health.rssBytes,
++        },
++        transport: {
++          configured: cfg.transport,
++          ptyHost: cfg.ptyHost,
++          daemonUrl: cfg.daemonUrl,
++          connected: false,
++          note: "传输与守护为 M2 任务占位，尚未接入（connected=false 为如实状态）",
++        },
+       };
+-    }
+-  },
+-});
++    }),
++  };
++
++  const repairTool: BridgeToolDef = {
++    name: "repair",
++    description:
++      "自愈修复 codearts CLI 安装：从有效备份原子恢复二进制（校验→部署→复验→审计），" +
++      "可选 fixAutoupdate 显式关停自动升级。二进制健康时幂等返回 already-healthy（非错误）。" +
++      "需要权限（codearts.manage / install）。",
++    input: REPAIR_INPUT_SCHEMA,
++    options: { namespace: TOOL_NAMESPACE },
++    execute: wrap("repair", summarizeRepair, async (input, ctx) => {
++      await assertManagePermission(permission, ctx, ["install"]);
++      const fixAutoupdate = optBoolean(input, "fixAutoupdate") === true;
++      const probe = await probeInstall(cfg, { exec });
++      // R-t3 幂等口径：在场 ∧ 未漂移 ∧ 备份有效 = 健康（不触发任何修复动作）
++      const healthy = probe.present && probe.pinState !== "drift" && probe.backupValid;
++      if (healthy) {
++        // 健康短路不丢弃显式 fixAutoupdate 请求（R-t3 透传；独立审计、幂等）
++        let fixAutoupdateApplied = false;
++        if (fixAutoupdate) {
++          await fixAutoupdateFlag(cfg);
++          fixAutoupdateApplied = true;
++        }
++        return {
++          status: "already-healthy",
++          fixAutoupdateRequested: fixAutoupdate,
++          fixAutoupdateApplied,
++          install: {
++            path: probe.path,
++            version: probe.version,
++            pinState: probe.pinState,
++            backupValid: probe.backupValid,
++          },
++        };
++      }
++      // 修复路径：fixAutoupdate 透传给 repairInstall（止血优先，其内部先关停再恢复）
++      const repair = await repairInstall(cfg, exec, { fixAutoupdate });
++      // 任务书接口顺序：repairInstall → ensureBackup（恢复后的二进制刷新备份，派生物幂等）
++      await ensureBackup(cfg, exec);
++      return {
++        status: "repaired",
++        fixAutoupdateRequested: fixAutoupdate,
++        action: repair.action,
++        from: repair.from,
++        to: repair.to,
++        sha256: repair.sha256,
++        auditId: repair.auditId,
++      };
++    }),
++  };
++
++  const upgradeTool: BridgeToolDef = {
++    name: "upgrade",
++    description:
++      "受控升级 codearts CLI 到官方最新版（或指定版本）：下载→哈希校验→解压→自检→" +
++      "同数据集暂存→原子部署→复验→旧版转备份，任何失败零损坏。需要权限（codearts.manage / install）。",
++    input: UPGRADE_INPUT_SCHEMA,
++    options: { namespace: TOOL_NAMESPACE },
++    execute: wrap("upgrade", summarizeUpgrade, async (input, ctx) => {
++      await assertManagePermission(permission, ctx, ["install"]);
++      const version = optString(input, "version");
++      const result = await upgradeInstall(
++        cfg,
++        { exec, fetcher, ...(deps.extract !== undefined ? { extract: deps.extract } : {}) },
++        version !== undefined ? { version } : {},
++      );
++      return { status: "upgraded", ...result };
++    }),
++  };
++
++  const healthTool: BridgeToolDef = {
++    name: "health",
++    description:
++      "codearts 内核健康体检（只读）：托管进程 RSS、db/WAL 字节、堆转储计数与字节、日志总量、" +
++      "最近错误摘要（规范化去重 ≤20 条）、内核自报 RSS。注意：真实环境全量扫读内核日志，" +
++      "单次采样可达约 14 秒。不需要权限。",
++    input: EMPTY_INPUT_SCHEMA,
++    options: { namespace: TOOL_NAMESPACE },
++    execute: wrap("health", summarizeHealth, async () => {
++      const snapshot = await collectHealth(cfg, healthOpts());
++      return { status: "ok", health: snapshot };
++    }),
++  };
++
++  const hygieneTool: BridgeToolDef = {
++    name: "hygiene",
++    description:
++      "磁盘/状态治理：清理到期堆转储（dump-*.heapsnapshot）、WAL checkpoint 收缩、" +
++      "轮转内核日志。默认只返回只读计划（apply=false/缺省）；apply=true 执行计划并写审计，" +
++      "需要权限（codearts.manage / state）。",
++    input: HYGIENE_INPUT_SCHEMA,
++    options: { namespace: TOOL_NAMESPACE },
++    execute: wrap("hygiene", summarizeHygiene, async (input, ctx) => {
++      const apply = optBoolean(input, "apply") === true;
++      const olderThanDays = optNonNegativeInt(input, "olderThanDays");
++      const logsKeep = optNonNegativeInt(input, "logsKeep");
++      const plan = await planHygiene(cfg, {
++        ...(olderThanDays !== undefined ? { olderThanDays } : {}),
++        ...(logsKeep !== undefined ? { logsKeep } : {}),
++        ...healthOpts(),
++      });
++      if (!apply) {
++        return { status: "planned", plan };
++      }
++      // R-t2：apply 是改状态动作，必须过权限门（resources/save=["state"]）
++      await assertManagePermission(permission, ctx, ["state"]);
++      const { applied, auditId } = await applyHygiene(cfg, plan, healthOpts());
++      return { status: "applied", plan, applied, auditId };
++    }),
++  };
++
++  return [statusTool, repairTool, upgradeTool, healthTool, hygieneTool];
++}
++
++/* ───── 插件装配 ───── */
++
++/**
++ * 构建插件定义（deps 注入点）。生产用 default 导出（无 deps）；
++ * 测试注入 fake 依赖并配合 fake ctx（捕获 editor + fake permission）直调 execute。
++ */
++export function buildPlugin(deps: ToolDeps = {}): Plugin.Plugin {
++  return Plugin.define({
++    id: PLUGIN_ID,
++    setup: async (context) => {
++      /**
++       * 运行时不兼容守卫（依 SDD 台账 Ruling（2026-10-31，修复环 I1），T1-08 保持）：
++       * 若宿主注入的上下文不含 tool.transform（如旧版 opencode 的插件契约），
++       * 显式 throw 拒绝加载——宿主会以 "failed to load plugin" 记录，可见性远优于
++       * console.error 后静默跳过。仓库铁律：出错即显式报错，禁止任何形式的静默退化。
++       */
++      const transform = context.tool?.transform;
++      if (typeof transform !== "function") {
++        throw new Error(
++          `[codearts-bridge] 插件上下文不兼容：缺少 context.tool.transform` +
++            `（插件 id=${PLUGIN_ID}）。期望契约：opencode V2 插件 API` +
++            `（@opencode/plugin 2.x）注入的 setup(context) 须提供 context.tool.transform；` +
++            `当前宿主版本过旧或插件加载路径错误，拒绝注册工具。`,
++        );
++      }
++
++      // 权限域来自宿主上下文（R-t2）；配置覆盖优先级：deps（测试）> opencode options > env > 默认值
++      const tools = createTools({
++        ...deps,
++        configOverrides: {
++          ...(deps.configOverrides ?? {}),
++          ...configOverridesFromOptions(context.options),
++        },
++        permission: context.permission as PermissionGate | undefined,
++      });
++
++      const registration = await transform((editor) => {
++        for (const tool of tools) {
++          editor.add(tool as Parameters<typeof editor.add>[0]);
++        }
++      });
++
++      // 把宿主返回的注册句柄转交为清理回调，供宿主卸载插件时释放
++      if (registration) {
++        return async () => {
++          await registration.dispose();
++        };
++      }
++    },
++  });
++}
++
++/** 生产入口：配置取环境变量/默认值，权限域在 setup 时从宿主上下文接线。 */
++export default buildPlugin();
+diff --git a/plugins/codearts-bridge/test/m1-acceptance.test.ts b/plugins/codearts-bridge/test/m1-acceptance.test.ts
+new file mode 100644
+index 0000000000..b86060da2e
+--- /dev/null
++++ b/plugins/codearts-bridge/test/m1-acceptance.test.ts
+@@ -0,0 +1,627 @@
++/**
++ * T1-08 M1 工具接线与验收测试（bun:test）。
++ *
++ * 覆盖（任务书 Step1 + 主控裁定 R-t1..R-t4）：
++ * - 注册精度：五个工具名 status/repair/upgrade/health/hygiene、namespace=codearts、
++ *   输入 schema 严格 additionalProperties:false（经 fake ctx 捕获 editor 后断言）；
++ * - codearts_status：五类 fixture（+R-a 未钉版共六行）表驱动摘要断言
++ *   （present/version/drift/pinState/备份/autoupdate/健康摘要字段）+ AK-SK 存在性
++ *   （凭据值绝不回显）；
++ * - codearts_repair：权限门（action/resources/save/source 精确断言）、only-delete 残局
++ *   + 有效备份恢复成功（R-t4 组合场景：哈希+auditId）、already-healthy 幂等（R-t3）、
++ *   fixAutoupdate 透传（修复路径与健康路径都生效且保留未知字段）、无备份 → content 中
++ *   BIN_MISSING_NO_BACKUP + remediation（R-t1 结构化错误，不抛裸异常）；
++ * - codearts_upgrade：权限门精确断言；被拒 → PERMISSION_DENIED 且 fetcher 零调用
++ *   （不执行）；
++ * - codearts_hygiene：apply=false 只返回计划（零权限调用、零审计、零删除）；
++ *   apply=true 走权限门且执行清单=计划清单（R-hy4 fake 环境复核）；
++ * - codearts_health：返回 collectHealth 快照（fake cli-data）。
++ *
++ * 隔离纪律（沿用 R-e）：绝不真跑 codearts 二进制（exec/fetcher 全注入）、绝不联网、
++ * 绝不触碰真实 HOME（installDir/stateDir/kernelDataDir 全部显式注入 fixture 路径）。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { Database } from "bun:sqlite";
++import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { Plugin } from "@opencode/plugin";
++import plugin, { buildPlugin, TOOL_NAMES } from "../src/server";
++import { PLUGIN_ID, TOOL_NAMESPACE } from "../src/core/config";
++import { sha256File } from "../src/core/fsx";
++import {
++  BIN_CONTENT,
++  PINNED_VERSION,
++  makeInstallFixture,
++  writePinnedFile,
++} from "./fixtures/install-fixtures";
++import {
++  DEFAULT_LAYOUT,
++  NEW_ELF_CONTENT,
++  NEW_VERSION,
++  contentVersionExec,
++  copyExtract,
++  makeFakeFetcher,
++  sha256Oracle,
++} from "./fixtures/fake-release";
++import type { Exec } from "../src/core/install";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "m1-acceptance-test");
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/* ───── fake 宿主上下文（捕获 editor + 记录权限调用） ───── */
++
++/** add 被调用时捕获到的工具信息（只取测试关心的字段）。 */
++interface CapturedTool {
++  name: string;
++  description: string;
++  input: Record<string, unknown>;
++  options?: { namespace?: string };
++  execute: (input: unknown, context: unknown) => Promise<unknown>;
++}
++
++/** 权限门 fake：记录每次 assert 入参；deny=true 时拒绝。 */
++function makePermissionFake(opts: { deny?: boolean } = {}) {
++  const calls: Array<Record<string, unknown>> = [];
++  return {
++    calls,
++    permission: {
++      assert: async (input: Record<string, unknown>) => {
++        calls.push(input);
++        if (opts.deny === true) throw new Error("用户拒绝了授权请求（fake deny）");
++      },
++    },
++  };
++}
++
++/** 组装 fake 宿主上下文：transform 立即以捕获编辑器回调 + 注入 permission/options。 */
++function makeFakeContext(opts: {
++  permission: ReturnType<typeof makePermissionFake>["permission"];
++  options?: Record<string, unknown>;
++}) {
++  const added: CapturedTool[] = [];
++  const ctx = {
++    options: opts.options ?? {},
++    permission: opts.permission,
++    tool: {
++      transform: async (cb: (editor: unknown) => void) => {
++        cb({ add: (tool: CapturedTool) => added.push(tool) });
++        return { dispose: async () => {} };
++      },
++    },
++  };
++  return { ctx: ctx as unknown as Parameters<Plugin.Plugin["setup"]>[0], added };
++}
++
++/** 工具执行上下文 fake（ToolContext 的 M1 关心子集；signal/progress 本层未用）。 */
++const TOOL_CTX = {
++  sessionID: "ses_m1test",
++  agent: "agent_m1test",
++  messageID: "msg_m1test",
++  id: "call_m1test",
++};
++
++/** 按 name 取捕获工具；缺失即断言失败。 */
++function toolOf(added: CapturedTool[], name: string): CapturedTool {
++  const tool = added.find((t) => t.name === name);
++  expect(tool).toBeDefined();
++  return tool!;
++}
++
++/** 工具结果形态（content[0]=JSON 摘要，content[1]=人类可读文本）。 */
++interface ToolResultLike {
++  content: Array<{ type: string; text: string }>;
++}
++
++/** 解析 content[0] 的 JSON 载荷。 */
++function jsonOf(result: unknown): Record<string, any> {
++  const r = result as ToolResultLike;
++  expect(Array.isArray(r.content)).toBe(true);
++  expect(r.content.length).toBeGreaterThanOrEqual(2);
++  expect(r.content[0]!.type).toBe("text");
++  return JSON.parse(r.content[0]!.text) as Record<string, any>;
++}
++
++/** 取 content[1] 的人类可读文本。 */
++function humanOf(result: unknown): string {
++  const r = result as ToolResultLike;
++  expect(r.content[1]!.type).toBe("text");
++  return r.content[1]!.text;
++}
++
++/** 读取审计文件（install.jsonl）为对象数组。 */
++async function readAuditLines(stateDir: string): Promise<Array<Record<string, unknown>>> {
++  const text = await readFile(path.join(stateDir, "audit", "install.jsonl"), "utf8");
++  return text
++    .split("\n")
++    .filter((l) => l.trim().length > 0)
++    .map((l) => JSON.parse(l) as Record<string, unknown>);
++}
++
++/** 审计文件是否存在。 */
++async function auditExists(stateDir: string): Promise<boolean> {
++  try {
++    await stat(path.join(stateDir, "audit", "install.jsonl"));
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** 组装注入了 fixture 路径与 fake 依赖的插件实例（权限经 fake ctx 注入）。 */
++function fixturePlugin(fixture: {
++  installDir: string;
++  stateDir: string;
++  exec: Exec;
++  root: string;
++}, extra: { extract?: (p: string, d: string) => Promise<void>; fetcher?: ReturnType<typeof makeFakeFetcher> } = {}) {
++  return buildPlugin({
++    configOverrides: { installDir: fixture.installDir, stateDir: fixture.stateDir },
++    exec: fixture.exec,
++    kernelDataDir: path.join(fixture.root, "cli-data"), // 不存在 → 健康摘要全零（显式注入，绝不触碰真实 HOME）
++    ...(extra.extract !== undefined ? { extract: extra.extract } : {}),
++    ...(extra.fetcher !== undefined ? { fetcher: extra.fetcher } : {}),
++  });
++}
++
++/* ───── 注册精度（任务书 Step1 最后一条） ───── */
++
++describe("M1 五工具注册精度", () => {
++  it("注册名恰为 status/repair/upgrade/health/hygiene，namespace=codearts，schema 严格封闭", async () => {
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await plugin.setup(ctx);
++
++    expect(added.map((t) => t.name)).toEqual([...TOOL_NAMES]);
++    for (const tool of added) {
++      expect(tool.options?.namespace).toBe(TOOL_NAMESPACE);
++      expect(`${tool.options?.namespace}_${tool.name}`).toBe(`codearts_${tool.name}`);
++      // schema 严格性：顶层 object + 禁止未知字段（任务书 Step3）
++      expect(tool.input["type"]).toBe("object");
++      expect(tool.input["additionalProperties"]).toBe(false);
++      expect(typeof tool.description).toBe("string");
++      expect(tool.description.length).toBeGreaterThan(0);
++    }
++  });
++
++  it("default 导出是 id=codearts-bridge 的插件定义（骨架契约保持）", () => {
++    expect(plugin.id).toBe(PLUGIN_ID);
++    expect(typeof plugin.setup).toBe("function");
++  });
++});
++
++/* ───── codearts_status：五类 fixture 表驱动（+R-a 未钉版） ───── */
++
++describe("codearts_status 摘要", () => {
++  /** 每行 = fixture 形态 → 期望摘要字段（undefined 断言键不存在/为 undefined）。 */
++  const ROWS: Array<{
++    kind: Parameters<typeof makeInstallFixture>[1];
++    present: boolean;
++    version: string | undefined;
++    pinState: string;
++    drift: boolean;
++    backupValid: boolean;
++    autoupdateFlag: boolean;
++  }> = [
++    { kind: "healthy", present: true, version: PINNED_VERSION, pinState: "consistent", drift: false, backupValid: true, autoupdateFlag: false },
++    { kind: "missing", present: false, version: undefined, pinState: "drift", drift: true, backupValid: true, autoupdateFlag: false },
++    { kind: "only-delete", present: false, version: undefined, pinState: "drift", drift: true, backupValid: false, autoupdateFlag: false },
++    { kind: "bad-hash", present: true, version: PINNED_VERSION, pinState: "drift", drift: true, backupValid: true, autoupdateFlag: false },
++    { kind: "bad-version", present: true, version: "99.99.99", pinState: "drift", drift: true, backupValid: true, autoupdateFlag: false },
++    { kind: "unpinned", present: true, version: PINNED_VERSION, pinState: "unpinned", drift: false, backupValid: true, autoupdateFlag: false },
++  ];
++
++  for (const row of ROWS) {
++    it(`fixture=${row.kind} 摘要如实呈现`, async () => {
++      const fixture = await makeInstallFixture(path.join(TEST_ROOT, `status-${row.kind}`), row.kind);
++      const perm = makePermissionFake();
++      const { ctx, added } = makeFakeContext({ permission: perm.permission });
++      await fixturePlugin(fixture).setup(ctx);
++
++      const result = await toolOf(added, "status").execute({}, TOOL_CTX);
++      const payload = jsonOf(result);
++
++      expect(payload.install.present).toBe(row.present);
++      expect(payload.install.version).toBe(row.version);
++      expect(payload.install.pinState).toBe(row.pinState);
++      expect(payload.install.drift).toBe(row.drift);
++      expect(payload.install.backupValid).toBe(row.backupValid);
++      expect(payload.install.autoupdateFlag).toBe(row.autoupdateFlag);
++      expect(payload.install.path).toBe(fixture.binPath);
++      expect(payload.install.pinnedVersion).toBe(row.kind === "unpinned" ? undefined : PINNED_VERSION);
++
++      // 健康摘要字段（fixture cli-data 不存在 → 全零如实呈现）
++      expect(payload.health.dbBytes).toBe(0);
++      expect(payload.health.walBytes).toBe(0);
++      expect(payload.health.dumps).toEqual({ files: 0, bytes: 0 });
++      expect(payload.health.logsBytes).toBe(0);
++      expect(payload.health.lastErrorsCount).toBe(0);
++
++      // AK/SK 未配置 + 传输/守护占位（M2）
++      expect(payload.credentials.present).toBe(false);
++      expect(payload.transport.connected).toBe(false);
++      expect(payload.transport.configured).toBe("auto");
++      expect(payload.bridge.version).toBe("dev");
++
++      // status 是只读工具：零权限调用
++      expect(perm.calls).toHaveLength(0);
++
++      // 人类可读文本
++      expect(humanOf(result)).toContain("codearts_status");
++    });
++  }
++
++  it("AK/SK 存在性如实呈现，且凭据值绝不回显", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "status-aksk"), "healthy");
++    await writeFile(fixture.stateDir + "/config.env", "AK=AKTESTVALUE123\nSK=SKTESTVALUE456\n", "utf8");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const result = await toolOf(added, "status").execute({}, TOOL_CTX);
++    const payload = jsonOf(result);
++    expect(payload.credentials.present).toBe(true);
++    const raw = JSON.stringify(payload);
++    expect(raw).not.toContain("AKTESTVALUE123");
++    expect(raw).not.toContain("SKTESTVALUE456");
++  });
++});
++
++/* ───── codearts_repair ───── */
++
++describe("codearts_repair", () => {
++  it("only-delete 残局 + 有效备份：恢复成功（哈希+auditId，R-t4 组合场景）", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "repair-combo"), "missing");
++    // 升级中断残留：bin 缺失 + .delete 残局 + 有效备份并存
++    await writeFile(path.join(path.dirname(fixture.binPath), "codearts.delete"), BIN_CONTENT, "utf8");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const result = await toolOf(added, "repair").execute({}, TOOL_CTX);
++    const payload = jsonOf(result);
++
++    expect(payload.status).toBe("repaired");
++    expect(payload.action).toBe("restore-from-backup");
++    expect(payload.to).toBe(fixture.binPath);
++    expect(payload.sha256).toBe(fixture.pinnedSha256);
++    expect(payload.auditId).toMatch(/^rep-/);
++    // 恢复落地复核：部署内容哈希 = 钉版哈希（哈希口径与审计一致）
++    expect(await sha256File(fixture.binPath)).toBe(fixture.pinnedSha256);
++    // 审计留痕：kind=repair result=restored
++    const lines = await readAuditLines(fixture.stateDir);
++    const repair = lines.find((l) => l["kind"] === "repair");
++    expect(repair).toBeDefined();
++    expect(repair!["auditId"]).toBe(payload.auditId);
++    expect(repair!["result"]).toBe("restored");
++    expect(humanOf(result)).toContain("恢复");
++  });
++
++  it("bin 健康时返回 already-healthy（R-t3 幂等，零审计副作用）", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "repair-healthy"), "healthy");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const result = await toolOf(added, "repair").execute({}, TOOL_CTX);
++    const payload = jsonOf(result);
++    expect(payload.status).toBe("already-healthy");
++    expect(payload.fixAutoupdateRequested).toBe(false);
++    // 幂等：无任何审计写入
++    expect(await auditExists(fixture.stateDir)).toBe(false);
++    // 权限门先行（R-t2）：repair 一律过门
++    expect(perm.calls).toHaveLength(1);
++    expect(perm.calls[0]).toMatchObject({
++      sessionID: "ses_m1test",
++      agent: "agent_m1test",
++      action: "codearts.manage",
++      resources: ["install"],
++      save: ["install"],
++      source: { type: "tool", messageID: "msg_m1test", id: "call_m1test" },
++    });
++  });
++
++  it("真 only-delete（无备份）：content 返回 BIN_MISSING_NO_BACKUP + remediation（R-t1 结构化错误）", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "repair-nobackup"), "only-delete");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const result = await toolOf(added, "repair").execute({}, TOOL_CTX);
++    const payload = jsonOf(result);
++    expect(payload.error.code).toBe("BIN_MISSING_NO_BACKUP");
++    expect(payload.error.message).toContain(fixture.binPath);
++    // remediation 四要素：.delete 残留检查 / 官方重装 / 备份恢复指引 / 官方入口
++    expect(payload.error.remediation).toContain("codearts.delete");
++    expect(payload.error.remediation).toContain("https://codearts.huaweicloud.com");
++    // 二进制仍未恢复、无审计
++    expect(await auditExists(fixture.stateDir)).toBe(false);
++  });
++
++  it("fixAutoupdate 透传（修复路径）：修复同时把 autoupdate 关停且保留未知字段", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "repair-fixauto"), "missing");
++    await writeFile(fixture.cliPath, JSON.stringify({ autoupdate: true, vendorExtra: 1 }), "utf8");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const payload = jsonOf(await toolOf(added, "repair").execute({ fixAutoupdate: true }, TOOL_CTX));
++    expect(payload.status).toBe("repaired");
++    const after = JSON.parse(await readFile(fixture.cliPath, "utf8")) as Record<string, unknown>;
++    expect(after["autoupdate"]).toBe(false);
++    expect(after["vendorExtra"]).toBe(1);
++  });
++
++  it("fixAutoupdate 透传（健康路径）：already-healthy 短路不丢显式请求", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "repair-healthy-fixauto"), "healthy");
++    await writeFile(fixture.cliPath, JSON.stringify({ autoupdate: true, vendorExtra: 1 }), "utf8");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const payload = jsonOf(await toolOf(added, "repair").execute({ fixAutoupdate: true }, TOOL_CTX));
++    expect(payload.status).toBe("already-healthy");
++    expect(payload.fixAutoupdateApplied).toBe(true);
++    const after = JSON.parse(await readFile(fixture.cliPath, "utf8")) as Record<string, unknown>;
++    expect(after["autoupdate"]).toBe(false);
++    expect(after["vendorExtra"]).toBe(1);
++    // 幂等路径的审计 = fix-autoupdate 一条（健康路径无 repair 审计）
++    const lines = await readAuditLines(fixture.stateDir);
++    expect(lines.filter((l) => l["kind"] === "fix-autoupdate")).toHaveLength(1);
++    expect(lines.filter((l) => l["kind"] === "repair")).toHaveLength(0);
++  });
++
++  it("权限被拒：PERMISSION_DENIED 结构化返回且不执行（R-t2）", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "repair-denied"), "missing");
++    const perm = makePermissionFake({ deny: true });
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture).setup(ctx);
++
++    const payload = jsonOf(await toolOf(added, "repair").execute({}, TOOL_CTX));
++    expect(payload.error.code).toBe("PERMISSION_DENIED");
++    expect(perm.calls).toHaveLength(1); // 过门一次，被拒不重试
++    expect(await auditExists(fixture.stateDir)).toBe(false); // 未执行
++  });
++});
++
++/* ───── codearts_upgrade ───── */
++
++describe("codearts_upgrade", () => {
++  it("happy path：权限门精确断言 + 受控升级成功（fake fetcher/extract/exec，绝不联网）", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "upgrade-ok"), "healthy");
++    const extractCalls: Array<{ pkg: string; destDir: string }> = [];
++    const fetcher = makeFakeFetcher();
++    const execCalls: string[][] = [];
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await buildPlugin({
++      configOverrides: { installDir: fixture.installDir, stateDir: fixture.stateDir },
++      // 升级链用 content-driven exec（按目标文件 VERSION= 标记回答 --version）：
++      // 旧 fixture 无标记 → from=unknown；新 ELF 有 VERSION=26.11.0 → 自检/复验通过
++      exec: contentVersionExec(execCalls),
++      kernelDataDir: path.join(fixture.root, "cli-data"),
++      fetcher,
++      extract: copyExtract(DEFAULT_LAYOUT, extractCalls),
++    }).setup(ctx);
++
++    const result = await toolOf(added, "upgrade").execute({}, TOOL_CTX);
++    const payload = jsonOf(result);
++
++    expect(payload.status).toBe("upgraded");
++    expect(payload.from).toBe("unknown"); // 旧 fixture 无 VERSION 标记 → 版本不可读（如实呈现）
++    expect(payload.to).toBe(NEW_VERSION);
++    expect(payload.sha256).toBe(sha256Oracle(NEW_ELF_CONTENT));
++    expect(payload.auditId).toMatch(/^upg-/);
++    expect(extractCalls).toHaveLength(1);
++    // 升级落地复核
++    expect(await sha256File(fixture.binPath)).toBe(sha256Oracle(NEW_ELF_CONTENT));
++    // 权限门：action/resources/save/source 精确断言（R-t2）
++    expect(perm.calls).toHaveLength(1);
++    expect(perm.calls[0]).toMatchObject({
++      sessionID: "ses_m1test",
++      agent: "agent_m1test",
++      action: "codearts.manage",
++      resources: ["install"],
++      save: ["install"],
++      source: { type: "tool", messageID: "msg_m1test", id: "call_m1test" },
++    });
++  });
++
++  it("权限被拒：PERMISSION_DENIED 且 fetcher 零调用（不执行）", async () => {
++    const fixture = await makeInstallFixture(path.join(TEST_ROOT, "upgrade-denied"), "healthy");
++    let latestCalls = 0;
++    const inner = makeFakeFetcher();
++    const countingFetcher = {
++      latest: async () => {
++        latestCalls += 1;
++        return inner.latest();
++      },
++      download: inner.download,
++    };
++    const perm = makePermissionFake({ deny: true });
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await fixturePlugin(fixture, {
++      fetcher: countingFetcher as typeof inner,
++      extract: copyExtract(DEFAULT_LAYOUT),
++    }).setup(ctx);
++
++    const payload = jsonOf(await toolOf(added, "upgrade").execute({}, TOOL_CTX));
++    expect(payload.error.code).toBe("PERMISSION_DENIED");
++    expect(latestCalls).toBe(0); // 未执行任何网络动作
++    expect(await auditExists(fixture.stateDir)).toBe(false); // 无 upgrade.start 审计
++  });
++});
++
++/* ───── codearts_hygiene ───── */
++
++/** hygiene fixture：1 个到期转储 + 热 WAL（保持连接不关）+ N 个内核日志。 */
++async function makeHygieneFixture(root: string, logs: number): Promise<string> {
++  const kernelDataDir = path.join(root, "cli-data");
++  const logDir = path.join(kernelDataDir, "log");
++  await mkdir(logDir, { recursive: true });
++  const dump = path.join(logDir, "dump-old.heapsnapshot");
++  await writeFile(dump, "heap snapshot payload", "utf8");
++  const old = new Date(Date.now() - 31 * DAY_MS);
++  await utimes(dump, old, old);
++  // 热 WAL：连接故意不关（进程退出即回收），保持 WAL 非自愈态供 checkpoint
++  const db = new Database(path.join(kernelDataDir, "opencode.db"));
++  db.run("PRAGMA journal_mode=WAL");
++  db.run("CREATE TABLE t(x TEXT)");
++  db.run("INSERT INTO t VALUES ('hot')");
++  for (let i = 0; i < logs; i++) {
++    await writeFile(
++      path.join(logDir, `kernel-h-${i}.log`),
++      `INFO  2026-10-30T20:00:0${i}.000 +1ms service=session "ok"\n`,
++      "utf8",
++    );
++  }
++  return kernelDataDir;
++}
++
++describe("codearts_hygiene", () => {
++  it("apply=false 只返回计划：零权限调用、零审计、零删除", async () => {
++    const kernelDataDir = await makeHygieneFixture(path.join(TEST_ROOT, "hy-plan"), 3);
++    const stateDir = path.join(TEST_ROOT, "hy-plan", "state");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await buildPlugin({
++      configOverrides: { installDir: path.join(TEST_ROOT, "hy-plan", "installers"), stateDir },
++      exec: { run: async () => ({ code: 0, stdout: "", stderr: "" }) },
++      kernelDataDir,
++    }).setup(ctx);
++
++    const payload = jsonOf(await toolOf(added, "hygiene").execute({ apply: false, olderThanDays: 30, logsKeep: 1 }, TOOL_CTX));
++    expect(payload.status).toBe("planned");
++    expect(payload.plan.map((a: { kind: string }) => a.kind)).toEqual([
++      "purge-dumps",
++      "wal-checkpoint",
++      "rotate-logs",
++    ]);
++    expect(perm.calls).toHaveLength(0); // 只读计划不走权限门
++    expect(await auditExists(stateDir)).toBe(false); // 纯只读不写审计
++    // 未删除任何文件
++    await expect(stat(path.join(kernelDataDir, "log", "dump-old.heapsnapshot"))).resolves.toBeDefined();
++  });
++
++  it("apply=true 走权限门（resources=state）且执行清单=计划清单", async () => {
++    const kernelDataDir = await makeHygieneFixture(path.join(TEST_ROOT, "hy-apply"), 3);
++    const stateDir = path.join(TEST_ROOT, "hy-apply", "state");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await buildPlugin({
++      configOverrides: { installDir: path.join(TEST_ROOT, "hy-apply", "installers"), stateDir },
++      exec: { run: async () => ({ code: 0, stdout: "", stderr: "" }) },
++      kernelDataDir,
++    }).setup(ctx);
++
++    const result = await toolOf(added, "hygiene").execute({ apply: true, olderThanDays: 30, logsKeep: 1 }, TOOL_CTX);
++    const payload = jsonOf(result);
++
++    // 执行清单 = 计划清单（R-hy4）
++    const kinds = payload.plan.map((a: { kind: string }) => a.kind);
++    expect(kinds).toEqual(["purge-dumps", "wal-checkpoint", "rotate-logs"]);
++    expect(payload.applied).toEqual(kinds);
++    expect(payload.auditId).toMatch(/^hy-/);
++
++    // 权限门：hygiene(apply=true) → resources/save=["state"]（R-t2）
++    expect(perm.calls).toHaveLength(1);
++    expect(perm.calls[0]).toMatchObject({
++      action: "codearts.manage",
++      resources: ["state"],
++      save: ["state"],
++      source: { type: "tool", messageID: "msg_m1test", id: "call_m1test" },
++    });
++
++    // 落地复核：转储已删、日志轮转 2/3、WAL checkpoint 收敛
++    await expect(stat(path.join(kernelDataDir, "log", "dump-old.heapsnapshot"))).rejects.toThrow();
++    const lines = await readAuditLines(stateDir);
++    const entry = lines.find((l) => l["kind"] === "hygiene.apply");
++    expect(entry).toBeDefined();
++    expect(entry!["result"]).toBe("ok");
++    expect(entry!["auditId"]).toBe(payload.auditId);
++    expect(entry!["rotatedCount"]).toBe(2);
++    const wal = entry!["walCheckpoint"] as Record<string, unknown>;
++    expect(wal["busy"]).toBe(0);
++  });
++
++  it("apply=true 权限被拒：PERMISSION_DENIED、零删除、零审计", async () => {
++    const kernelDataDir = await makeHygieneFixture(path.join(TEST_ROOT, "hy-denied"), 3);
++    const stateDir = path.join(TEST_ROOT, "hy-denied", "state");
++    const perm = makePermissionFake({ deny: true });
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await buildPlugin({
++      configOverrides: { installDir: path.join(TEST_ROOT, "hy-denied", "installers"), stateDir },
++      exec: { run: async () => ({ code: 0, stdout: "", stderr: "" }) },
++      kernelDataDir,
++    }).setup(ctx);
++
++    const payload = jsonOf(
++      await toolOf(added, "hygiene").execute({ apply: true, olderThanDays: 30, logsKeep: 1 }, TOOL_CTX),
++    );
++    expect(payload.error.code).toBe("PERMISSION_DENIED");
++    expect(await auditExists(stateDir)).toBe(false);
++    await expect(stat(path.join(kernelDataDir, "log", "dump-old.heapsnapshot"))).resolves.toBeDefined();
++  });
++});
++
++/* ───── codearts_health ───── */
++
++describe("codearts_health", () => {
++  it("返回 collectHealth 快照（fake cli-data：db/wal/dumps/日志错误/自报 RSS）", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "health-fixture", "cli-data");
++    const logDir = path.join(kernelDataDir, "log");
++    await mkdir(logDir, { recursive: true });
++    await writeFile(path.join(kernelDataDir, "opencode.db"), "sqlite-db-bytes", "utf8");
++    await writeFile(path.join(kernelDataDir, "opencode.db-wal"), "wal-bytes", "utf8");
++    await writeFile(path.join(logDir, "dump-1.heapsnapshot"), "d".repeat(100), "utf8");
++    const kernelLine =
++      'INFO  2026-10-31T10:00:01.000 +1ms service=om "当前进程内存使用情况" rssMB=10\n';
++    const errorLine = 'ERROR  2026-10-31T10:00:00.000 +5ms service=test "boom" code=EIO\n';
++    await writeFile(path.join(logDir, "kernel-a.log"), errorLine + kernelLine, "utf8");
++
++    const stateDir = path.join(TEST_ROOT, "health-fixture", "state");
++    const perm = makePermissionFake();
++    const { ctx, added } = makeFakeContext({ permission: perm.permission });
++    await buildPlugin({
++      configOverrides: { installDir: path.join(TEST_ROOT, "health-fixture", "installers"), stateDir },
++      exec: { run: async () => ({ code: 0, stdout: "", stderr: "" }) },
++      kernelDataDir,
++    }).setup(ctx);
++
++    const result = await toolOf(added, "health").execute({}, TOOL_CTX);
++    const payload = jsonOf(result);
++
++    expect(payload.status).toBe("ok");
++    expect(payload.health.dbBytes).toBe("sqlite-db-bytes".length);
++    expect(payload.health.walBytes).toBe("wal-bytes".length);
++    expect(payload.health.dumps).toEqual({ files: 1, bytes: 100 });
++    // 快照契约 = collectHealth 原样返回（logs 为 {bytes}，lastErrors 为字符串数组）
++    expect(payload.health.logs).toEqual({ bytes: 100 + Buffer.byteLength(errorLine + kernelLine, "utf8") });
++    expect(payload.health.lastErrors).toHaveLength(1);
++    expect(payload.health.lastErrors[0]).toContain('service=test "boom"');
++    expect(payload.health.kernelRssFromLog).toBe(10 * 1024 * 1024);
++    expect(perm.calls).toHaveLength(0); // health 只读不走权限门
++    expect(humanOf(result)).toContain("codearts_health");
++  });
++});
++
++/* ───── 钉版写入辅助回归（fixtures 共享出口仍可用） ───── */
++
++describe("fixture 共享出口", () => {
++  it("writePinnedFile 保持既有格式契约", async () => {
++    const stateDir = path.join(TEST_ROOT, "pin-helpers", "state");
++    await writePinnedFile(stateDir, { version: "1.2.3", sha256: "a".repeat(64) });
++    const raw = JSON.parse(await readFile(path.join(stateDir, "pinned.json"), "utf8")) as Record<string, unknown>;
++    expect(raw["version"]).toBe("1.2.3");
++    expect(raw["sha256"]).toBe("a".repeat(64));
++  });
++});
+diff --git a/plugins/codearts-bridge/test/server.test.ts b/plugins/codearts-bridge/test/server.test.ts
+index 26f8a7d4b2..b116e8be32 100644
+--- a/plugins/codearts-bridge/test/server.test.ts
++++ b/plugins/codearts-bridge/test/server.test.ts
+@@ -1,81 +1,75 @@
+ /**
+- * T1-01 骨架验证测试（bun:test）。
++ * 插件入口层测试（T1-01 骨架 → T1-08 M1 五工具接线后更新）。
+  *
+- * 覆盖任务书 Step 1 的两条断言：
+- * 1. 默认导出是 id 为 "codearts-bridge" 的插件定义（经 @opencode/plugin 的
+- *    Plugin.Plugin 接口形状检查——该检查在编译期由类型标注强制，运行期断言字段）。
+- * 2. setup 恰好注册一个 smoke 工具：命名空间内名 "status"、命名空间 "codearts"，
+- *    对外有效名为 codearts_status；且 execute 返回 { ok: true, version: "dev" }。
++ * 覆盖：
++ * 1. default 导出是 id 为 "codearts-bridge" 的插件定义（Plugin.Plugin 形状）；
++ * 2. setup 恰好注册五个 M1 工具（名称集合断言；逐工具的 namespace/schema 精确断言
++ *    在 test/m1-acceptance.test.ts）；
++ * 3. 运行时不兼容守卫：宿主上下文缺 tool.transform 时显式 throw（修复环 I1 保持）；
++ * 4. status 工具以 content 返回（R-t1 新语义，替代 T1-01 的 {output} 冒烟契约）；
++ *    用注入 fixture 的 buildPlugin 实例验证，绝不触碰真实 HOME。
+  */
+ import { describe, expect, it } from "bun:test";
+ import { Plugin } from "@opencode/plugin";
+-import plugin from "../src/server";
+-import {
+-  PLUGIN_ID,
+-  PLUGIN_VERSION,
+-  SMOKE_TOOL_NAME,
+-  TOOL_NAMESPACE,
+-} from "../src/core/config";
++import plugin, { buildPlugin, TOOL_NAMES } from "../src/server";
++import { PLUGIN_ID } from "../src/core/config";
++import { makeInstallFixture } from "./fixtures/install-fixtures";
++import * as path from "node:path";
++import * as fs from "node:fs/promises";
+ 
+ /** add 被调用时捕获到的工具信息（只取测试关心的字段）。 */
+ interface CapturedTool {
+   name: string;
+   options?: { namespace?: string };
+   execute: (input: unknown, context: unknown) => Promise<unknown>;
+ }
+ 
+-/** 按 @opencode/plugin 的 ToolDomain.transform 契约构造 fake ctx（任务书 Step 1 指定形状）。 */
+-function makeFakeContext(): { ctx: unknown; added: CapturedTool[] } {
++/** 按 @opencode/plugin 的 ToolDomain.transform 契约构造 fake ctx。 */
++function makeFakeContext(permission: unknown = undefined): { ctx: unknown; added: CapturedTool[] } {
+   const added: CapturedTool[] = [];
+   const ctx = {
++    options: {},
++    permission,
+     tool: {
+-      // 模拟宿主：transform 收到编辑器回调，立即用捕获编辑器调用之
+       transform: async (cb: (editor: unknown) => void) => {
+         cb({
+           add: (tool: CapturedTool) => {
+             added.push(tool);
+           },
+         });
+         return { dispose: async () => {} };
+       },
+     },
+   };
+   return { ctx, added };
+ }
+ 
+ /** 把 fake ctx 断言成宿主上下文类型（单测标准做法；真实契约由编译期保证）。 */
+ function asHostContext(ctx: unknown): Parameters<typeof plugin.setup>[0] {
+   return ctx as Parameters<typeof plugin.setup>[0];
+ }
+ 
+-describe("codearts-bridge 插件骨架", () => {
++describe("codearts-bridge 插件入口", () => {
+   it("default export is a plugin definition with id \"codearts-bridge\"", () => {
+-    // 导出对象非空且经 Plugin.define 形状检查（编译期：Plugin.Plugin 可赋值性）
+     expect(plugin).toBeDefined();
+     const shapeCheck: Plugin.Plugin = plugin;
+     expect(shapeCheck.id).toBe(PLUGIN_ID);
+     expect(plugin.id).toBe("codearts-bridge");
+     expect(typeof plugin.setup).toBe("function");
+   });
+ 
+-  it("setup registers exactly one smoke tool named codearts_status", async () => {
++  it("setup 恰好注册五个 M1 工具（TOOL_NAMES 精确集合）", async () => {
+     const { ctx, added } = makeFakeContext();
+     await plugin.setup(asHostContext(ctx));
+-
+-    // 恰好注册一个工具
+-    expect(added).toHaveLength(1);
+-    const tool = added[0]!;
+-    // 命名空间内名 "status" + 命名空间 "codearts" => 对外有效名 codearts_status
+-    expect(tool.name).toBe(SMOKE_TOOL_NAME);
+-    expect(tool.options?.namespace).toBe(TOOL_NAMESPACE);
+-    expect(`${tool.options?.namespace}_${tool.name}`).toBe("codearts_status");
++    expect(added.map((t) => t.name)).toEqual([...TOOL_NAMES]);
++    expect(`${added[0]!.options?.namespace}_${added[0]!.name}`).toBe("codearts_status");
+   });
+ 
+   it("setup 在宿主上下文缺 tool.transform 时抛出含契约信息的错误（修复环 I1）", async () => {
+     // 不兼容宿主的两类形态：完全缺 tool 字段 / tool 存在但缺 transform
+     for (const badCtx of [{}, { tool: {} }]) {
+       let caught: unknown;
+       try {
+         await plugin.setup(asHostContext(badCtx));
+       } catch (e) {
+         caught = e;
+@@ -83,22 +77,39 @@ describe("codearts-bridge 插件骨架", () => {
+       // 出错即显式报错：必须抛出，禁止 console.error 后静默跳过
+       expect(caught).toBeInstanceOf(Error);
+       const message = (caught as Error).message;
+       // 错误消息须含：插件 id、缺失项、期望契约（opencode V2 插件 API）
+       expect(message).toContain(PLUGIN_ID);
+       expect(message).toContain("tool.transform");
+       expect(message).toContain("opencode V2");
+     }
+   });
+ 
+-  it("smoke tool execute returns { ok: true, version }", async () => {
+-    const { ctx, added } = makeFakeContext();
+-    await plugin.setup(asHostContext(ctx));
+-
+-    const tool = added[0]!;
+-    const result = (await tool.execute({}, {})) as {
+-      output?: { ok?: boolean; version?: string };
+-    };
+-    expect(result.output?.ok).toBe(true);
+-    expect(result.output?.version).toBe(PLUGIN_VERSION);
++  it("status 工具以 content 返回结构化 JSON（R-t1 语义；注入 fixture 隔离真实 HOME）", async () => {
++    const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++    const fixture = await makeInstallFixture(
++      path.join(PLUGIN_ROOT, ".tmp", "server-smoke-test"),
++      "healthy",
++    );
++    try {
++      const isolated = buildPlugin({
++        configOverrides: { installDir: fixture.installDir, stateDir: fixture.stateDir },
++        exec: fixture.exec,
++        kernelDataDir: path.join(fixture.root, "cli-data"),
++      });
++      const { ctx, added } = makeFakeContext();
++      await isolated.setup(asHostContext(ctx));
++      const status = added.find((t) => t.name === "status");
++      expect(status).toBeDefined();
++      const result = (await status!.execute({}, {})) as {
++        content: Array<{ type: string; text: string }>;
++      };
++      expect(Array.isArray(result.content)).toBe(true);
++      expect(result.content[0]!.type).toBe("text");
++      const payload = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
++      expect((payload.bridge as Record<string, unknown>).version).toBe("dev");
++      expect((payload.install as Record<string, unknown>).present).toBe(true);
++    } finally {
++      await fs.rm(path.join(PLUGIN_ROOT, ".tmp", "server-smoke-test"), { recursive: true, force: true });
++    }
+   });
+ });

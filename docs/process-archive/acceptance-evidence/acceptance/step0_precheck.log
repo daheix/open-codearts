@@ -1,0 +1,25 @@
+=== T0 2026-10-31T17:33:57+08:00 前置检查 ===
+--- systemctl is-active:
+active
+--- systemctl status 摘要:
+● codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）
+     Loaded: loaded (/home/wsc/.config/systemd/user/codearts-bridge.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-10-31 16:14:28 +08; 1h 19min ago
+   Main PID: 502400 (bun)
+      Tasks: 14 (limit: 32602)
+     Memory: 8.7M (peak: 10.3M swap: 2.3M swap peak: 2.6M)
+        CPU: 5.139s
+     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/codearts-bridge.service
+             └─502400 /home/wsc/.bun/bin/bun /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/cli.ts daemon
+
+10月 31 16:14:28 wsc-Default-string systemd[2128]: Started codearts-bridge.service - codearts-bridge 守护进程（目标引擎常驻宿主）.
+10月 31 16:14:28 wsc-Default-string codearts-bridge[502400]: [codearts-bridge] 目标域传输：pty-script（auto：未检测到 AK/SK 凭据 → pty；ptyHost=auto：tmux 不可用 → script）
+10月 31 16:14:28 wsc-Default-string codearts-bridge[502400]: [codearts-bridge] 清除陈旧 daemon.pid（pid=501551 已不存在）：path=/home/wsc/.codearts-bridge/daemon.pid
+10月 31 16:14:28 wsc-Default-string codearts-bridge[502400]: [codearts-bridge] 启动对账完成：resumed=0 blocked=0
+10月 31 16:14:28 wsc-Default-string codearts-bridge[502400]: codearts-bridge daemon: 监听 127.0.0.1:4577（version=dev，stateDir=/home/wsc/.codearts-bridge）；SIGINT/SIGTERM 优雅停止
+--- codearts-bridge status (CLI):
+timeout: 无法运行命令 "codearts-bridge": 没有那个文件或目录
+--- codearts CLI version:
+timeout: 无法运行命令 "/home/wsc/.codeartsdoer/installers/bin/codearts": 没有那个文件或目录
+--- token 文件:
+-rw------- 1 wsc wsc 64 10月 31 16:14 /home/wsc/.codearts-bridge/daemon-token

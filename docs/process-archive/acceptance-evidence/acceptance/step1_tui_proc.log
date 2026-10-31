@@ -1,0 +1,10 @@
+=== T1 2026-10-31T17:37:37+08:00 目标已创建，观察 TUI 进程形态 ===
+502400 /home/wsc/.bun/bin/bun /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/src/cli.ts daemon
+577837 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+577838 /home/wsc/.codeartsdoer/installers/bin/codearts
+578307 /bin/bash -c cd /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/.tmp/acceptance && chmod +x poll.sh && { echo "=== T1 $(date -Is) 目标已创建，观察 TUI 进程形态 ==="; pgrep -af "codearts" | head -10; echo "---"; pgrep -af "script.*codearts" | head -5; } 2>&1 | tee step1_tui_proc.log
+578309 /bin/bash -c cd /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/.tmp/acceptance && chmod +x poll.sh && { echo "=== T1 $(date -Is) 目标已创建，观察 TUI 进程形态 ==="; pgrep -af "codearts" | head -10; echo "---"; pgrep -af "script.*codearts" | head -5; } 2>&1 | tee step1_tui_proc.log
+---
+577837 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+578307 /bin/bash -c cd /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/.tmp/acceptance && chmod +x poll.sh && { echo "=== T1 $(date -Is) 目标已创建，观察 TUI 进程形态 ==="; pgrep -af "codearts" | head -10; echo "---"; pgrep -af "script.*codearts" | head -5; } 2>&1 | tee step1_tui_proc.log
+578309 /bin/bash -c cd /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge/plugins/codearts-bridge/.tmp/acceptance && chmod +x poll.sh && { echo "=== T1 $(date -Is) 目标已创建，观察 TUI 进程形态 ==="; pgrep -af "codearts" | head -10; echo "---"; pgrep -af "script.*codearts" | head -5; } 2>&1 | tee step1_tui_proc.log

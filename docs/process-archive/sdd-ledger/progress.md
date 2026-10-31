@@ -1,0 +1,332 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-10-31-codearts-integration-opencode-implementation-plan.md
+
+- 工作区: /home/wsc/.local/share/opencode/worktree/e5785e/codearts-bridge（git worktree，分支 codearts-bridge）
+- Spec: docs/superpowers/specs/2026-10-30-codearts-integration-opencode-design.md（权威；plan 为其论据）
+- BASE(T1): 723e116754c6362dd67c5ba728a25abb0a5c1d62
+
+## 预检扫描（执行前冲突/一致性核查）
+
+### 共享文件与接口对（产出→消费）
+| 产出方 | 消费方 | 核查 | 结果 |
+|---|---|---|---|
+| T1-02 BridgeConfig | T2-04/T3-03 参数 | 字段（transport/ptyHost/akskFile/thresholds.*）名与形状 | ✓ 一致 |
+| T1-04 fsx（sameDevice/copyDeploy/atomicWriteFile/sha256File） | T1-05 升级、T3-04 状态 | 签名与语义 | ✓ 一致 |
+| T1-03 BridgeError + codes | T1-04/05/11/12/19 错误分支 | UPPER_SNAKE code + remediation | ✓ 一致 |
+| T2-01（CodeartsTransport/Signal/SessionRef/FakeTransport） | T2-02/03/04/05、T3-03/04 测试 | 名称/形状 | ✓ 一致 |
+| T1-03/04/05 install 家族 | T1-08 server 接线 | 函数名与返回类型 | ✓ 一致 |
+| T3-02 protocol（CONTINUE_PROMPT/buildResumeContract/parseProgress） | T3-03 runner | 名称/语义 | ✓ 一致 |
+| T3-04 state（saveGoal/loadGoals/appendAudit/reconcile） | T3-05 daemon、T3-06 插件 | 名称/时机 | ✓ 一致 |
+| server.ts 递增修改（T1-08→T2-05→T3-06） | — | 顺序与 Files 清单 | ✓ 无冲突 |
+| daemon.ts 递增修改（T3-01→T3-04→T3-05） | — | 顺序与 Files 清单 | ✓ 无冲突 |
+
+### 逐卡自洽（分组）
+T1-01..T4-03 全 25 卡均含 Files/Interfaces/可执行步骤/commit 回滚点；抽查跨卡继承（T3-04 Modify daemon.ts ↔ T3-01 Create；T2-05 Modify server.ts ↔ T1-08；T1-07 依赖 T1-06 的 health.ts；T1-05 依赖 T1-04 fsx）——无自相矛盾；测试步均含"跑失败→实现→跑通过"闭合。
+
+## 预检裁决（Ruling）
+- Ruling: spec 任务卡 10→8 折叠（T1-09/T1-10 并入 T1-07/T1-08）— spec §6.5 工具面（status/repair/upgrade/health/hygiene）在 T1-08 全覆盖，未丢项 — 若错：补派任务即可（代价小）。
+- Ruling: T1-01 计划文本缺陷（Files 未列 README.md 但 Step5 要求写入）— 不改已提交 plan，派发说明中补充创建 README.md — 若错：文档清单差 1 行（已登记）。
+- Ruling: T1-05 真机升级链路（httpFetcher 直连官方接口）可达性未经 AK/SK 场景验证 — 单测全部注入 Fetcher；真机路径并入 T4-02 验证 — 若错：升级真机链路延后暴露问题（不阻塞 M1 测试面）。
+- Ruling: T1-01 Step5 全局配置验证界定为"受控观察"（先备份、后还原；禁重启/禁 kill opencode 服务；配置为热重载）— 若错：需手动恢复全局配置（已要求 diff 校验还原）。
+- Ruling: T3-06 插件轮询需注册卸载清理（plan 未显式写）— 并入 T3-06 派发说明 — 若错：插件卸载后残留定时器。
+
+## 进度
+- Task 1: dispatched (BASE 723e1167) — 派发实施子代理（brief task-1-brief.md）
+- Task 1: implementer 返回 DONE_WITH_CONCERNS，commit 58eba495fc（3 pass / tsc 干净 / 单文件≤85 行）
+  - 取证核心结论：2.1.4 项目级 `plugin`（单数）+ 绝对目录 + 根 index.ts 实体入口可加载（日志行级证据）；文件路径被拒；含 package.json 的目录走 npm 解析被跳过（故保留根 index.ts 兼容入口）；依赖就近解析；全局 jsonc 两键均未热重载。
+  - Concern ① setup 执行/工具注册无直接证据（2.1.4 无工具清单端点）→ 闭环计划：T1-08 会话内实测 codearts_status（派发说明中已并入）。
+  - Concern ② 全局接入未闭环 → T4-01 方案：项目级形态已验证；另验 `~/.config/opencode/plugins/` 自动加载目录。
+  - Concern ③ 环境观察（ohm-shim 缺依赖、CGAL WARN）非本卡问题。
+  - Ruling: 接受 concerns 并进入任务评审（低风险 + 闭环路径明确）；若评审将其判为真实缺口则转入修复环。若错：闭环推迟到 T1-08，代价=一个里程碑内的验证滞后。
+- Task 1: review 返回 **Needs fixes**（2 Important / 0 Critical；评审包 review-723e116754..58eba495fc.diff）
+  - I1 `server.ts:35` 裁决引用失配（注释引用"预检裁决 3"不在持久记录）。核实：T1-01 派发说明确含"setup 不得抛异常"指令但未入台账。
+    Ruling: ①补登记该指令来源；②复核后改判——guard 语义由"console.error+跳过注册"改为**显式 throw**（仓库铁律：出错即显式报错、禁静默退化；throw 路径在宿主日志可见性更好；把 2.1.4 兼容不确定性转成响亮信号）；观察期安全目的已达成，本裁决替代原指令。若错：需回退为告警跳过（代价小、可回滚）。
+  - I2 `bunfig.toml` 缺项（plan-mandated）。核实：派发说明曾软化（"非必需"）但 plan/台账未留痕。
+    Ruling: 豁免登记 + plan 文本修订（T1-01 Files 中标注 bunfig.toml 可选项，理由：无 test 配置需求，YAGNI；先修文档再走流程；由实施者在修复提交中一并修订）。若错：后续需要时补建即可（代价小）。
+  - Minor（不入环，台账跟踪）：M3 守卫可观测性→T1-08 闭环时补守卫路径实测；M4 `plugin/index.ts` 推测性备用入口→T4-01 定稿后清理/标注；M5 test 冗余 shapeCheck→后续打磨；M6 cli 无参数 exit 0→CLI 任务（T3-01/T3-07）统一裁定。
+  - 评审员 ⚠️：bun test/tsc 未复跑（读码无具体疑点）→ 主控在任务完成前自跑一次作为验收证据。
+- Task 1: fix round 1/5 (2 addressed, 0 open — I1 guard→throw/引用修正/覆盖测试; I2 bunfig 豁免+plan 修订; commits 58eba495fc..8bb2fc1d50；resume 通道失效改为新派修复者)
+- Task 1: 主控验收自跑证据：`bun test` 4 pass / 0 fail / 18 expect；`bun run typecheck` rc=0
+- Task 1: **complete** (commits 723e1167..8bb2fc1d, review clean)
+- Task 2: dispatched (BASE 8bb2fc1d) — 派发实施子代理（brief task-2-brief.md；T1-02 配置与状态根）
+- Task 2: implementer 返回 DONE_WITH_CONCERNS，commit 54b039cbf0（22 pass / typecheck 零错）
+  - Concern 裁决：`autoNudge` 默认值改为 **true**（spec §6.3.2 停续是核心承诺；false 默认=静默挂起，违背"永不挂起"+禁静默铁律；false 保留为显式退出高级选项；逐目标覆盖将随 T3-05 定义）。若错：默认行为与预期相反，需改配置默认值（代价小、可回滚）。
+  - Concern 2/3（readAksk 未知键显式抛错；空文件 {} vs 缺失 undefined 两态）接受为实施者决策，交评审独立判断。
+- Task 2: 修正完成 6b4179fa8c（22 pass/78 断言，env/overrides 三路径覆盖）；任务评审 **Approved**（0C/0I/2 Minor）
+  - Minor（不入环）：M7 标量字段 env 读取与路径字段惰性读取错误面不一致（一致性打磨）；M8 parseAksk 值不剥离引号（补一句 doc 边界即可）。
+- Task 2: 主控验收自跑证据：`bun test` 22 pass / 0 fail；`bun run typecheck` rc=0
+- Task 2: **complete** (commits 8bb2fc1d..6b4179fa, review clean, 2 minors deferred)
+- Task 3: dispatched (BASE 6b4179fa) — T1-03 安装状态探测
+  - Ruling: pinned.json 缺失时不得用 drift=false 掩盖"未钉版"——"未钉版"与"已钉且一致"必须可区分（字段自定，显式表达）。若错：升级/漂移判定基础失真（代价中，可回滚）。
+  - Ruling: T1-03 增列 `src/core/fsx.ts`（仅 `sha256File`；T1-04 同文件扩展 sameDevice/copyDeploy/atomicWriteFile），禁止哈希两处重复实现。若错：文件归属微调（代价小）。
+  - Ruling: autoupdate 路径派生 `<installDir>/../codearts_cli.json`；缺失→undefined（显式未知）；**JSON 解析失败/类型非法→抛错**。若错：配置损坏时的行为语义调整（代价小）。
+  - Ruling: probeInstall 只读状态采集：业务态（缺失/坏哈希/无法执行/版本不符）以状态字段如实表达不抛业务错；FS 意外错误（非 ENOENT）→ 抛出。若错：错误分类调整（代价小）。
+- Task 3: implementer 返回 DONE，commit b63accad8b（54 pass/182 断言；typecheck 干净；主控抽查 54 pass 确认）
+  - 实现者 concerns（供后续任务指针）：① `codearts.bak-unknown` 占位名信息性，T1-04 ensureBackup 若需多备份扫描再扩展；② pinned.json 写入方在 T1-04/05（fixtures writePinnedFile 为格式契约）；③ createNodeExec UTF-8 跨 chunk 拼接待 T2 复用时换 StringDecoder。
+- Task 3: review 返回 **Needs fixes**（1 Important / 0 Critical）
+  - I1 `install.ts:140-143`：stderr 溢出被静默截断（与头注"stdout+stderr 合并计数→EXEC_OUTPUT_OVERFLOW"契约矛盾；测试只覆盖 stdout 溢出）。裁定：修复矢量=stderr 与 stdout 同构处理（合并计数、超限即 settleFail+SIGKILL、补 stderr 溢出测试）。若错：无——契约明文要求，直接修。
+  - Minor（不入环）：M9 fsx `errnoOf` 超 R-b 字面（头注标注为共享助手即可）；M10 detectVersion 失败原因折叠（建议 T1-04/05 见效时增可选诊断字段）；M11 spawn 层原始 Error 未结构化（建议包 BridgeError(EXEC_SPAWN_FAILED)，T2 复用前处理）；M12 backup 路径派生重复（观感）。
+- Task 3: fix round 1/5 (1 addressed, 0 open; commits b63accad8b..e008c2a64b)；重评审确认（含 SIGKILL marker 验证、无新破坏）
+- Task 3: 主控验收自跑：`bun test` 55 pass / 0 fail / 185 expect；`bun run typecheck` rc=0
+- Task 3: **complete** (commits 6b4179fa..e008c2a6, review clean, 4 minors deferred)
+  - T2 关注点（携带指针）：createNodeExec 多字节跨 chunk 拼接需 StringDecoder；kill 只杀 shell 不杀进程组（传输层复用前评估）。
+- Task 4: dispatched (BASE e008c2a6) — T1-04 备份与自愈
+  - Ruling: copyDeploy 原子替换语义（目标要么旧要么新，无半写；推荐同目录 tmp+rename；fsync；mode 默认 755；失败旧文件原位）。
+  - Ruling: ensureBackup=派生物可安全刷新（bin 有效且备份缺失/失效→从 bin 刷新+审计；bin 缺失→显式 BridgeError）。
+  - Ruling: repair 备份发现顺序：`<binPath>.bak-<期望版本>` → 扫描 `bin/codearts.bak-*` 任一有效备份（结果显式记录所用文件）→ 无则 BIN_MISSING_NO_BACKUP（remediation 含 .delete 残留检查/官方重装/备份恢复指引）。
+  - Ruling: fixAutoupdate=显式开关：parse→改字段→写回（JSON.stringify 2 空格+末尾换行）；解析失败→AUTOUPDATE_INVALID 且不触碰文件；审计含 before/after。
+  - Ruling: 审计 `audit/install.jsonl`，auditId 形如 `rep-<ts>-<rand>`；追加写。
+- Task 4: implementer 返回 DONE，commit 9fff0cd7e8（82 pass/284 断言；typecheck 干净；主控抽查 82 pass 确认）；报告记录中间真缺陷（only-delete 误报 BACKUP_INVALID）并修复。
+- Task 4: review **Approved**（0C/0I/5 Minor）
+  - Minor（不入环）：M13 恢复用例名与 fixture 不符（.delete+备份组合场景未字面覆盖——行为两半已覆盖）→ 并入 T1-08 验收补组合场景；M14 stat TOCTOU 裸错包装（打磨）；M15 rename 后无目录 fsync（T1-05 deploy 步骤评估补 fsyncDir）；M16 只读目录用例隐含非 root 前提（CI 注意）；M17 失败动作无审计行（T3 状态层可补 result:"failed"）。
+- Task 4: 主控验收自跑：`bun test` 82 pass / 0 fail / 284 expect ✓
+- Task 4: **complete** (commits e008c2a6..9fff0cd7, review clean, 5 minors deferred)
+- Task 5: dispatched (BASE 9fff0cd7) — T1-05 受控升级
+  - Ruling: 升级逻辑落**新文件 `src/core/upgrade.ts`**（install.ts 已 821 行；保持单文件 ≤1000 铁律；测试 test/upgrade.test.ts）。若错：文件归属微调（代价小）。
+  - Ruling: deploy 后新增 `fsx.fsyncDir` 对目标目录 fsync（M15 收敛；失败显式报错）。若错：极端断电场景的持久化语义减弱（有备份兜底）。
+  - Ruling: 包布局识别最小规则：候选二进制=[`bin/codearts`,`agentkernel`,`codearts`] 中首个 ELF 魔数文件（缺失→`PACKAGE_LAYOUT_INVALID` 显式）；可选脚本=名为 `codearts` 且 `#!` 开头的文本文件（存在则一并 copyDeploy 到 `<installDir>/codearts`；不存在不报错）。若错：对厂商包布局演进的适配调整（代价小）。
+  - Ruling: Fetcher 注入（测试全离线）；`httpFetcher` 真实实现引用实测端点与响应形状（`ide.cn-north-4.myhuaweicloud.com/v1/release-info/latest?sub_product_name=cli-linux-x64&os_type=debian&arch=X86-64` → `{result:{version,url,hash}}`），真机验证并入 T4-02。若错：端点变更时仅改一处常量（代价小）。
+- Task 5: implementer 返回 DONE，commit 26734d6cf7（103 pass/395 断言；upgrade.ts 523 行；install.ts 净增 3 行）。
+- Task 5: review **Approved（含 2 Important plan-mandated，进修复环）**
+  - I1 `upgrade.fail`/`upgrade.start` 审计缺失（spec §8 权威清单要求）。裁定：补 `upgrade.start`（single-flight 置位后）+ `upgrade.fail`（所有失败分支，含 code/auditId，原错误 rethrow）。若错：无（规格明文）。
+  - I2 verify 失败分支自毁旧版快照（finally 清 staging 连快照一并删；破坏性 rename 已发生→首次升级场景旧版不可恢复，remediation 落空）。裁定：verify 失败 → 回滚 `copyDeploy(快照→binPath)` 并审计 `upgrade.fail{rolledBack:true}`；回滚失败 → **保留暂存**（不清）、审计记录 snapshotPath、remediation 含快照路径。若错：极端回滚失败场景语义调整（代价小）。
+  - Minor（不入环）：M18 报告行数两处失实（523/626 实测）；M19 deploy-interrupt 用例补 binDir 无残留断言；M20 single-flight 置位与 try 间理论泄漏窗口（防御性）；M21 跨设备用例用 /tmp/opencode（已披露豁免）；M22 EACCES 用例 root 耦合（CI 注意）。
+  - ⚠️ 主控应查：RELEASE_INFO_URL query 与响应形状实测依据（报告无抓包证据）→ 并入 T4-02 真机验证；103 pass 未复跑 → 主控验收自跑。
+- Task 5: fix round 1/5 (2 addressed, 0 open; commits 26734d6cf7..80240ce43b)；重评审确认（含回滚失败真实 EACCES 注入测试、start/fail 事件核验）；新增 Minor：同版本重试可静默销毁保留的暂存快照（触发需违反 remediation 指引；延后立项）
+- Task 5: 主控验收自跑：`bun test` 104 pass / 0 fail；`bun run typecheck` rc=0
+- Task 5: **complete** (commits 9fff0cd7..80240ce4, review clean, minors deferred)
+- Task 6: dispatched (BASE 80240ce4) — T1-06 健康采样
+  - Ruling: lastErrors 采集口径以**真实日志格式**为准：ERROR 前缀行 **或** 含错误关键词（`error fetch`/`ECONNRESET`/`timed out`/`TimeoutError` 等）的 INFO/WARN 行；去重、上限 20；关键词表写进代码注释；测试样本用真实格式（含 `INFO … "error fetch:" … code:"ECONNRESET"` 行）。若错：采集口径调整（代价小）。〔修正 plan 测试原文"只收 ERROR 级"与实测矛盾〕
+  - Ruling: kernelDataDir 作为 collectHealth 的**函数参数**（默认 `~/.codeartsdoer/cli-data`）传入，本任务**不扩展 BridgeConfig 接口**。若错：后续按需升级为配置项（代价小）。
+  - Ruling: 缺目录返回零值属"容忍探测"（只读状态采集），注释写明非掩盖；PidProbe 注入，默认无 → rssBytes undefined。
+- Task 6: implementer 返回 DONE，commit c0a855b0cd（115 pass/486 断言；真实环境只读演练 logs/dumps 与 du 逐位一致）。
+  - Concerns 裁决：① 全量扫描 14.4s 接受（任务书未要求增量化；记为 M2 增量扫描设计输入+采样频率依据）；② WAL 命名 `opencode.db-wal` 接受（双确证优于字面）；③ 缺省路径分支无直接测试接受（隔离裁定所致，分支为单行拼接）。
+- Task 6: review **Approved**（0C/0I/4 Minor）
+  - Minor（不入环）：M23 scanLogFile finally 缺 input.destroy()（fd 卫生，随 M2 一并处理）；M24 severity 对 tab 分隔理论漏采（真实为空格，理论边界）；M25 截断先于去重键计算的理论碰撞（极难碰撞）；M26 报告一处数字笔误（168.02→168.05 系转写）。
+  - 待主控确认项（评审提出）：logs.bytes 口径="log 目录递归总字节（含 dumps 子集）"，已注释+测试钉死——主控采纳（与"资源占用可见"目标一致）。
+- Task 6: 主控验收自跑：`bun test` 115 pass / 0 fail；`bun run typecheck` rc=0
+- Task 6: **complete** (commits 80240ce4..c0a855b0, review clean, 4 minors deferred)
+- Task 7: dispatched (BASE c0a855b0) — T1-07 hygiene 治理
+  - Ruling: WAL checkpoint 用 `bun:sqlite`（`PRAGMA wal_checkpoint(TRUNCATE)`；打开失败/PRAGMA 失败显式抛）。若错：换 sqlite CLI 通道（代价小）。
+  - Ruling: 默认参数 `olderThanDays=30`、`logsKeep=20`（kernel-*.log 专属轮转）；purge 仅匹配 `dump-*.heapsnapshot` 且路径必须位于 kernelDataDir/log 内（越界拒绝）。若错：默认值调整（代价小）。
+  - Ruling: hygiene 审计写同一 `audit/install.jsonl` 流（M1 单一审计流；T3 如需再拆分）；apply 审计含删除清单；dry-run 清单=apply 实际清单（逐条可断言）。若错：审计流拆分（代价小）。
+- Task 7: implementer 返回 DONE，commit 03af4add9c（133 pass；health.ts 860 行≤1000——**红线提醒：后续任务触碰 health.ts 前先评估拆分**）。
+- Task 7: review **Approved + 1 Important**（busy 分支零测试且"不可测"理由被评审实证推翻）
+  - I1：`WAL_CHECKPOINT_BUSY` 分支零回归保护（唯一防"TRUNCATE 未达成被误报成功"防线）；评审给出确定性构造法（连接 A 持未提交读事务 + 连接 B checkpoint → busy=1；A COMMIT 后 → busy=0）。裁定：补两连接回归测试（busy 路径 + 恢复路径）+ 更正报告关注点①表述。若错：无——测试加固。
+  - Minor 折叠裁决（同文件 1 行级，随修复一并处理）：M27 失败审计补 `rotatedCount`（与成功路径 schema 对齐）；M28 删除恒真自比较断言。M29（同批重复 wal-checkpoint 审计覆盖写）延后（仅手工构造可触发，M2 动作去重时处理）。
+- Task 7: fix round 1/5 (3 addressed, 0 open; commits 03af4add9c..dab56deae7；含"删 busy 判定→用例红"反证实证)；重评审确认无新破坏
+- Task 7: **complete** (commits c0a855b0..dab56dea, review clean, M29 deferred)
+- Task 8: dispatched (BASE dab56dea) — T1-08 M1 工具接线与验收（五个工具：status/repair/upgrade/health/hygiene）
+  - Ruling: 工具 execute 的业务错误以**结构化 content** 返回（`{error:{code,message,remediation}}`），不抛裸异常；破坏性动作（repair/upgrade/hygiene-apply）经 `ctx.permission.assert`（action=`codearts.manage`，resources=install|state，save 同 resources；source 带 tool/messageID/id）。若错：权限语义调整（代价小）。
+  - Ruling: `codearts_repair` 幂等语义：bin 健康时返回 already-healthy 结构化结果（非错误）；`fixAutoupdate` 透传；无备份→BIN_MISSING_NO_BACKUP+remediation 为 content。若错：工具语义调整（代价小）。
+  - Ruling: M13 折叠——补组合场景（.delete 残局 + 有效备份 → repair 成功）进 M1 验收测试。若错：无（覆盖补强）。
+  - Ruling: 真实会话活验路径——将插件以**本地 dev 接线**加入 worktree `opencode.json`（绝对路径；**不提交**、仅本地工作区改动，台账在案；合并时排除、T4-01 定正式接入形态）；经日志确认加载无错；工具活调用（codearts_status）由主控在完成后尝试并记录（T1-01 concern① 的闭环点）。若错：接线移除即可（代价小）。
+  - Ruling: server.ts 若超 ~800 行允许拆分 `src/tools/*.ts`（保持单文件 ≤1000 红线）。若错：文件归属微调（代价小）。
+- Task 8: implementer 返回 DONE，commit b13e72fae1（156 pass/882 断言；server.ts 619 行；TDD RED→GREEN）。
+  - 接线活验（R-t5）：worktree opencode.json 已加插件绝对路径（**未提交**，本地 dev 接线，台账在案）；日志零失败；实施者会话实调 `codearts_status`+`codearts_hygiene{apply:false}` 成功。
+  - **主控活验（M1 验收证据）**：本会话（主控）实调 `codearts_status` 成功，真实环境直出：present=true/version=26.10.9/pinState=unpinned/backupValid=true/autoupdateFlag=false/AK-SK=未配置/db=1113268224B/wal=0/dumps={6,1302015607B}/logs=2333906250B/lastErrors=20/kernelRssFromLog=176213197B。**T1-01 concern① 闭环**（2.1.4 下 setup 执行→工具注册→会话可调用，全链路实证）。
+  - 实施者 concerns：① 真实环境 dumps+logs+db≈4.5GB（hygiene 计划就绪待用户决策）；② 权限门真实拒绝交互未演练（本会话 permission=allow）→ 记 T4-01；③ status/health 真实环境约 14s/次（已写入工具描述）。
+- Task 8: review **Approved**（0C/0I/4 Minor）
+  - Minor（不入环）：M30 `inputRecord` 对 null 静默归一（建议 null 也显式报错或注释）；M31 报告 §1.3 options 白名单笔误（实现正确：无 kernelDataDir——报告勘误）；M32 `SMOKE_TOOL_NAME` 死导出（补注释）；M33 错误返回无 isError 标志（记录项，若插件 API 支持再增强）。
+- Task 8: 主控验收：`bun test` 156 pass / 882 expect；`bun run typecheck` rc=0；**活验：主控会话实调 `codearts_status` 成功（真实数据）**。
+- Task 8: **complete** (commits dab56dea..b13e72fa, review clean)
+- 🏁 **M1 里程碑完成（T1-01..T1-08 全绿）**：验收判据证据——① .delete 诊断（T1-03 测试）②repair 恢复含组合场景（T1-04/T1-08 R-t4）③升级跨数据集+零损坏矩阵（T1-05）④autoupdate 报警（T1-03/04）⑤健康/hygiene（T1-06/07）⑥插件加载+工具活调用（T1-08 主控实调）。M1 期间 8 卡全部经独立评审+修复环收敛；累计 34 项 Minor 延后（终审分诊）。
+- Task 9: dispatched (BASE b13e72fa) — T2-01 传输接口与 FakeTransport
+  - Ruling: `observe` 必须尊重 `opts.signal`（abort → 迭代正常结束）；FakeTransport 设计为 T3-03 runner 测试可复用（脚本化信号/注入留痕/存活开关/stop 后 observe 终止）。
+  - 携带指针（实现者注意）：进程原语复用注意——createNodeExec 的 UTF-8 跨 chunk（T2 涉非 ASCII 需 StringDecoder）与 kill 仅及 shell 不及进程组（传输层自建 spawn 时需考虑进程组终止）。
+- Task 9: implementer 返回 DONE，commit 3c292e471d（172 pass；transport/types.ts 59 + fake.ts 268 + test 300 行）。
+  - Concern 裁决：① abort 语义钉死为"立即放弃、残存信号丢弃"——**T2-02/03/04 真实实现必须对齐**（携带至各派发说明；T3-03 经 Fake 验证的行为与真实传输不得分叉）；② opencode.json 本地改动=已知 dev 接线（T8 R-t5 在案，后续任务不得提交/还原）。
+- Task 9: review **Approved + 1 Important**
+  - I1：abort"立即放弃"语义只钉在 fake.ts 注释，未入 types.ts（契约唯一真相源）——裁定：types.ts observe 注释补一行（真实传输实现须对齐；T3-03 基准语义）。若错：无（纯注释）。
+  - 折叠 Minor（同域一行级，随修复处理）：M34 包装层 return/throw 对挂起等待补 `wakeAll(s)`（与 abort 路径对称）+ 一个"pending next 时 return() 可落定"用例。其余 M35/M36/M37 延后（stop 排空语义补注释、start 复用 at 归零交互说明、injections 只读视图）。
+- Task 9: fix round 1/5 (2 addressed, 0 open; commits 3c292e471d..8b7d4a43ba)；重评审确认（含挂起等待解析链闭合核验）；范围外观察：throw() 对称路径无专测（非阻塞，T2-02~04 实现各自迭代器时可补）
+- Task 9: **complete** (commits b13e72fa..8b7d4a43, review clean, M35/M36/M37 deferred)
+- Task 10: dispatched (BASE 8b7d4a43) — T2-02 PTY 宿主 · script(1)
+  - Ruling: 两段式注入（text → 可注入时钟 120ms → "\r"）——注入时钟用于测试确定性。若错：时序参数调整（代价小）。
+  - Ruling: **日志信号源**（plan 补丁）：tail `<KERNEL_DATA_DIR>/log/kernel-*.log` 增量，`service=` 行转为 output 信号补充；日志源不可用（无文件/轮转）不报错，来源可用性在 `snapshot.meta` 如实标注；测试：fake-tui 追加 `service=om` 行 → observe 产出信号；缺失 → 标注不可用。
+  - Ruling: **abort 对齐**（T9 I1 基准）：observe 尊重 opts.signal，立即放弃、残存信号丢弃、不 flush、不抛错。
+  - Ruling: **进程组终止**：`stop` 必须连底层 codearts 进程一并终止（spawn detached + 负 PID kill 或等价），测试用 `/bin/sh` 孙进程 fixture 验证"stop 后进程树无残留"（防 createNodeExec 同款"只杀 shell"残留）。若错：极端残留场景，回滚为显式文档限制（代价中）。
+  - 隔离：测试允许本地 spawn bash fixture（离线）；绝不真跑 codearts；不触真实 HOME。
+- Task 10: implementer 返回 DONE，commit 9b3ea99d74（195 pass；22 新用例实跑真 PTY；实施中修复两处测试侧隐患）。
+  - 流程修正（主控自我）：T10 派发时漏跑 task-brief 提取，brief 文件事后补生成（实施者已成功交付，评审以派发内嵌规格为准）——后续任务严格先提取 brief。
+  - Concern 裁决：① setsid+CASCADE 机理=真实行为（探针+测试证实）；组杀仅及 script、树终止靠 master 关闭 SIGHUP 级联；HUP-trapping 目标残留风险记录（T2-03 tmux / T2-05 eval 强化后代清扫）；② 200ms 轮询按接口签名接受；③ 测试侧修复接受。
+- Task 10: review **Needs fixes**（1 Important）
+  - I1：`pty-script.ts:22-24/:144/:596` 注释称"组杀含孙进程"与探针实测相反；报告"已注释"表述不实。裁定：**纯注释更正**——文件头 R-p4 段与 kill() 处写明真实两级机理（组杀覆盖 script；树终止=master 关闭 SIGHUP 级联）、残余风险（HUP-trapping 目标）与缓解路径（T2-03/T2-05）；报告表述一并更正。若错：无（文档与事实对齐）。
+  - Minor（不入环）：M38 copytruncate 式轮转致 tail 静默停摆+meta 陈旧（超出"新文件轮转"口径，后续）；M39 family 用例清场仍子串匹配（改全路径元素全等更稳）；M40 空转期 200ms 同步 readdir+stat（量大时 mtime 短路）。
+- Task 10: fix round 1/5 (1 addressed, 0 open; commits 9b3ea99d74..a478c3c9d5；纯注释更正，测试零改动)；重评审确认无残留旧口径
+  - 范围外观察（延后）：`test/transport-script.test.ts:13-14` 文件头注释仍是旧口径（下次触碰该文件时顺手更正，M41）。
+- Task 10: 主控验收自跑：`bun test` 195 pass；`bun run typecheck` rc=0
+- Task 10: **complete** (commits 8b7d4a43..a478c3c9, review clean, M38/M39/M40/M41 deferred)
+- Task 11: dispatched (BASE a478c3c9) — T2-03 tmux PTY 宿主
+  - Ruling: 共享工具提取（可选）——若显著降低重复且不破坏既有测试，允许在 transport/ 内提取 shared 助手（日志 tailer/observe 包装）；否则最小重复并在注释标明来源。若错：文件归属微调（代价小）。
+  - Ruling: tmux 探测在每次创建时执行（非缓存单次）：`tmux -V` 失败 → `PTY_HOST_UNAVAILABLE`（remediation：装 tmux 或 ptyHost=script；无静默切换）。真机用例以 `describe.skipIf(!hasTmux)` 标记（本机未安装 tmux）。
+  - 对齐：abort/observe/stop 语义与 types.ts 基准一致；start 幂等（`has-session` 命中→重连）；inject=send-keys 两次独立调用（文本/Enter）。
+- Task 11: implementer 返回 DONE，commit 8fcbe21485（221 pass；真机用例 skipIf(!hasTmux) 按裁定 skip）。
+  - Concern 裁决：① 签名偏差 `(cfg,exec)`→`(exec,opts)` 接受（types.ts 为契约唯一真相源；与 T2-02 先例一致；配置经 start(cfg) 交付，头注/提交已注明）；② capture 中途失败路径未单测（与已测退出码检查同构）接受，台账跟踪；③ 重绘差分对全屏重绘交付全量文本（监督层消费策略=T3 关注点）。
+- Task 11: review **Approved + 1 Important**
+  - I1（重建×观察中组合，公开 API 可达）：观察中会话外部消亡 + `start(ref)` 同名重建 → 新对象继承陈旧 `observer` 令牌 → 旧观察者结束只清旧对象 → **此后该 ref 一切 observe 永远 OBSERVER_ACTIVE**（remediation 误导）；且 snapshot 的 log meta 分叉。裁定：重建分支先 `prev.closed=true; wakeAll(prev)`（旧观察者按 stop 语义静默终止）、新对象 `observer=null` 干净起步；补单测（观察中+外部 kill+start(ref) → 后续 observe 可用）。若错：无（并发状态修复，测试锁定）。
+  - 确认（主控）：会话命名 `codearts-<slug>-<hash8(installDir)>` 扩展**接受**（防多安装目录同名碰撞；幂等重连语义所需）——T3-04 对账层以 SessionRef 为准，不假设命名格式。签名偏差 `(exec,opts)` 已确认（前条）。
+  - Minor（不入环）：M40 四个显式错误码路径缺直测（failNext 一行注入口，低成本）；M41 inject 校验顺序（多行检查应在 alive 之前更优）；→ 登记延后。
+- Task 11: fix round 1/5 (1 addressed, 0 open; commits 8fcbe21485..4797bfb3eb)；重评审确认（含共享 log 原地变更对 pty-script 零影响核验、重建终止链路闭合）
+- Task 11: 主控验收自跑：`bun test` 223 pass / 1 skip（真机 tmux，本机未装）/ 0 fail；`bun run typecheck` rc=0
+- Task 11: **complete** (commits a478c3c9..4797bfb3, review clean)
+- Task 12: dispatched (BASE 4797bfb3) — T2-04 structured 传输
+  - Ruling: **回合=进程**：每回合 spawn `<installDir>/bin/codearts run <prompt> --format json --print-logs`（argv 数组）；`--session <id>` 续接；session id 从事件行宽容提取（`sessionID`/`session_id` 首现；非 JSON 行按 output 处理并保留原文）。若错：解析策略调整（代价小）。
+  - Ruling: **AK/SK 前置**：start 前置检查 aksk（readAksk）；缺失 → `BridgeError(AKSK_MISSING)`，remediation 含官方配置入口与 config.env 说明（F2 实测门控；不静默转 PTY）。若错：传输可用性口径调整（代价小）。
+  - Ruling: **env 装配**：沿用 wrapper 全量字段；`CODEARTS_CLI_AK/SK` 注入；`OPENCODE_MODE` 不注入（交由 run 子命令语义；如实测必须，显式注释依据再补）。若错：env 微调（代价小）。
+  - Ruling: **并发=1**：同一 ref 新回合前不得有活跃回合（否则显式错）；kill=直接杀进程+进程组（T2-02 教训：防孤儿内部 server）。
+  - Ruling: **事件→Signal 映射表**写进代码注释（JSONL 行→output/error/step/done；错误分类 classifyError：ECONNRESET/timeout/429/503→retryable；认证失败→fatal）；非 JSON 行保留原文为 output（宽容解析，不静默丢弃）。若错：映射调整（代价小）。
+  - 隔离：`test/fixtures/fake-codearts/fake-run.ts` 按 `--scenario` 输出 JSONL（normal/stall/error/crash/echo/session-continuation）；测试注入 spawnPty/exec，全离线。
+- Task 12: implementer 返回 DONE，commit b5be623412（251 pass/1 skip；structured.ts 597 行；既有文件零改动）。
+  - Concern 裁决：① 一次全量测试被 SIGKILL（load≈10.6 疑环境 OOM/高载；复跑 2 轮全绿）→ 接受为环境噪声，台账记录（后续全量若再现考虑拆分/串行化策略）；② 事件字段路径为宽容假设、真实格式未实测 → **T4-02 真机验证必含 `codearts run --format json` 真实输出对照**（精化只动 handleLine 一处）；③ 签名偏差 `(exec)` 接受（对齐 T2-02/03 先例）。
+- Task 12: review **Approved**（0C/0I/6 Minor）
+  - Minor（不入环）：M42 stop 组杀→error 信号留队列路径零回归锁定（T3-04 对账集成补断言）；M43 INJECT_TEXT_EMPTY 在 ROUND_ACTIVE 之后（错误码优先级观感）；M44 killLeftovers 全机 /proc 子串匹配（测试侧，限 uid/时间窗更稳）；M45 废弃迭代器监听器滞留（结构同构已接受）；M46 raw 无上限累积（T3-04 消费侧注意）；M47 classifyError 子串理论误报+空行 output（裁定口径内）。
+- Task 12: 主控验收自跑：`bun test` 252 计数（251 pass+1 skip）/ 0 fail / 1196 expect；`bun run typecheck` rc=0
+- Task 12: **complete** (commits 4797bfb3..b5be6234, review clean, 6 minors deferred)
+- Task 13: dispatched (BASE b5be6234) — T2-05 codearts_run 工具与 M2 验收
+  - Ruling: **auto 传输选择显式**：config.transport=auto → structured 当且仅当 readAksk 有凭据，否则 pty（ptyHost: tmux 可用→tmux，否则 script）；结果中必须含所选模式与原因（无静默切换）。
+  - Ruling: `codearts_run({prompt, session?, timeoutMs?})`：timeout 到 → stop + 结构化超时结果（非静默）；进度 `context.progress({status})` 按信号批次/2s；`context.signal` → stop；返回 `{session, summary, signals, mode, reason, auditId}`；审计 run.start/run.exit（spec §8）。若错：超时/审计语义调整（代价小）。
+  - Ruling: M2 真机冒烟（计划内）：PTY(script) 对真实 codearts TUI 注入一轮短 prompt 并捕获输出（限时、捕获后停止；记录证据到任务说明）。若错：真机前置不足时如实标注"未执行+原因"（不虚报）。
+- Task 13: implementer 返回 DONE，commit d99f27ff8a（276 pass/1 skip；server.ts 730 + run.ts 451 行；bridge 链路真机全绿：PTY 注入真实 TUI、90s/1001 信号/49KB→timeout+stop 无残留、审计成对）。
+  - **真机发现（主控裁定入修复环）**：PTY 直启 `bin/codearts` 缺 wrapper 环境（KERNEL_DATA_DIR/OPENCODE_* 等）→ TUI 卡"Waiting for authorization"（未用用户已有 auth.json 登录态）。裁定：PTY 双宿主（script/tmux）改**经官方 wrapper `<installDir>/codearts` 启动**（单环境真相源；bin 直启仅在 wrapper 缺失时显式报错或降级注释——不静默）；structured 维持 bin 直启（无头模式 env 由 AK/SK 前置门控，属 F2 设计）。修复并入 T13 修复环 + 补真机复验（登录态可用则对话应能推进）。若错：启动方式回退 bin 直启（代价小、一行）。
+  - 实施者 concern 采纳：TUI 动画帧占 output 大头 → T3 监督判停滞需对齐 echoGuard/动画帧过滤口径（携带指针）。
+- Task 13: review **Approved**（0C/0I/5 Minor）；评审独立核实 bin 直启（pty-script.ts:286）+ env 裸传（:288）与主控归因一致；冒烟审计证据逐字段为真（auditId 6fea061f）。
+  - Minor（不入环）：M48 预 abort 短路（已折叠修复）；M49 报告行数勘误（已折叠）；M50 error 路径 exit 审计缺 outputBytes/summary（已折叠）；M51 生产宿主 run 不可取消（2.2.3 无 ctx.signal，已文档化；工具 description 补提示）；M52 wrapper 修复落点 pty-script.ts:286。
+- Task 13: fix round 1/5 (3 addressed, 0 open; commits d99f27ff8a..700a241e46)
+  - **wrapper 修复真机复验实证**："Waiting for authorization" 四轮 grep 均阴性；内核以用户 env 正常引导；登录态可用、prompt 递达已认证模型（DeepSeek-V4.1-Flash @ huaweicloud-maas）并开始生成。对话完整回合未在观察窗闭合（残余因素非桥接缺陷）。
+  - 真机新发现（携带指针→M3/T4）：① TUI 自升级交互门（OPENCODE_CHANNEL=latest + autoupdate:false 不抑制交互式升级对话框，盲注入被吞）→ **T3-03 监督需 TUI-ready 门**（就绪信号：屏幕含 "Ask anything…"）后再注入；② **上游升级缺陷现场复现**：EXDEV rename /tmp/agentkernel→installers/bin/codearts 失败弹屏（用户安装 26.10.9 钉版未变盘）——与今日修复的根因同源，建议上报华为；③ 按量计费提醒弹窗（套餐流量用尽）叠加噪声。
+- Task 13: fix round 1/5 (4 addressed, 0 open; commits d99f27ff8a..700a241e46)；重评审确认（wrapper 双宿主+WRAPPER_MISSING 专测、structured 依据注释、M48 零注入断言、M50 审计对齐；无新破坏）
+- Task 13: 主控验收自跑：`bun test` 280 计数（279+1skip）/ 0 fail / 1322 expect；typecheck rc=0
+- Task 13: **complete** (commits b5be6234..700a241e, review clean, M51/M52 deferred)
+  - 真机新发现（携带指针→M3/T4）：① TUI 自升级交互门（OPENCODE_CHANNEL=latest，autoupdate:false 不抑制交互式升级对话框，盲注入被吞）→ **T3-03 监督需 TUI-ready 门**（就绪信号：屏幕含 "Ask anything…"）后再注入；② **上游升级缺陷现场复现**：EXDEV rename /tmp/agentkernel→installers/bin/codearts 失败弹屏（26.10.9 钉版未变盘）——与 M1 修复根因同源，上报华为候办；③ 按量计费提醒弹窗（套餐流量用尽）叠加噪声。
+- 🏁 **M2 里程碑完成（T2-01..T2-05 全绿）**：传输层三形态（structured/pty-tmux/pty-script）+ codearts_run 工具全交付；真机证据：wrapper 修复后 PTY 链路实测登录态可用、prompt 递达已认证模型（DeepSeek-V4.1-Flash @ huaweicloud-maas）；structured 待 AK/SK 配置即用。累计 Minor 延后 40+ 项（终审分诊）。
+- Task 14: dispatched (BASE 700a241e) — T3-01 守护进程骨架与 API
+  - Ruling: 守护 HTTP 仅绑 127.0.0.1；端口默认 4577 可配（测试 0 随机取实际端口）；token `~/.codearts-bridge/daemon-token` 首启自动生成（32B hex）0600、重启复用。若错：token/端口策略调整（代价小）。
+  - Ruling: `GET /health` 免鉴权（防 watchdog 死锁设计，注释写明）；401=缺/错 token；404=结构化 NOT_FOUND。若错：鉴权面调整（代价小）。
+  - Ruling: CLI 增 `daemon`（前台）与 `status`（探测可达性，不可达非零退出）。若错：CLI 面调整（代价小）。
+- Task 25: dispatched (BASE 79a8523b) — T4-05 安装包与组件升级支持（用户新指令：别人开箱即用 + opencode/codearts 后续升级全支持）
+  - Ruling: 交付形态=**install.sh 引导脚本 + doctor 体检 + self-upgrade 自升级**（源码分发+Bun 前置；Bun 缺失由引导脚本自动补装）。若错：分发形态调整（代价小）。
+  - Ruling: 升级三通道：①bridge 自升级=git fetch→备份标记→reset→install→健康验证→失败回滚（禁 rename 跨数据集；copy 部署）；②codearts CLI=复用 upgradeInstall 零损坏内核（CLI 增子命令暴露）；③opencode=外部升级，doctor 版本检查+兼容矩阵文档。若错：升级语义调整（代价小）。
+  - Ruling: **安装器纪律**：幂等可重跑；全局配置改动先备份 diff 还原；绝不触发厂商自升级（autoupdate 门继承）；卸载默认保留用户数据（--purge 才清）。若错：无（纪律）。
+- Task 14: implementer 返回 DONE，commit 53c10ed60d（295 pass+1skip；过程中根因修复 2 真问题：① bun closeAllConnections 顺带停监听→stop 分态；② CLI 信号处理器注册竞态 ~50% 复现→先注册后启动）
+- Task 14: review **Approved**（0C/0I/6 Minor；两处自报根因修复经读码核实为真修复）
+  - Minor（不入环）：M53 DEFAULT_DAEMON_PORT 双真相源（从 DEFAULT_DAEMON_URL 派生消除漂移）；M54 复用路径 chmod 失败裸 fs 错误（包 BridgeError）；M55 server error 监听跨重启累积（once/移除）；M56 Bun 分态同端口释放未显式测试；M57 Bearer 大小写敏感（自家客户端约定可接受）；M58 /health 免鉴权依赖 127.0.0.1 绑定不变量的耦合提醒（R-d3 注释处补一句）。
+- Task 14: 主控验收自跑：`bun test` 296 计数（295+1skip）/ 0 fail；typecheck rc=0
+- Task 14: **complete** (commits 700a241e..53c10ed6, review clean, 6 minors deferred)
+- Task 15: dispatched (BASE 53c10ed6) — T3-02 完成协议移植
+  - Ruling: 语义源=codeartsGUI `src/goalprotocol.cpp` + `tests/test_goalrunner.cpp`（22 用例逐条搬运，用例名对齐）；v0.2.5/v0.2.6 修复语义（stripInjectionEcho、echo guard、ANSI 私有标记消费、hasRealContent CJK）必须随迁。若错：协议语义与 GUI 历史行为分叉（代价大——回退对齐）。
+  - Ruling: protocol.ts 为纯函数模块（无传输/FS/时钟依赖），接口按计划卡（GOAL_PLAN_MARK/GOAL_DONE_MARK/CONTINUE_PROMPT/buildContract/buildResumeContract/parseProgress/stripInjectionEcho/hasRealContent）。若错：接口微调（代价小）。
+- Task 15: review **Approved**（0C/0I/4 Minor；评审独立复推变异验证成立、22 对照无虚账）
+  - Minor（不入环）：M59 用例名"源用例30"标注失真（删）；M60 CONTRACT_PROTOCOL_BODY 比源多一空行（对齐或登记）；M61 totalSteps 近似口径 T3-03 消费时复述；M62 对照表精简版留档入库。
+- Task 15: 主控验收自跑：`bun test` 332 计数（331+1skip）/ 0 fail / 1461 expect；typecheck rc=0
+- Task 15: **complete** (commits 53c10ed6..b73ae61ff, review clean, 4 minors deferred)
+- Task 16: dispatched (BASE b73ae61ff) — T3-03 监督状态机
+  - Ruling: **纯 tick 设计**（注入时钟，测试假时钟推进；禁止 setTimeout 内嵌测试逻辑）；并发串行化（pause 与 tick 互斥队列或同步守卫，测试钉死）。
+  - Ruling: 策略参数默认对齐 spec §6.3.2（停滞 60s、错误重试无上限+60s 封顶+连续≥10 告警、strikes≥3 告警不终止）；done 双过=AI 自报+verifyRun（注入依赖）。若错：策略调整（代价小）。
+  - Ruling: 携带指针：①T3-02 feed 顺序契约（剥离→解析→3s 守卫）必须遵守；②TUI 动画帧占 output 大头→判停滞的"增量"口径需对齐（文本变化量或信号批次计数，测试覆盖）；③classifyModelError/normalizeReceived 随本任务移植（含 `\\b` 教训 TS 适配）。
+- Task 16: implementer 返回 DONE，commit 7c2c629fe0（364 计数：363+1skip；runner.ts 843 行≤1000；32/32 新用例）。
+  - 流程修正（主控自我②）：T16 派发又漏跑 task-brief（已事后补生成）——"验收+提取 brief"固定为派发前同一 shell 批次。
+  - Ruling（接口缺口确认）：RunnerDeps 增可选 cfg? 接受（进程死重建需 transport.start(cfg,ref)；计划卡遗漏）；structured 终态会话 start 抛错映射归 T3-05。若错：重建语义调整（代价小）。
+  - 携带指针（→T3-04/T3-05）：pendingVerify/pendingRetry/sawStepMarker 不持久化（T3-04 设计输入）；autoNudge 未接 runner（T3-05 接线）；PTY 回显复位重试计数=C++ 原语义；verify argv 不支持引号参数（登记）。
+- Task 16: review **Needs fixes**（1 Important）
+  - I1 classifyModelError 丢内部 stripAnsi（goalprotocol.cpp:118-120 有、TS 无；ANSI 交错错误词漏检；偏差未登记）。裁定：函数内补 stripAnsi + ANSI 包裹错误词用例（交错形 RED 实证）。若错：无——对齐 C++ 原语义。
+  - Minor（不入环）：M63 cfg 强转类型收口；M64 lastFeedAt 死状态；M65 complete 前 phase 复查；M66 awaitPumpDead 微任务假设（传输契约注释）。
+- Task 16: fix round 1/5 (1 addressed, 0 open; commits 7c2c629fe0..48c7db34c0；交错形 RED→GREEN 实证)
+- Task 16: 主控验收自跑：`bun test` 365 计数（364+1skip）/ 0 fail / 1591 expect；typecheck rc=0
+- Task 16: fix round 1/5 (1 addressed, 0 open; commits 7c2c629fe0..48c7db34c0)；重评审确认（交错形 RED 机理核实、双形式测试设计正确、无新破坏）
+- Task 16: 主控验收自跑：`bun test` 365 计数（364+1skip）/ 0 fail / 1591 expect；typecheck rc=0
+- Task 16: **complete** (commits b73ae61ff..48c7db34, review clean, 4 minors deferred)
+- Task 17: dispatched (BASE 48c7db34) — T3-04 持久化与对账
+  - Ruling: 持久化=原子写（atomicWriteFile）+ 加载容错（损坏 JSON → 该目标 blocked + 审计，不崩守护）；审计 jsonl 追加（单文件串行锁）。若错：损坏处理语义调整（代价小）。
+  - Ruling: **对账幂等**（Review-Focus-4）：连续两次 reconcile 同目标 → 第二次不注入（injected 指纹去重）；会话死 → 重建+断点契约；重建失败 → blocked+fatal 审计。若错：对账语义调整（代价中——涉及恢复正确性）。
+  - Ruling: reconcile 返回 `{resumed, blocked}` 供守护/测试断言。若错：接口微调（代价小）。
+- Task 17: implementer 返回 DONE，commit ce8a360bf2（386 计数：385+1skip；21 新用例；RED→GREEN 抓到 2 真缺陷：审计先于动作的假事实、原因不自定位）。
+  - 接口偏差登记（主控确认）：① `loadGoals` 返回 `LoadedGoals{goals,corrupted}`（R-st1 裁定改型，接受）；② `ReconcileDeps` 增可选 `cfg?`（同已裁定缺口，接受）；③ 死会话无进度→发全文契约而非字面 resume（对齐 runner.restartLocked，接受——避"0/0 步"病态文案）。
+  - T3-05 接线指针：`reconcileOnStart` 缝已留；须以落盘状态构造 GoalRunner（对账契约已入 injected 指纹，tick 重锚不重复注入）。
+- Task 17: review **Approved**（0C/0I；曾重点核查三疑点均排除；4 项偏差主控全部追认：④ paused/blocked/无会话 active 不触碰=人工管辖语义正确 ⑤幂等不变量="同一对话不双注入"，跨失败重复恢复注入合法且由 runner strikes 约束 ⑥新审计词表 state-corrupt/reconcile-* 登记 ⑦goalId 白名单拒路径穿越）
+  - Minor（不入环）：M68 catch 形参遮蔽（改名 err）；M69 锁表进程内 Map（单守护前提以 pidfile/文档固化→T3-05）；M70 重锚注入后 saveGoal 失败的重复注入窗口（FS 边缘，T3-05 可观察）；M71 过弱断言改目录列举；M72 reconcile 墙钟 vs runner clock 混流（T3-05 假时钟测试时给 ReconcileDeps 增 clock）。
+- Task 17: 主控验收自跑：`bun test` 386 计数（385+1skip）/ 0 fail / 1686 expect；typecheck rc=0
+- Task 17: **complete** (commits 48c7db34..ce8a360b, review clean, 5 minors deferred)
+- Task 18: dispatched (BASE ce8a360b) — T3-05 守护-目标对接
+  - Ruling: POST /goals 以落盘状态构造 GoalRunner（T3-04 缝：reconcileOnStart 已留；对账契约已入 injected 指纹，tick 重锚不重复注入）；tick 循环=setInterval 5s + 事件驱动（守护宿主）；并发多目标状态隔离（专测）。
+  - Ruling: control 语义：pause=phase 翻转（不再 tick 注入）；resume=注入继续；stop=终态。GET /goals/:id/logs 分页（cursor 顺序稳定）。
+  - 携带指针（T16/T17）：autoNudge 接线 runner；runner 持久化缺口登记；reconcile 墙钟 vs clock 混流→ReconcileDeps 增 clock（本任务处理）；M69 单守护前提以 pidfile 固化（本任务处理）。
+- Task 18: implementer 返回 DONE，commit ef26e2394b（407 计数：406+1skip；+21 用例；R-dg1~5 落地）。
+  - **顺带修复 T3-03 遗留真缺陷**：quiescePump 单轮采样在唤醒管线未走完时误判排空（同块连推多信号迟到 ≤1 周期）→ 连续 4 轮稳定窗口 + 2 个 runner 回归用例钉死（主控认可该顺带修复：属本任务 tick 集成的直接前置正确性）。
+  - 登记项：① 生产 GoalHost 装配未接 CLI（任务书 Files 未列；显式 501 GOAL_HOST_DISABLED 指引）→ T3-07 systemd 时接线；② 进程内重启+会话死场景 reconcile 新会话可能成孤儿（需 runner dispose API）→ T3-07 roster 随对账重建消化；③ workdir/maxRounds 持久化保留、消费者后续。
+- Task 18: review **Approved**（0C/0I/5 Minor；quiescePump 修复确认严格向后相容、control 竞态复核排除、pidfile 四分支专测齐）
+  - Minor（不入环）：M72 verify 静默 trim-drop 擦边（trim 后空串显式 400 更严）；M73 getLogs 存在性守卫全量读盘（加单读原语）；M74 resume 失败瞬态 roster 不一致（重试自愈，T3-07 消化）；M75 cursor 超 2^53 精度（参数卫生）；M76 报告自登记项认可。
+- Task 18: 主控验收自跑：`bun test` 407 计数（406+1skip）/ 0 fail / 1839 expect；typecheck rc=0
+- Task 18: **complete** (commits ce8a360b..ef26e239, review clean, 5 minors deferred)
+- Task 19: dispatched (BASE ef26e239) — T3-06 插件目标工具与回呼
+  - Rulings: 六工具经 daemonUrl HTTP 代理（DAEMON_UNAVAILABLE 显式，无静默兜底/不自动启动守护——接线属 T3-07）；回呼=30s 轮询尽力通知（失败仅审计不阻塞，非投递保证）；测试注入 fake fetch。
+- Task 19: implementer 返回 DONE，commit f736a61216（422 计数：421+1skip；+15 用例；goal-tools.ts 独立成文件=已接受先例）
+  - 主控会话实证：插件热重载后本会话工具目录已含 **12 个 codearts 工具**（goal/daemon_status 全数加载——T3-06 交付物加载实证）。
+  - Concern 登记：① 插件重载丢 goalId→sessionID 映射（尽力通知边界，跨重载持久化未做，登记后续）；② 守护缺位轮询失败逐次审计 ~500KB/天（治理后续）。
+- Task 19: review **Approved**（0C/0I/3 Minor；薄代理零注入缺口/凭据零泄漏/恰好一次语义被测试锚定）
+  - Minor（不入环）：M77 goalPollIntervalMs 注释与用法相反（下次触碰更正）；M78 输入归一助手双份同码（漂移风险，未来抽共享）；M79 levels 快照无淘汰（量级极小，终态可清理）。
+- Task 19: 主控验收自跑：`bun test` 422 计数（421+1skip）/ 0 fail / 1946 expect；typecheck rc=0
+- Task 19: **complete** (commits ef26e239..f736a612, review clean, 3 minors deferred)
+- Task 20: dispatched (BASE f736a612) — T3-07 systemd 服务与 watchdog
+  - Ruling: watchdog=内置 CLI 子命令 `codearts-bridge watchdog-probe`（纯函数评估：fetch /health 15s 超时；失败计数文件在 stateDir；连续 ≥2 → `systemctl --user restart codearts-bridge`）——单二进制自含，优于外置 bash 脚本；评估逻辑纯函数注入测试。
+  - Ruling: 单元生成器=纯函数（service 内容快照测试；ExecStart=安装时探测的 bun 绝对路径 + cli.ts daemon）；`service install` 幂等（重复生成同内容）；daemon-reload/enable 由 install 命令经注入 exec 执行（测试只测生成器+幂等，不真装）。若错：单元配置调整（代价小）。
+- Task 20: implementer 返回 DONE，commit 599af05100（455 计数：454+1skip；+33 用例；**真机观察全绿**：install→active、kill -9 自愈换 PID、watchdog 宽限→healthy 留痕、幂等复装 mtime 不变；安装保留供 M4）。
+  - 偏差登记（主控确认）：① renderWatchdogUnits 取同参签名（无参无法嵌绝对 ExecStart）接受；② 任务书 bash -n 项被 R-sv1 内置化取代接受；③ run.ts 增 export needsTmuxProbe（装配所需，防第二真相源）接受；④ **daemonCommand 生产装配挂载 GoalHost**（登记项① T3-07 接线提前落地，真机 /goals 不再 501）接受。
+- Task 20: review-package 生成，任务评审派发中
+- Task 20: review 待返回（评审子代理已派发）
+- **🌐 产品公开发布（用户新指令，主控执行）**：仓库 https://github.com/daheix/open-codearts （PUBLIC，首提交 0283540，main 已推送 + topics 已打）。内容=codearts-bridge 插件全部代码（git archive 自工作树 HEAD，排除 node_modules/.tmp）；README 重写为公开版（12 工具速查/安装/守护/配置/架构/已知限制/2.1.4 加载实测表）；LICENSE=MIT；**泄密终扫全净**（无 ghp_/sk-/私钥/account.txt/config.env/daemon-token/auth.json；README worktree 绝对路径已清洗为通用示例；无用户名残留）；**开箱验证**：clone 后 bun install（265 包）+ bun test 455 全绿 + typecheck 0。范围裁决：本次仅发布 codearts-bridge 插件（本会话产品）；codeartsGUI（Qt 工作台）未含（个人环境工具，发布需另行清洗，待用户指示）。发布副本=/home/wsc/wsc/open-codearts（稳定路径，M4 落地可将其作为用户生产检出）。
+- 流程修正（主控自我③）：台账追加连续两次锚点失误（把"追加在 X 后"误写为"替换 X"导致 oldString 永不存在）——纪律：追加前先 `tail` 确认锚点=现存末行。
+- Task 22: implementer 返回 DONE，commits c5df019a1d（worktree README）+ 5a8a440（公开仓库 daheix/open-codearts 已推 origin/main：CHANGELOG v0.3.0-dev/故障排查节/2.2.5 加载实测）。
+  - **全局接入实测生效（形态 1）**：`~/.config/opencode/plugins/codearts-bridge.ts`（re-export → /home/wsc/wsc/open-codearts 稳定检出）写入后 0.25s 热加载；`plugin list`+`GET /api/plugin` status=active；主控会话工具目录已现 12 个 codearts 工具（活调 codearts_daemon_status 成功）。全局 opencode.jsonc 零改动。
+  - 环境变化：opencode 服务已升 **2.2.5**（2.1.4 结论存档于 README 双版本对照表）；T1-01 的全局未热载结论仅适用 2.1.4。
+  - Concerns：① worktree 会话双实例（全局+项目 dev 接线）工具重复注册行为未实测；② 公开检出需保持 node_modules 在场（autoload 依赖树）；③ 泄密终扫三表全净。
+- Task 22: review **Approved**（0C/0I；autoload 文件/日志行/公开仓库 HEAD/终扫全部独立核验吻合、零夸大）
+  - Minor（不入环）：M83 公开 README 2.2.5 全局 jsonc 单元格未标"未验证"（补标注）；M84 评审包标题笔误（工件瑕疵）；M85 双实例并存三处披露一致（处置合理）。
+- Task 22: 主控验收：评审员独立核验 autoload 文件 sha256/日志行/公开仓库 HEAD=origin/main/终扫零命中；主控会话 12 工具在列（活证）
+- Task 22: **complete** (commits a2458e2e..c5df019a (worktree) + 0283540..5a8a440 (公开仓库), review clean, 3 minors deferred)
+- Task 23: dispatched (BASE c5df019a) — T4-02 真机验收（受监督目标全流程 + 中断演练 + structured 真实格式对照视配额而定）
+  - Ruling: **配额/环境受限时如实标注**：真实模型回合若因套餐流量/上游故障无法完成，完成判据降级为"恢复链路证据完整"（启动/注入/杀进程重建/守护重启对账均留证）并如实记录阻塞点——不虚报完成。若错：无（诚实纪律）。
+  - Ruling: TUI-ready 门缺位（T13 遗留）：依赖停滞重试的最终递达（T13 第 5 轮实证可递达）；观察窗内未递达→如实记录（TUI-ready 门列入 M3 增强候选）。
+  - Ruling: 真机演练全程限时（目标观察 ≤15min；kill 演练各 ≤2min）；结束后 goal stop 终态 + 清场（不留真实 TUI 进程）。
+- Task 23: 返回 DONE_WITH_CONCERNS——真机验收完成（降级判据"恢复链路证据完整"达成），暴露 5 真实缺陷（全为矩阵 Fake 传输测不到的真机行为差异）：④[严重] alive() 抛错而非 false→守护带活跃目标被杀永久下线；③[严重] 死会话重启风暴（restartLocked 回传死 ref）；②[高] 多行契约被 PTY 注入拒绝（契约从未送达）；①[高] 生产 verifyRun 未接线；⑤[中] 死会话 resume 永久失败。
+  - Rulings（全部"修复"）：④ alive()=布尔查询，未知/终态→false，全传输对齐；③ start(死 ref) 销毁残留+新建活会话且回传 ref 满足 alive=true，restartLocked 采纳回传 ref；② PTY inject 改多行安全（整块写入+独立 Enter；拒绝分支删除；若 TUI 逐行提前提交→回退单行扁平化，先实测再定）；① 生产装配接线 verifyRun（execFile+60s 超时+截断+cwd=workdir）；⑤ resume 前置 alive 检查，死→重建+resume 契约。全部附测试。
+  - 环境发现：bin/codearts 再度缺失（上游 EXDEV 缺陷现场触发）→ 实施者自 .bak-26.10.9 硬链接还原（登记：自愈自动化候补）。
+- Task 23: fix round 1/5 dispatched（5 缺陷一揽子；新派修复者）
+- Task 23: fix 返回 DONE，commit dad203fc53（474 pass/0 fail；18 RED 先行；单文件最大 920 行；17 文件 +807/−108）。
+  - 真机复验：演练 B 守护 KILL 一次拉起 resumed=1、journal 0 BridgeError（修复前崩溃循环永久下线）；演练 A 杀会话 restart 恰 1 次+新 TUI spawn+零 tick-failed（修复前风暴 52 strikes）；多行契约注入成功驱动真实模型回合（修复前 INJECT_TEXT_MULTILINE 拒绝）；控制三连 ✓。
+  - 如实记录：模型服务端持续 5xx 致两复验目标未完成（hello-bridge.txt 未创建）——恢复链路（杀进程重建/杀守护对账/死会话 resume）已全部实证，完成判据按降级口径达成。
+- Task 23: fix round 1/5 (5 addressed, 0 open; commits a2458e2e69..dad203fc53)；重评审确认（④ types.ts 真相源+4 传输对齐+崩溃循环回归断言；③ spawnSession 自检不过不回传；② 真机契约 357+ 字符注入成功；① execVerify 60s/截断/cwd+生产装配专测；⑤ resume 重建链）；3 新 Minor 延后（fake alive kind 校验、resumeLocked active 先置、start 重建失败窗口）。
+- Task 23: 主控验收自跑：`bun test` 475 计数（474+1skip）/ 0 fail / 2265 expect；typecheck rc=0
+- Task 23: **complete** (commits a2458e2e..dad203fc5, review clean, 3 minors deferred)——**恢复链路真机实证：杀进程重建/杀守护对账/死会话 resume 全部闭环**；目标完成受上游模型 5xx 阻塞（如实记录，非桥接缺陷）。
+- Task 24: dispatched (BASE dad203fc5) — T4-03 操作记录与经验沉淀
+  - Ruling: 操作记录落在**本 worktree** `操作记录/`（随分支合并入库）；经验条目落全局经验库 `~/.codeartsdoer/experience-reuse/experiences/`。若错：位置调整（代价小）。
+  - Ruling: 最终验证=bun test 全量+typecheck+spec §10.1/§10.2 判据逐条勾选（主控复核）。
+- Task 24: implementer 返回 DONE，commit 79a8523b7d（474 pass+1skip/0 fail/2264 expect+typecheck 0；操作日志 `操作记录/codearts-bridge集成开发-2026-10-31-操作日志记录.md` 含全 36 提交清单；3 经验条目入全局经验库 index 已刷新 493→496）。
+  - 登记项：① M1 止损日志在主检出未随分支入库（路径已在日志标注）；② 延后项（TUI-ready 门、PTY 空闲软重启、3 新 Minor）已在日志"关联"节登记；③ 主仓 gc.log 松散对象警告（主控处置，不阻塞）。
+- Task 24: **complete** (commits dad203fc5..79a8523b, docs+experience only)
+- 🏁 **全部 25 任务完成（M1+M2+M3+M4）**——进入最终整分支评审。
+- 最终整分支评审: 生成 review-723e116754..HEAD 全分支包（36+ 提交），派发终审（deferred minors 清单：M7-M102 见 progress.md 各任务行；关键裁决清单见各 Ruling 行）。
+
+## 收官总账（2026-10-31）
+
+- Task 19: review **Approved**（0C/0I/3 Minor）→ complete
+- Task 20: review **Approved**（0C/0I；真机 systemd 实证：kill -9 自愈/watchdog 宽限/幂等复装；GoalHost 生产装配提前挂载）→ complete
+- Task 21: review **Approved**（0C/0I/3 Minor；八格矩阵断言锚定真实实现）→ complete → **🏁 M3 完成**
+- Task 22 (T4-01): review **Approved**（0C/0I；autoload 文件/日志/公开仓 HEAD/终扫独立核验零夸大）→ complete → **全局接入生效**（~/.config/opencode/plugins/codearts-bridge.ts → 稳定检出）
+- Task 23 (T4-02): 真机验收 DONE_WITH_CONCERNS → 5 真实缺陷 → fix round 1 (5/5 ADDRESSED) → **complete**（恢复链路真机全实证；目标完成受上游 5xx 阻塞如实记录）
+- Task 24 (T4-03): DONE → **complete**（操作日志+3 经验条目+终验 474 pass/typecheck 0）
+- 🏁 **M4 文档与落地完成 → 全部 25 任务完成**
+- 最终整分支评审（723e1167..79a8523b，34 提交）：**Ready with follow-ups**（0 Critical；2 Important=raw 无上限/公开仓滞后——均已修复并同步）
+- 终审修复波: c1f00c34d0（worktree raw 封顶+文案）+ 5ab2fc0（公开仓 README 修正）
+- **公开发布**：github.com/daheix/open-codearts（PUBLIC）；同步事故：rsync --delete 误删公开仓独有 LICENSE/CHANGELOG → 6ff1e29 恢复+补记修复条目；两文件已回填 worktree 插件目录防复发
+- 主控终验收：`bun test` 478 计数（477+1skip）/ 0 fail / 2278 expect；typecheck rc=0（worktree）；公开仓 478 同构
+- **合并决定待用户**：分支 codearts-bridge（worktree）→ 主检出合并方式（用户 WIP 分支 feature/h3dl-3dlayout 不动）
+- Task 25: implementer 返回 DONE，commit 3498ed8e08（561 pass+1skip；+84 用例；install.sh/uninstall.sh/doctor/self-upgrade/upgrade-cli/uninstall 全交付；沙箱 HOME 全量门禁安装 rc=0 含幂等重跑）。
+  - 偏差/关注登记：① `install.sh --skip-gate`（测试专用防自递归；全量门禁已手动真跑）；② self-upgrade 脏工作树显式拒绝（零损坏加严）+ typecheck 默认执行；③ 实施者一次真机误触（漏设 HOME 沙箱覆写真机 opencode 接线）已从 .bak 逐字节还原核对——反证备份-还原路径有效；④ 自定义 --state-dir 卸载需带环境变量（uninstall 子命令不收 --state-dir，登记打磨）；⑤ 真机安装验证（systemd 全链）留主控执行。
+- Task 25: review-package 生成，任务评审派发中
+
+## 收官（2026-10-31）
+- Task 25: review **Approved**（0C/0I/6 Minor；doctor 判定/采集分离、self-upgrade 零损坏矩阵、purge 三重守卫、--state-dir 端到端链路均达商业级）
+- 真机安装验证（主控）：公开稳定检出幂等重跑 install.sh rc=0；doctor 6✓/2⚠（磁盘⚠=hygiene 可治理）/0✗；守护 active 与全局接线完好无损
+- 公开仓同步: a835050（T4-05 全量）推送；**Release v0.4.0** 已创建（tag+release notes）
+- 台账追加纪律改定：heredoc 追加式（终结锚点漂移）
+- **项目 A（opencode 集成）全量交付完成**；项目 B（dsh 完整集成）待用户指令另行立项

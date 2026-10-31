@@ -1,0 +1,4 @@
+=== 演练B 2026-10-31T17:45:06+08:00 bootstrap 后状态 ===
+phase= active rounds= 1 session= {'kind': 'pty', 'id': 'script-2'}
+582111 /usr/bin/script -qefc '/home/wsc/.codeartsdoer/installers/codearts' /dev/null
+582113 /home/wsc/.codeartsdoer/installers/bin/codearts

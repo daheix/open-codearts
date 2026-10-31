@@ -1,0 +1,657 @@
+# Review package: b13e72fa..3c292e471d
+
+## Commits
+3c292e471d codearts-bridge(T2-01): 传输接口与 FakeTransport — 脚本化信号/注入留痕/可切换存活
+
+## Files changed
+ plugins/codearts-bridge/src/core/transport/fake.ts | 268 ++++++++++++++++++
+ .../codearts-bridge/src/core/transport/types.ts    |  59 ++++
+ .../codearts-bridge/test/transport-fake.test.ts    | 300 +++++++++++++++++++++
+ 3 files changed, 627 insertions(+)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/transport/fake.ts b/plugins/codearts-bridge/src/core/transport/fake.ts
+new file mode 100644
+index 0000000000..e4d50c736d
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/transport/fake.ts
+@@ -0,0 +1,268 @@
++/**
++ * codearts-bridge FakeTransport（T2-01）。
++ *
++ * 职责：CodeartsTransport 的确定性测试替身——不 spawn 任何进程、无 FS/网络
++ * 副作用（R-tr4）。M3 监督状态机（T3-03）将直接注入本类做行为测试；后续真实
++ * 传输（T2-02/T2-03/T2-04）以 types.ts 为契约对齐本类的可观测语义。
++ *
++ * 可复用性设计（主控裁定 2026-10-31 R-tr3，逐条落实）：
++ * - ① 脚本化信号队列：`push(ref, sig)` 原样入队 / `emit(ref, t, text?)` 便捷
++ *   入队——均显式按 ref 寻址（与六方法一致，多会话脚本无歧义）；队列被消费
++ *   期间可继续追加，observe 挂起等待新信号（事件驱动唤醒，无任何定时器——⑤）。
++ * - ② 注入留痕：`injections` 按调用顺序记录每次 inject 的 {ref, text, at}，
++ *   供"两步提交/注入留痕"断言；stop 后留痕不丢。
++ * - ③ alive 可切换：stop → false；start 复用同一 ref（恢复语义）→ true。
++ * - ④ stop 后 observe 正常终止（挂起中的 next 得 done）、后续 observe 立即
++ *   正常结束（空迭代）、alive=false；stop 幂等。
++ * - ⑤ `at` 时间线：**调用序计数器**（二选一裁定：弃注入时钟），会话级单调
++ *   递增、inject 与 emit 共享同一刻度（与真实传输的事件序一致）；
++ *   start 复用归零（新生命期的确定性起点）。
++ *
++ * 语义裁决（显式报错，禁静默兜底）：
++ * - 未知 ref：全部方法同步抛 `SESSION_UNKNOWN`，不产生任何副作用；
++ * - 对非存活会话 inject：抛 `SESSION_NOT_ALIVE` 且不留痕；
++ * - 同一 ref 并发第二个 observe：同步抛 `OBSERVER_ACTIVE`（单观察者模型，
++ *   消除多消费者争抢信号的歧义；迭代器结束/return/abort 释放后可重新 observe）；
++ * - observe 的 signal abort：迭代**立即正常结束**（"立即放弃"语义——已入队
++ *   未消费的残存信号丢弃，不抛错，R-tr2）；
++ * - snapshot.raw：会话 raw 缓冲按序拼接的 output/error 信号 text（入队时
++ *   累积、与是否被 observe 消费无关，模拟终端缓冲区）；其余信号类型与无
++ *   text 信号不进 raw。meta 含 id/kind/alive/closed/injections/signalCount
++ *   （signalCount = 累计入队信号总数，含已消费）。
++ */
++
++import type { BridgeConfig } from "../config";
++import { BridgeError } from "../errors";
++import type { CodeartsTransport, SessionRef, Signal, TransportKind } from "./types";
++
++/** 注入留痕条目（injections 数组元素；ref 用于多会话场景区分归属）。 */
++export interface InjectionRecord {
++  ref: SessionRef;
++  text: string;
++  at: number;
++}
++
++/** FakeTransport 构造选项。 */
++export interface FakeTransportOptions {
++  /** 传输种类（SessionRef.kind 与之一致）；缺省 "pty"。 */
++  kind?: TransportKind;
++}
++
++/** 单个 fake 会话的全部可变状态（经 ref.id 寻址）。 */
++interface FakeSession {
++  ref: SessionRef;
++  alive: boolean;
++  /** stop 置位：observe 迭代终止条件之一（与 alive 双保险，语义一致）。 */
++  closed: boolean;
++  /** 脚本化信号队列（push/emit 入队，observe 按序消费）。 */
++  pending: Signal[];
++  /** 累计入队信号总数（含已消费；snapshot.meta.signalCount）。 */
++  signalCount: number;
++  /** raw 缓冲：入队的 output/error 信号 text 按序累积（与消费无关）。 */
++  raw: string;
++  /** 调用序时间线计数器（inject/emit 共享；start 复用归零）。 */
++  atNext: number;
++  /** 等待新信号的唤醒函数集合（observe 迭代器注册；push/stop/abort 时逐个唤醒）。 */
++  waiters: Array<() => void>;
++  /** 当前活跃观察者标记（单观察者模型；null = 无）。 */
++  observer: symbol | null;
++}
++
++/** FakeTransport：脚本化信号 / 注入留痕 / 可切换存活的确定性传输替身。 */
++export class FakeTransport implements CodeartsTransport {
++  readonly kind: TransportKind;
++
++  /** 注入留痕（只读纪律：调用方只读，勿改写——数组引用直接暴露以保持零拷贝）。 */
++  readonly injections: InjectionRecord[] = [];
++
++  /** 会话表：id → 状态。含已 stop 的会话（留痕/快照不丢）。 */
++  private readonly sessions = new Map<string, FakeSession>();
++
++  /** start 自增序号（新会话 id 生成：`fake-<n>`）。 */
++  private idNext = 0;
++
++  constructor(opts: FakeTransportOptions = {}) {
++    this.kind = opts.kind ?? "pty";
++  }
++
++  /* ───── CodeartsTransport 六方法 ───── */
++
++  async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
++    // cfg 仅满足接口签名；Fake 不读配置、无副作用（R-tr4）。显式标注以示故意。
++    void cfg;
++    if (ref !== undefined) {
++      const s = this.requireSession(ref);
++      // 复用/恢复语义：复活会话并归零时间线；信号队列、raw 缓冲、注入留痕
++      // 一律保留（留痕是审计事实，重启不抹除）。
++      s.alive = true;
++      s.closed = false;
++      s.atNext = 0;
++      return { ...s.ref };
++    }
++    const id = `fake-${++this.idNext}`;
++    const created: SessionRef = { kind: this.kind, id };
++    this.sessions.set(id, {
++      ref: created,
++      alive: true,
++      closed: false,
++      pending: [],
++      signalCount: 0,
++      raw: "",
++      atNext: 0,
++      waiters: [],
++      observer: null,
++    });
++    return { ...created };
++  }
++
++  async inject(ref: SessionRef, text: string): Promise<void> {
++    const s = this.requireSession(ref);
++    if (!s.alive) {
++      throw new BridgeError("SESSION_NOT_ALIVE", `会话已停止，拒绝注入：id=${ref.id}`, {
++        remediation: "先 start 复用该会话引用恢复存活，再注入。",
++      });
++    }
++    this.injections.push({ ref: { ...s.ref }, text, at: s.atNext++ });
++  }
++
++  observe(ref: SessionRef, opts?: { signal?: AbortSignal }): AsyncIterable<Signal> {
++    const s = this.requireSession(ref);
++    if (s.observer !== null) {
++      throw new BridgeError(
++        "OBSERVER_ACTIVE",
++        `会话已有活跃观察者（单观察者模型）：id=${ref.id}`,
++        { remediation: "先结束当前观察（迭代完成/return/abort）再重新 observe。" },
++      );
++    }
++    // 已 abort：立即正常结束的空迭代，且不占用观察者名额（"未开始即取消"）。
++    if (opts?.signal?.aborted) return emptySignals();
++
++    const token = Symbol("observer");
++    s.observer = token;
++    const self = this;
++
++    async function* iterate(): AsyncGenerator<Signal> {
++      const signal = opts?.signal;
++      const onAbort = (): void => self.wakeAll(s);
++      signal?.addEventListener("abort", onAbort, { once: true });
++      try {
++        while (true) {
++          // abort = 立即放弃：每次 next 先检查，未消费残存信号丢弃（R-tr2 正常结束）。
++          if (signal?.aborted) return;
++          if (s.pending.length === 0) {
++            if (s.closed || !s.alive) return;
++            await waitFor(s);
++            continue;
++          }
++          yield s.pending.shift() as Signal;
++        }
++      } finally {
++        signal?.removeEventListener("abort", onAbort);
++        self.releaseObserver(s, token);
++      }
++    }
++
++    // 包装迭代器：显式 return/throw 时先同步释放观察者再委托——
++    // 保证"未启动即 return"（async generator 体未执行、finally 不触发）也不泄漏。
++    const inner = iterate();
++    const iterator: AsyncIterator<Signal> = {
++      next: () => inner.next(),
++      return: (v?: unknown) => {
++        self.releaseObserver(s, token);
++        return inner.return(v as undefined);
++      },
++      throw: (e?: unknown) => {
++        self.releaseObserver(s, token);
++        return inner.throw(e);
++      },
++    };
++    return { [Symbol.asyncIterator]: () => iterator };
++  }
++
++  async alive(ref: SessionRef): Promise<boolean> {
++    return this.requireSession(ref).alive;
++  }
++
++  async stop(ref: SessionRef): Promise<void> {
++    const s = this.requireSession(ref);
++    s.alive = false;
++    s.closed = true;
++    this.wakeAll(s);
++  }
++
++  async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
++    const s = this.requireSession(ref);
++    return {
++      raw: s.raw,
++      meta: {
++        id: s.ref.id,
++        kind: s.ref.kind,
++        alive: s.alive,
++        closed: s.closed,
++        injections: this.injections.filter((i) => i.ref.id === s.ref.id).length,
++        signalCount: s.signalCount,
++      },
++    };
++  }
++
++  /* ───── Fake 特有脚本 API（测试/T3-03 使用，不属于 CodeartsTransport） ───── */
++
++  /**
++   * 向指定会话原样入队一个信号（脚本方完全控制，含 at）；
++   * 同时累积 raw 缓冲（output/error 带 text 时）并唤醒挂起的观察者。
++   */
++  push(ref: SessionRef, sig: Signal): void {
++    const s = this.requireSession(ref);
++    if ((sig.t === "output" || sig.t === "error") && sig.text !== undefined) {
++      s.raw += sig.text;
++    }
++    s.pending.push(sig);
++    s.signalCount++;
++    this.wakeAll(s);
++  }
++
++  /** 便捷入队：at 由会话调用序计数器提供（与 inject 共享时间线）；返回入队的信号。 */
++  emit(ref: SessionRef, t: Signal["t"], text?: string): Signal {
++    const s = this.requireSession(ref);
++    const at = s.atNext++;
++    const sig: Signal = text !== undefined ? { t, at, text } : { t, at };
++    this.push(ref, sig);
++    return sig;
++  }
++
++  /* ───── 内部机制 ───── */
++
++  /** 未知 ref 显式报错（全部方法的统一入口守卫，禁静默兜底）。 */
++  private requireSession(ref: SessionRef): FakeSession {
++    const s = this.sessions.get(ref.id);
++    if (s === undefined) {
++      throw new BridgeError("SESSION_UNKNOWN", `未知会话引用：kind=${ref.kind} id=${ref.id}`, {
++        remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
++      });
++    }
++    return s;
++  }
++
++  /** 释放观察者（仅持有者可释放；幂等）。 */
++  private releaseObserver(s: FakeSession, token: symbol): void {
++    if (s.observer === token) s.observer = null;
++  }
++
++  /** 唤醒全部挂起等待者（push/stop/abort 路径共用；等待者醒来后自旋复查状态）。 */
++  private wakeAll(s: FakeSession): void {
++    const waiters = s.waiters.splice(0);
++    for (const wake of waiters) wake();
++  }
++}
++
++/** 注册挂起等待：队列/终止状态变化时被唤醒（事件驱动，无定时器）。 */
++function waitFor(s: FakeSession): Promise<void> {
++  return new Promise((resolve) => {
++    s.waiters.push(resolve);
++  });
++}
++
++/** 空信号迭代（observe 收到已 abort 的 signal 时返回；不占用观察者）。 */
++function emptySignals(): AsyncIterable<Signal> {
++  return (async function* () {})();
++}
+diff --git a/plugins/codearts-bridge/src/core/transport/types.ts b/plugins/codearts-bridge/src/core/transport/types.ts
+new file mode 100644
+index 0000000000..90c73c4bf4
+--- /dev/null
++++ b/plugins/codearts-bridge/src/core/transport/types.ts
+@@ -0,0 +1,59 @@
++/**
++ * codearts-bridge 传输层接口（T2-01）。
++ *
++ * 职责：定义目标会话传输的最小完整抽象（R-tr1），供 M2 各传输实现
++ * （T2-02 script PTY / T2-03 tmux / T2-04 structured）与 M3 监督状态机
++ * （T3-03 经 FakeTransport）共同依赖。
++ *
++ * 主控裁定 2026-10-31（R-tr1）：本文件为传输接口唯一真相源；签名与任务书
++ * 逐字一致，**禁止可选兜底字段扩展**（保持最小）。后续任务如需扩展，
++ * 先改本文件并走评审，禁止在实现侧私自加字段。
++ */
++
++import type { BridgeConfig } from "../config";
++
++/** 传输种类：structured = 结构化通道（HTTP/daemon），pty = 伪终端通道（tmux/script 宿主）。 */
++export type TransportKind = "structured" | "pty";
++
++/** 会话事件信号：at 为产生时刻（毫秒时间戳或调用序刻度，由实现定义并在其文档注明）。 */
++export interface Signal {
++  t: "output" | "error" | "idle" | "step" | "done";
++  at: number;
++  text?: string;
++}
++
++/** 会话引用：由 transport.start 返回、后续方法凭其寻址（不透明值，调用方只透传）。 */
++export interface SessionRef {
++  kind: TransportKind;
++  id: string;
++}
++
++/** 目标会话传输接口（最小完整，六方法）。 */
++export interface CodeartsTransport {
++  /** 本传输的种类（构造即定；SessionRef.kind 与之一致）。 */
++  readonly kind: TransportKind;
++
++  /**
++   * 启动（或复用）一个目标会话。ref 缺省创建新会话；传入 start 返回过的 ref
++   * 表示复用/恢复该会话（语义由实现定义并注明）。
++   */
++  start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef>;
++
++  /** 向会话注入一段文本（如续跑指令）。 */
++  inject(ref: SessionRef, text: string): Promise<void>;
++
++  /**
++   * 观察会话事件流。opts.signal abort → 迭代正常结束（不抛错，R-tr2）。
++   * 并发观察策略由实现定义（FakeTransport 为单观察者，重复 observe 显式报错）。
++   */
++  observe(ref: SessionRef, opts?: { signal?: AbortSignal }): AsyncIterable<Signal>;
++
++  /** 会话是否存活。 */
++  alive(ref: SessionRef): Promise<boolean>;
++
++  /** 停止会话；对已停止会话幂等。 */
++  stop(ref: SessionRef): Promise<void>;
++
++  /** 会话当前状态快照（raw 语义由实现定义并注明）。 */
++  snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }>;
++}
+diff --git a/plugins/codearts-bridge/test/transport-fake.test.ts b/plugins/codearts-bridge/test/transport-fake.test.ts
+new file mode 100644
+index 0000000000..c3d8cc427a
+--- /dev/null
++++ b/plugins/codearts-bridge/test/transport-fake.test.ts
+@@ -0,0 +1,300 @@
++/**
++ * T2-01 传输接口与 FakeTransport 测试（bun:test）。
++ *
++ * 主控裁定对照（2026-10-31）：
++ * - R-tr1 接口最小完整：FakeTransport 实现任务书 CodeartsTransport 全部六方法，
++ *   Signal/SessionRef/TransportKind 形态与任务书逐字段一致（测试侧钉死）。
++ * - R-tr2 observe 尊重取消：opts.signal abort → 迭代正常结束（不抛错）。
++ * - R-tr3 FakeTransport 可复用性（T3-03 监督状态机将直接使用）：
++ *   ① 脚本化信号队列：push 预置 / emit 便捷追加，消费期间可继续追加；
++ *   ② inject 记录 {text, at} 调用顺序（注入留痕，供"两步提交"断言）；
++ *   ③ alive 可切换：stop → false；start 复用同一 ref → true；
++ *   ④ stop 后 observe 终止且 alive=false；
++ *   ⑤ 一切行为确定性可测：无计时依赖——`at` 由会话级调用序计数器提供
++ *     （二选一裁定：选调用序，弃注入时钟；start 复用时归零；
++ *     inject 与 emit 共享同一时间线刻度，与真实传输的事件序一致）。
++ * - R-tr4 隔离：Fake 不 spawn 任何进程、无 FS/网络副作用，测试不触碰真实 HOME。
++ *
++ * 错误路径（禁静默兜底，显式 BridgeError）：
++ * - SESSION_UNKNOWN：任何方法收到未知 ref（同步抛，不产生副作用）；
++ * - SESSION_NOT_ALIVE：对已 stop 的 session inject；
++ * - OBSERVER_ACTIVE：同一 ref 并发第二个 observe。
++ */
++import { describe, expect, it } from "bun:test";
++import { loadConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import { FakeTransport } from "../src/core/transport/fake";
++import type { SessionRef, Signal } from "../src/core/transport/types";
++
++/** 与真实环境完全隔离的配置（Fake 不读它，仅为满足 CodeartsTransport.start 签名）。 */
++const CFG = loadConfig(
++  { stateDir: "/nonexistent/codearts-bridge-fake-test", installDir: "/nonexistent/installers" },
++  {},
++);
++
++/**
++ * 收集型观察：消费信号直至脚本终结信号（done）或流自然终结（stop/abort）。
++ * Fake 的 observe 在队列耗尽且会话未终结时保持挂起（R-tr3-①"期间可继续追加"
++ * 的必然语义），故"跑完"必须由脚本 done 收尾或先 stop——本 helper 取 done 约定。
++ * break 触发迭代器 return → 同步释放观察者名额。
++ */
++async function drain(
++  t: FakeTransport,
++  ref: SessionRef,
++  signal?: AbortSignal,
++): Promise<Signal[]> {
++  const out: Signal[] = [];
++  for await (const sig of t.observe(ref, signal ? { signal } : undefined)) {
++    out.push(sig);
++    if (sig.t === "done") break;
++  }
++  return out;
++}
++
++describe("FakeTransport.start / 会话生命周期", () => {
++  it("start 无 ref：返回新 ref（kind 与构造一致、id 唯一递增、alive=true）", async () => {
++    const t = new FakeTransport();
++    const a = await t.start(CFG);
++    const b = await t.start(CFG);
++    expect(a.kind).toBe("pty");
++    expect(b.kind).toBe("pty");
++    expect(a.id).not.toBe(b.id);
++    expect(await t.alive(a)).toBe(true);
++    expect(await t.alive(b)).toBe(true);
++  });
++
++  it("start 构造参数可指定 kind=structured（R-tr1 TransportKind 两值）", async () => {
++    const t = new FakeTransport({ kind: "structured" });
++    const ref = await t.start(CFG);
++    expect(ref.kind).toBe("structured");
++    expect(t.kind).toBe("structured");
++  });
++
++  it("start 带 ref：复用已知 session（返回同一 ref、复活 alive）；未知 ref 显式抛 SESSION_UNKNOWN", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    await t.stop(ref);
++    expect(await t.alive(ref)).toBe(false);
++
++    const again = await t.start(CFG, ref);
++    expect(again).toEqual(ref);
++    expect(await t.alive(ref)).toBe(true);
++
++    const ghost: SessionRef = { kind: "pty", id: "fake-999" };
++    // async 方法（alive）的未知 ref 以 rejection 形态显式报错；observe 的同步抛见下方"未知 ref"用例
++    await expect(t.alive(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++  });
++});
++
++describe("FakeTransport.inject 注入留痕（R-tr3-②）", () => {
++  it("inject 按 {text, at} 记录调用顺序，at 随调用序递增", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    await t.inject(ref, "第一步");
++    await t.inject(ref, "第二步");
++    await t.inject(ref, "第三步");
++    expect(t.injections).toHaveLength(3);
++    expect(t.injections.map((i) => i.text)).toEqual(["第一步", "第二步", "第三步"]);
++    expect(t.injections.map((i) => i.at)).toEqual([0, 1, 2]);
++    // 留痕含 ref（多会话场景可区分归属）
++    expect(t.injections.every((i) => i.ref.id === ref.id)).toBe(true);
++  });
++
++  it("inject 对已 stop 的 session 显式抛 SESSION_NOT_ALIVE 且不留痕", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    await t.inject(ref, "活着");
++    await t.stop(ref);
++    try {
++      await t.inject(ref, "死了");
++      expect.unreachable();
++    } catch (e) {
++      expect((e as BridgeError).code).toBe("SESSION_NOT_ALIVE");
++    }
++    expect(t.injections.map((i) => i.text)).toEqual(["活着"]);
++  });
++
++  it("inject/observe/stop/snapshot 对未知 ref 一律显式抛 SESSION_UNKNOWN", async () => {
++    const t = new FakeTransport();
++    const ghost: SessionRef = { kind: "pty", id: "nope" };
++    await expect(t.inject(ghost, "x")).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++    await expect(t.stop(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++    await expect(t.snapshot(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++    await expect(t.alive(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
++    expect(() => t.observe(ghost)).toThrow(BridgeError);
++  });
++});
++
++describe("FakeTransport.observe 脚本化产出（R-tr3-①⑤）", () => {
++  it("push 预置脚本：observe 按序产出全部信号（Signal 形态逐字段钉死）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.push(ref, { t: "output", at: 100, text: "alpha" });
++    t.push(ref, { t: "step", at: 101 });
++    t.push(ref, { t: "done", at: 102, text: "final" });
++    const got = await drain(t, ref);
++    expect(got).toEqual([
++      { t: "output", at: 100, text: "alpha" },
++      { t: "step", at: 101 },
++      { t: "done", at: 102, text: "final" },
++    ]);
++  });
++
++  it("消费期间可继续追加：耗尽后挂起等待新 push，醒来继续按序产出（无计时依赖）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.emit(ref, "output", "first");
++
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const r1 = await iter.next();
++    expect(r1.done).toBe(false);
++    expect(r1.value).toEqual({ t: "output", at: 0, text: "first" });
++
++    // 队列已空：next() 挂起（返回 pending promise，确定性——不依赖任何定时器）
++    const p2 = iter.next();
++    let resolved = false;
++    void p2.then(() => {
++      resolved = true;
++    });
++    await Promise.resolve();
++    expect(resolved).toBe(false);
++
++    // 消费期间追加两条，按序醒来产出（emit 与 inject 共享时间线：inject 占 at=1）
++    await t.inject(ref, "mid-inject");
++    const late = t.emit(ref, "output", "late-1");
++    t.emit(ref, "output", "late-2");
++    expect(late.at).toBe(2);
++    const r2 = await p2;
++    expect(r2.value).toEqual(late);
++    expect((await iter.next()).value).toMatchObject({ text: "late-2" });
++
++    // 无更多脚本也未 stop：迭代仍挂起；stop 唤醒后正常终止（挂起中的 next 得 done）
++    const p3 = iter.next();
++    expect((await Promise.race([p3, Promise.resolve("pending")])) === "pending").toBe(true);
++    await t.stop(ref);
++    expect((await p3).done).toBe(true);
++  });
++
++  it("emit 的 at 由会话级调用序计数器提供（start 复用后归零）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.emit(ref, "idle");
++    t.emit(ref, "output", "x");
++    t.emit(ref, "error", "boom");
++    t.emit(ref, "done"); // 脚本终结信号（drain 消费到 done 即止）
++    const got = await drain(t, ref);
++    expect(got.map((s) => s.at)).toEqual([0, 1, 2, 3]);
++    // start 复用同一 ref：计数器归零（新生命期，确定性起点）
++    const reborn = await t.start(CFG, ref);
++    expect(reborn).toEqual(ref);
++    t.emit(ref, "done", "again");
++    const got2 = await drain(t, ref);
++    expect(got2.map((s) => s.at)).toEqual([0]);
++  });
++});
++
++describe("FakeTransport.observe 尊重取消（R-tr2）", () => {
++  it("挂起等待中 abort：迭代正常结束（done=true，不抛错），未消费残存信号按'立即放弃'语义丢弃", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    const ac = new AbortController();
++    const iter = t.observe(ref, { signal: ac.signal })[Symbol.asyncIterator]();
++    const pending = iter.next(); // 队列空，挂起
++    ac.abort();
++    const r = await pending;
++    expect(r.done).toBe(true);
++  });
++
++  it("已 abort 的 signal：observe 立即正常结束（空迭代，不占用观察者）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.emit(ref, "output", "unconsumed");
++    const ac = new AbortController();
++    ac.abort();
++    const got = await drain(t, ref, ac.signal);
++    expect(got).toEqual([]);
++    // 未占用观察者：之后仍可正常 observe（手动消费 1 条后 return 收尾）
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const r = await iter.next();
++    expect(r.value).toMatchObject({ text: "unconsumed" });
++    await iter.return?.(undefined);
++  });
++});
++
++describe("FakeTransport.observe 单观察者约束", () => {
++  it("同一 ref 并发第二个 observe 显式抛 OBSERVER_ACTIVE；未启动的迭代器 return 后即释放", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    const first = t.observe(ref);
++    try {
++      t.observe(ref);
++      expect.unreachable();
++    } catch (e) {
++      expect((e as BridgeError).code).toBe("OBSERVER_ACTIVE");
++    }
++    // 未启动（从未 next）的迭代器显式 return：观察者同步释放
++    await first[Symbol.asyncIterator]().return?.(undefined);
++    // 释放后可重新 observe；以 stop 终结空流（队列空且未终结时 observe 保持挂起）
++    await t.stop(ref);
++    expect(await drain(t, ref)).toEqual([]);
++  });
++});
++
++describe("FakeTransport.stop / alive 切换（R-tr3-③④）", () => {
++  it("stop 后：alive=false、正在挂起的 observe 正常终止、再次 observe 立即正常结束（空）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.emit(ref, "output", "before-stop");
++
++    const iter = t.observe(ref)[Symbol.asyncIterator]();
++    const r1 = await iter.next();
++    expect(r1.value).toMatchObject({ text: "before-stop" });
++    const pending = iter.next(); // 挂起
++    await t.stop(ref);
++    expect((await pending).done).toBe(true);
++
++    // stop 后：alive=false；后续 observe 立即正常结束；stop 幂等
++    expect(await t.alive(ref)).toBe(false);
++    expect(await drain(t, ref)).toEqual([]);
++    await t.stop(ref);
++    expect(await t.alive(ref)).toBe(false);
++  });
++
++  it("stop 后 snapshot 仍可读历史（留痕不丢）", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.emit(ref, "output", "keep-me");
++    await t.stop(ref);
++    const snap = await t.snapshot(ref);
++    expect(snap.raw).toBe("keep-me");
++  });
++});
++
++describe("FakeTransport.snapshot", () => {
++  it("raw 按序拼接 output/error 的 text；meta 反映会话状态计数", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    t.emit(ref, "output", "a");
++    t.emit(ref, "error", "b");
++    t.emit(ref, "step"); // 无 text：不进 raw
++    t.emit(ref, "output", "c");
++    const snap = await t.snapshot(ref);
++    expect(snap.raw).toBe("abc");
++    expect(snap.meta).toMatchObject({
++      id: ref.id,
++      kind: "pty",
++      alive: true,
++      closed: false,
++      injections: 0,
++      signalCount: 4,
++    });
++  });
++
++  it("inject 留痕计入 meta.injections", async () => {
++    const t = new FakeTransport();
++    const ref = await t.start(CFG);
++    await t.inject(ref, "go");
++    const snap = await t.snapshot(ref);
++    expect(snap.meta).toMatchObject({ injections: 1 });
++  });
++});

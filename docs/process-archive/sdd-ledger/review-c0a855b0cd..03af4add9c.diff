@@ -1,0 +1,994 @@
+# Review package: c0a855b0cd..03af4add9c
+
+## Commits
+03af4add9c codearts-bridge(T1-07): hygiene 治理 — dumps 清理/WAL checkpoint/日志轮转，dry-run 与执行清单一致 — planHygiene(纯只读 dry-run)/applyHygiene(执行+审计)：purge-dumps 仅列超 olderThanDays 的 dump-*.heapsnapshot 且 apply 逐条按清单删除(R-hy4)；wal-checkpoint 走 bun:sqlite PRAGMA wal_checkpoint(TRUNCATE)，db 缺失显式 WAL_DB_MISSING 不静默造库、open/PRAGMA 失败/busy≠0 显式抛(R-hy1)；rotate-logs 仅 kernel-*.log 按 mtime 保留最近 logsKeep 个(默认 30/20,R-hy2)；purge 边界守卫 realpath+前缀双校验，越界/符号链接外逃/名单不符/目标失踪显式报错不删除(R-hy3)；kernelDataDir 经 opts 传参不扩展 BridgeConfig(R-hy5)；apply 记 hygiene.apply 审计(删除清单/checkpoint 结果/轮转数)，失败留痕不掩盖主错误；18 新测试，全量 133 绿+typecheck 零错误
+
+## Files changed
+ plugins/codearts-bridge/src/core/health.ts   | 473 ++++++++++++++++++++++++++-
+ plugins/codearts-bridge/test/hygiene.test.ts | 449 +++++++++++++++++++++++++
+ 2 files changed, 919 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/health.ts b/plugins/codearts-bridge/src/core/health.ts
+index 9a7e0db2a8..ddc9302ca0 100644
+--- a/plugins/codearts-bridge/src/core/health.ts
++++ b/plugins/codearts-bridge/src/core/health.ts
+@@ -1,12 +1,13 @@
+ /**
+- * codearts-bridge 健康采样（T1-06）——对 codearts 内核 cli-data 的只读体检。
++ * codearts-bridge 健康采样与 hygiene 治理——对 codearts 内核 cli-data 的只读体检（T1-06）
++ * 与显式治理动作（T1-07）。
+  *
+  * 目标（痛点②"内存一直增加"可观测化第一步）：一次 collectHealth 产出快照
+  *   { rssBytes?, dbBytes, walBytes, dumps{files,bytes}, logs{bytes}, lastErrors[], kernelRssFromLog? }
+  *
+  * 字段口径：
+  * - rssBytes：托管内核进程 RSS 字节（注入 PidProbe，R-h5）；本任务无托管进程 →
+  *   undefined（M2 接入后由调用方注入真实探测）。
+  * - dbBytes/walBytes：<kernelDataDir>/opencode.db 与 opencode.db-wal（SQLite WAL
+  *   标准命名，已对真实安装双确证：内核二进制 strings 出现 "opencode.db-wal"，
+  *   且本机存在 ~/.codeartsdoer/codearts-data/opencode.db-wal 实文件）。
+@@ -33,29 +34,31 @@
+  *   如实报告；IO 非 ENOENT 错误 → 显式抛 BridgeError，绝不静默。
+  * - R-h5（PidProbe 注入）：opts.proc 返回"十进制整数字节"字符串（如 "52577"；
+  *   显式约定仅此一种形态，前后空白容忍，其余形态一律 PID_PROBE_INVALID，
+  *   禁止静默解析）；未注入 → rssBytes=undefined；proc 自身失败 → PID_PROBE_FAILED。
+  *
+  * 性能注记（真实环境实测 2026-10-31）：lastErrors/kernelRssFromLog 需流式扫读全部
+  * kernel-*.log（本机 52 文件/325MB，readline 逐行流式、内存 O(1)），单次采样实测约
+  * 14s。M2 接入托管进程后改增量扫描（按文件 offset 续扫，只读新增字节），本任务取
+  * 全量扫描的最小正确实现——正确性优先，调用方（M2）据实测耗时决定采样频率。
+  */
++import { randomBytes } from "node:crypto";
+ import { createReadStream } from "node:fs";
+ import type { Dirent } from "node:fs";
+-import { readdir } from "node:fs/promises";
++import { readdir, realpath, rm } from "node:fs/promises";
++import { Database } from "bun:sqlite";
+ import { homedir } from "node:os";
+ import * as path from "node:path";
+ import { createInterface } from "node:readline";
+ import { BridgeError } from "./errors";
+ import { errnoOf } from "./fsx";
+-import { statOrEnoent } from "./install";
++import { appendInstallAudit, statOrEnoent } from "./install";
+ import type { BridgeConfig } from "./config";
+ 
+ /* ───── 常量（R-h1/R-h2 口径，测试与未来调参共用） ───── */
+ 
+ /** lastErrors 上限（裁定 R-h1：最多 20 条）。 */
+ export const HEALTH_MAX_LAST_ERRORS = 20;
+ 
+ /** 单条错误摘要截断长度（裁定 R-h1：截断到合理长度；截断必须带显式标记）。 */
+ export const HEALTH_MAX_ERROR_SUMMARY_CHARS = 500;
+ 
+@@ -384,10 +387,474 @@ export async function collectHealth(
+   return {
+     rssBytes,
+     dbBytes,
+     walBytes,
+     dumps: { files: agg.dumpFiles, bytes: agg.dumpBytes },
+     logs: { bytes: agg.totalBytes },
+     lastErrors: scan.lastErrors,
+     kernelRssFromLog: scan.kernelRssBytes,
+   };
+ }
++
++/* ─────────────────────────────────────────────────────────────────────────
++ * hygiene 治理（T1-07）——把"内存/磁盘增长"变成显式可执行的治理动作。
++ *
++ * 主控裁定（2026-10-31）落点：
++ * - R-hy1（WAL checkpoint）：bun:sqlite 打开 <kernelDataDir>/opencode.db →
++ *   `PRAGMA wal_checkpoint(TRUNCATE)`；打开或 PRAGMA 失败 → 显式抛 BridgeError，
++ *   禁止任何静默降级。前置守卫：db 缺失/非常规文件 → 显式报错（new Database 会
++ *   静默创建空库，绝不能让"对缺失库做 checkpoint"变成"凭空造库"的静默副作用）。
++ * - R-hy2（默认参数）：olderThanDays=30、logsKeep=20；rotate 范围=仅 kernel-*.log
++ *   （log 目录顶层，与 scanKernelLogs 同口径；按 mtime 保留最近 keep 个，其余删除）。
++ * - R-hy3（purge 边界守卫）：仅匹配 dump-*.heapsnapshot，且候选必须位于
++ *   <kernelDataDir>/log 内——realpath（解符号链接）+ 前缀（path.relative）双重校验；
++ *   越界 → 拒绝并显式报错（HYGIENE_PATH_ESCAPE），绝不删除。
++ * - R-hy4（清单一致性）：planHygiene（纯只读、不写审计）返回的 purge 清单与
++ *   applyHygiene 实际删除的清单逐条一致（dry-run 语义）；apply 写入审计（同一
++ *   audit/install.jsonl 流，kind=hygiene.apply，含删除清单/checkpoint 结果/轮转数）。
++ * - R-hy5（kernelDataDir 传参）：沿用 R-h3 风格，plan/apply 均经 opts 接受
++ *   kernelDataDir（默认 ~/.codeartsdoer/cli-data），不扩展 BridgeConfig。
++ *
++ * 一致性语义与竞态纪律：
++ * - purge-dumps 按"清单执行"：plan 给出的每个文件在 apply 时必须仍然在场，
++ *   失踪（plan→apply 竞态或外部改动）→ HYGIENE_TARGET_MISSING 显式报错，不静默跳过
++ *   （清单一致性优先于尽力而为，失败即重跑一次 plan+apply）。
++ * - rotate-logs 按"重枚举执行"（动作只携带 keep 不携带清单）：apply 时重新枚举
++ *   kernel-*.log，扫描间隙被外部删除的文件按不存在计（与 scanKernelLogs 同语义）。
++ * - 失败审计（T1-05 评审教训）：apply 中途失败 → 记 hygiene.apply(result=failed)
++ *   后原样上抛；失败路径的审计写入尽力而为、不掩盖主错误（同 fsx cleanupTmp 纪律）；
++ *   成功路径的审计写入失败则显式抛（appendInstallAudit → FS_WRITE_FAILED）。
++ * ───────────────────────────────────────────────────────────────────────── */
++
++/** 一天毫秒数（olderThanDays 换算口径）。 */
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++/** 默认参数（裁定 R-hy2）：转储保留 30 天。 */
++export const HYGIENE_DEFAULT_OLDER_THAN_DAYS = 30;
++
++/** 默认参数（裁定 R-hy2）：内核日志保留最近 20 个。 */
++export const HYGIENE_DEFAULT_LOGS_KEEP = 20;
++
++/** 治理动作（任务书接口）：purge-dumps 携带显式清单；rotate-logs 只携带 keep。 */
++export type HygieneAction =
++  | { kind: "purge-dumps"; files: string[] }
++  | { kind: "wal-checkpoint" }
++  | { kind: "rotate-logs"; keep: number };
++
++/** planHygiene 选项（R-hy2 默认参数 + R-hy5 kernelDataDir 传参）。 */
++export interface HygienePlanOptions {
++  /** dump-*.heapsnapshot 的保留天数（超过才入选清理）；默认 30。 */
++  olderThanDays?: number;
++  /** kernel-*.log 保留个数（按 mtime 保留最近者）；默认 20。 */
++  logsKeep?: number;
++  /** 内核数据目录；缺省 ~/.codeartsdoer/cli-data（R-hy5，不扩展 BridgeConfig）。 */
++  kernelDataDir?: string;
++}
++
++/** applyHygiene 选项（R-hy5 kernelDataDir 传参；轮转/清理边界都以它为根）。 */
++export interface HygieneApplyOptions {
++  /** 内核数据目录；缺省 ~/.codeartsdoer/cli-data（R-hy5，不扩展 BridgeConfig）。 */
++  kernelDataDir?: string;
++}
++
++/** WAL checkpoint 结果（进审计；页数来自 PRAGMA 返回行）。 */
++interface WalCheckpointResult {
++  dbPath: string;
++  /** PRAGMA 返回的 busy 值（0=成功；非 0 在执行处即已显式抛出，进审计必为 0）。 */
++  busy: number;
++  /** WAL 中的页数（checkpoint 前）。 */
++  logPages: number;
++  /** 成功搬入主库的页数。 */
++  checkpointedPages: number;
++  /** checkpoint 前 WAL 字节。 */
++  walBytesBefore: number;
++  /** checkpoint 后 WAL 字节（TRUNCATE 成功时趋零）。 */
++  walBytesAfter: number;
++}
++
++/** 非负整数校验（禁静默截断/钳位：非法值就地显式报错，错误消息含参数名）。 */
++function requireNonNegativeInt(name: string, value: number): number {
++  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
++    throw new BridgeError(
++      "HYGIENE_OPT_INVALID",
++      `hygiene 参数 ${name} 须为非负整数，实际为 ${JSON.stringify(value)}`,
++    );
++  }
++  return value;
++}
++
++/** purge-dumps 候选中间态（递归收集结果）。 */
++interface DumpCandidate {
++  path: string;
++  mtimeMs: number;
++}
++
++/**
++ * 递归收集 log 目录内全部 dump-*.heapsnapshot（含子目录，与 collectHealth 的 dumps
++ * 统计同口径）。ENOENT（log 目录缺失）→ 空收集（无可清理是显式状态，R-h4 同语义）；
++ * 其他 readdir 错误 → FS_READ_FAILED 显式抛。stat 竞态消失 → 跳过（扫描语义）。
++ */
++async function collectDumpCandidates(dir: string, out: DumpCandidate[]): Promise<void> {
++  let entries: Dirent[];
++  try {
++    entries = await readdir(dir, { withFileTypes: true });
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return;
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取目录失败：path=${dir} reason=${reason}`, {
++      cause: e,
++    });
++  }
++  for (const d of entries) {
++    const p = path.join(dir, d.name);
++    if (d.isDirectory()) {
++      await collectDumpCandidates(p, out);
++    } else if (d.isFile() && DUMP_RE.test(d.name)) {
++      const st = await statOrEnoent(p);
++      if (st === undefined) continue; // 扫描间隙被删除：按不存在计（见函数注释）
++      out.push({ path: p, mtimeMs: st.mtimeMs });
++    }
++  }
++}
++
++/**
++ * 列出 log 目录顶层的 kernel-*.log（与 scanKernelLogs 同口径：仅常规文件、仅顶层；
++ * ENOENT → 空数组；其他 readdir 错误 → FS_READ_FAILED；stat 竞态消失 → 跳过）。
++ */
++async function listKernelLogs(logDir: string): Promise<Array<{ path: string; mtimeMs: number; name: string }>> {
++  let entries: Dirent[];
++  try {
++    entries = await readdir(logDir, { withFileTypes: true });
++  } catch (e) {
++    if (errnoOf(e) === "ENOENT") return [];
++    const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++    throw new BridgeError("FS_READ_FAILED", `读取目录失败：path=${logDir} reason=${reason}`, {
++      cause: e,
++    });
++  }
++  const files: Array<{ path: string; mtimeMs: number; name: string }> = [];
++  for (const d of entries) {
++    if (!d.isFile() || !KERNEL_LOG_RE.test(d.name)) continue;
++    const p = path.join(logDir, d.name);
++    const st = await statOrEnoent(p);
++    if (st === undefined) continue; // 扫描间隙被轮转删除：跳过（扫描语义）
++    files.push({ path: p, mtimeMs: st.mtimeMs, name: d.name });
++  }
++  return files;
++}
++
++/**
++ * 只读生成治理计划（dry-run，R-hy4：纯只读、绝不写审计、绝不改动任何文件）。
++ *
++ * 计划规则（只列"有活可干"的动作，空计划 = 无需治理）：
++ * 1. purge-dumps：log 目录内（递归）mtime 早于 now-olderThanDays 的 dump-*.heapsnapshot，
++ *    清单按路径升序（确定性，便于 dry-run 对账）；无到期转储 → 不产生动作。
++ * 2. wal-checkpoint：opencode.db-wal 存在且非零 → 产生动作（零/缺失无可 checkpoint）；
++ *    "WAL 在场但 db 缺失"的异常态照常产生动作，由 apply 显式报错暴露（禁静默跳过）。
++ * 3. rotate-logs：kernel-*.log 数量超过 logsKeep → 产生动作（keep 原样回传，供 apply 执行）。
++ *
++ * @param cfg  全局配置（本函数只读未用到；任务书接口固定携带，M2 计划落盘
++ *             <cfg.stateDir>/health 时启用——预留参数，勿删）
++ */
++export async function planHygiene(
++  cfg: BridgeConfig,
++  opts: HygienePlanOptions = {},
++): Promise<HygieneAction[]> {
++  void cfg; // 预留参数（同 collectHealth 注记）
++  const olderThanDays = requireNonNegativeInt(
++    "olderThanDays",
++    opts.olderThanDays ?? HYGIENE_DEFAULT_OLDER_THAN_DAYS,
++  );
++  const logsKeep = requireNonNegativeInt("logsKeep", opts.logsKeep ?? HYGIENE_DEFAULT_LOGS_KEEP);
++  const kernelDataDir = opts.kernelDataDir ?? path.join(homedir(), ".codeartsdoer", "cli-data");
++  const logDir = path.join(kernelDataDir, "log");
++
++  const actions: HygieneAction[] = [];
++
++  // 1) purge-dumps：到期转储清单（路径升序，确定性）
++  const cutoffMs = Date.now() - olderThanDays * DAY_MS;
++  const dumps: DumpCandidate[] = [];
++  await collectDumpCandidates(logDir, dumps);
++  const stale = dumps
++    .filter((d) => d.mtimeMs < cutoffMs)
++    .map((d) => d.path)
++    .sort();
++  if (stale.length > 0) actions.push({ kind: "purge-dumps", files: stale });
++
++  // 2) wal-checkpoint：WAL 在场且非零
++  const walStat = await statOrEnoent(path.join(kernelDataDir, "opencode.db-wal"));
++  if (walStat !== undefined && walStat.isFile() && walStat.size > 0) {
++    actions.push({ kind: "wal-checkpoint" });
++  }
++
++  // 3) rotate-logs：超出保留数的部分才产生动作
++  const logs = await listKernelLogs(logDir);
++  if (logs.length > logsKeep) actions.push({ kind: "rotate-logs", keep: logsKeep });
++
++  return actions;
++}
++
++/** hygiene 审计 ID：形如 hy-<epoch 毫秒>-<6 位随机十六进制>（与 rep- 前缀区分动作族）。 */
++function newHygieneAuditId(): string {
++  return `hy-${Date.now()}-${randomBytes(3).toString("hex")}`;
++}
++
++/**
++ * 执行单个 purge-dumps 动作（R-hy3 边界守卫 + R-hy4 清单执行）。
++ * 逐文件：① 名单校验（必须 dump-*.heapsnapshot）；② realpath 解析（失踪 →
++ * HYGIENE_TARGET_MISSING）；③ 前缀校验（realpath 后必须严格位于 log 目录内，
++ * 符号链接外逃在此被拦截 → HYGIENE_PATH_ESCAPE）；④ 删除（竞态失踪 →
++ * HYGIENE_TARGET_MISSING）。任一校验不过立即显式抛出，绝不删除越界目标。
++ * 实际删除的路径追加到 purged（供审计与调用方对账）。
++ */
++async function applyPurgeDumps(logDir: string, files: string[], purged: string[]): Promise<void> {
++  // log 目录必须可解析为真实路径，否则边界无从校验（显式报错，不假定）
++  let logReal: string;
++  try {
++    logReal = await realpath(logDir);
++  } catch (e) {
++    throw new BridgeError(
++      "HYGIENE_PATH_ESCAPE",
++      `log 目录不存在或不可解析，无法校验清理边界：path=${logDir}`,
++      { cause: e },
++    );
++  }
++  for (const file of files) {
++    // ① 名单校验（防伪造动作夹带任意路径）
++    if (!DUMP_RE.test(path.basename(file))) {
++      throw new BridgeError(
++        "HYGIENE_TARGET_INVALID",
++        `purge 清单含非 dump-*.heapsnapshot 路径，拒绝执行：path=${file}`,
++      );
++    }
++    // ② realpath（解符号链接；失踪显式报错——清单执行语义，禁静默跳过）
++    let fileReal: string;
++    try {
++      fileReal = await realpath(file);
++    } catch (e) {
++      if (errnoOf(e) === "ENOENT") {
++        throw new BridgeError(
++          "HYGIENE_TARGET_MISSING",
++          `purge 清单目标已失踪（plan→apply 竞态或外部改动）：path=${file}`,
++        );
++      }
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      throw new BridgeError("FS_STAT_FAILED", `realpath 失败：path=${file} reason=${reason}`, {
++        cause: e,
++      });
++    }
++    // ③ 前缀校验：fileReal 必须严格位于 logReal 内（path.relative 出 ".." 或绝对路径即越界）
++    const rel = path.relative(logReal, fileReal);
++    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
++      throw new BridgeError(
++        "HYGIENE_PATH_ESCAPE",
++        `purge 目标越界（须位于 log 目录内，realpath 后判定）：path=${file} real=${fileReal} logReal=${logReal}`,
++      );
++    }
++    // ④ 删除（校验全过才动手）
++    try {
++      await rm(file);
++    } catch (e) {
++      if (errnoOf(e) === "ENOENT") {
++        throw new BridgeError(
++          "HYGIENE_TARGET_MISSING",
++          `purge 清单目标已失踪（删除竞态）：path=${file}`,
++        );
++      }
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      throw new BridgeError("FS_WRITE_FAILED", `删除文件失败：path=${file} reason=${reason}`, {
++        cause: e,
++      });
++    }
++    purged.push(file);
++  }
++}
++
++/**
++ * 执行 WAL checkpoint（R-hy1）：bun:sqlite 打开 db → `PRAGMA wal_checkpoint(TRUNCATE)`。
++ * 前置守卫：db 缺失 → WAL_DB_MISSING（绝不借 new Database 的静默建库副作用造库）；
++ * db 非常规文件 → FS_PATH_NOT_FILE；打开/PRAGMA 失败 → WAL_CHECKPOINT_FAILED；
++ * PRAGMA 返回 busy≠0（并发读者阻塞，TRUNCATE 未达成）→ WAL_CHECKPOINT_BUSY。
++ */
++async function applyWalCheckpoint(kernelDataDir: string): Promise<WalCheckpointResult> {
++  const dbPath = path.join(kernelDataDir, "opencode.db");
++  const walPath = `${dbPath}-wal`;
++
++  const dbStat = await statOrEnoent(dbPath);
++  if (dbStat === undefined) {
++    throw new BridgeError(
++      "WAL_DB_MISSING",
++      `SQLite 数据库缺失，无法执行 WAL checkpoint：path=${dbPath}`,
++      { remediation: "确认内核数据目录是否正确；缺失的 opencode.db 不应被本动作凭空创建" },
++    );
++  }
++  if (!dbStat.isFile()) {
++    throw new BridgeError("FS_PATH_NOT_FILE", `数据库路径存在但不是常规文件：path=${dbPath}`);
++  }
++  const walBytesBefore = (await statOrEnoent(walPath))?.size ?? 0;
++
++  let db: Database;
++  try {
++    db = new Database(dbPath);
++  } catch (e) {
++    throw new BridgeError("WAL_CHECKPOINT_FAILED", `打开 SQLite 数据库失败：path=${dbPath}`, {
++      remediation: "检查数据库文件是否损坏或被其他进程以排他方式占用",
++      cause: e,
++    });
++  }
++  try {
++    let row: { busy?: unknown; log?: unknown; checkpointed?: unknown } | undefined;
++    try {
++      row = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as typeof row;
++    } catch (e) {
++      throw new BridgeError(
++        "WAL_CHECKPOINT_FAILED",
++        `PRAGMA wal_checkpoint(TRUNCATE) 执行失败：path=${dbPath}`,
++        { cause: e },
++      );
++    }
++    if (
++      row === undefined ||
++      typeof row.busy !== "number" ||
++      typeof row.log !== "number" ||
++      typeof row.checkpointed !== "number"
++    ) {
++      throw new BridgeError(
++        "WAL_CHECKPOINT_FAILED",
++        `PRAGMA wal_checkpoint(TRUNCATE) 返回行缺失或形态非法：path=${dbPath} row=${JSON.stringify(row)}`,
++      );
++    }
++    if (row.busy !== 0) {
++      throw new BridgeError(
++        "WAL_CHECKPOINT_BUSY",
++        `WAL checkpoint 因并发读者无法完成（busy=${row.busy}，TRUNCATE 未达成）：path=${dbPath}`,
++        { remediation: "待内核空闲后重试；持续 busy 说明有长事务持有 WAL" },
++      );
++    }
++    const walBytesAfter = (await statOrEnoent(walPath))?.size ?? 0;
++    return {
++      dbPath,
++      busy: row.busy,
++      logPages: row.log,
++      checkpointedPages: row.checkpointed,
++      walBytesBefore,
++      walBytesAfter,
++    };
++  } finally {
++    try {
++      db.close();
++    } catch {
++      // 关闭失败不掩盖主错误（仅资源回收；同 fsx.fsyncDir 纪律）
++    }
++  }
++}
++
++/**
++ * 执行 rotate-logs（R-hy2）：kernel-*.log（log 目录顶层）按 mtime 降序保留最近 keep 个，
++ * 其余删除。重枚举语义：扫描间隙被外部删除的目标按不存在计（非清单执行，见头注）。
++ * 返回实际删除数；被删路径追加到 rotated（供审计与调用方对账）。
++ */
++async function applyRotateLogs(logDir: string, keep: number, rotated: string[]): Promise<number> {
++  const logs = await listKernelLogs(logDir);
++  // 新→旧排序（mtime 降序；并列按文件名升序，确定性），前 keep 个为保留集
++  logs.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
++  const victims = logs.slice(keep);
++  let removed = 0;
++  for (const v of victims) {
++    try {
++      await rm(v.path);
++    } catch (e) {
++      if (errnoOf(e) === "ENOENT") continue; // 扫描间隙被删除：按不存在计（重枚举语义）
++      const reason = errnoOf(e) ?? (e instanceof Error ? e.name : "UNKNOWN");
++      throw new BridgeError("FS_WRITE_FAILED", `删除日志失败：path=${v.path} reason=${reason}`, {
++        cause: e,
++      });
++    }
++    rotated.push(v.path);
++    removed += 1;
++  }
++  return removed;
++}
++
++/** 审计条目的 walCheckpoint 字段（null=本批动作不含 wal-checkpoint）。 */
++type AuditWalField = WalCheckpointResult | null;
++
++/**
++ * 执行治理动作（R-hy4：apply 写入审计；动作序列按给定顺序逐个执行）。
++ *
++ * 成功 → 一条 hygiene.apply(result=ok) 审计（含删除清单 purged/rotated、轮转数
++ * rotatedCount、checkpoint 结果 walCheckpoint）并返回 { applied, auditId }；
++ * 中途失败 → 先尽力写一条 result=failed 审计（含已执行的部分清单与错误码，不掩盖
++ * 主错误）再原样上抛（T1-05 评审教训：失败也要留痕）。
++ *
++ * @param cfg     全局配置（审计写入 <cfg.stateDir>/audit/install.jsonl）
++ * @param actions planHygiene 产出的动作序列（也可手工构造，守卫逐条把关）
++ * @param opts    kernelDataDir 传参（R-hy5）
++ */
++export async function applyHygiene(
++  cfg: BridgeConfig,
++  actions: HygieneAction[],
++  opts: HygieneApplyOptions = {},
++): Promise<{ applied: string[]; auditId: string }> {
++  const kernelDataDir = opts.kernelDataDir ?? path.join(homedir(), ".codeartsdoer", "cli-data");
++  const logDir = path.join(kernelDataDir, "log");
++  const auditId = newHygieneAuditId();
++
++  const applied: string[] = [];
++  const purged: string[] = [];
++  const rotated: string[] = [];
++  let walResult: AuditWalField = null;
++
++  const auditBase = {
++    ts: new Date().toISOString(),
++    auditId,
++    kind: "hygiene.apply" as const,
++    actions: actions.map((a) => a.kind),
++  };
++
++  try {
++    for (const action of actions) {
++      switch (action.kind) {
++        case "purge-dumps":
++          await applyPurgeDumps(logDir, action.files, purged);
++          applied.push("purge-dumps");
++          break;
++        case "wal-checkpoint":
++          walResult = await applyWalCheckpoint(kernelDataDir);
++          applied.push("wal-checkpoint");
++          break;
++        case "rotate-logs":
++          requireNonNegativeInt("keep", action.keep);
++          await applyRotateLogs(logDir, action.keep, rotated);
++          applied.push("rotate-logs");
++          break;
++        default:
++          // 防静默跳过：未支持的 kind 显式报错（新增动作时在此增列分支并补测试）
++          throw new BridgeError(
++            "HYGIENE_ACTION_UNKNOWN",
++            `未支持的 hygiene 动作 kind：${JSON.stringify((action as { kind?: unknown }).kind)}`,
++          );
++      }
++    }
++  } catch (e) {
++    // 失败审计尽力而为：审计写失败不得掩盖主错误（同 fsx.cleanupTmp 纪律）
++    await appendInstallAudit(cfg, {
++      ...auditBase,
++      result: "failed",
++      error: e instanceof BridgeError ? `${e.code}: ${e.message}` : String(e),
++      purged,
++      rotated,
++      walCheckpoint: walResult,
++    }).catch(() => undefined);
++    throw e;
++  }
++
++  await appendInstallAudit(cfg, {
++    ...auditBase,
++    result: "ok",
++    purged,
++    rotated,
++    rotatedCount: rotated.length,
++    walCheckpoint: walResult,
++  });
++  return { applied, auditId };
++}
+diff --git a/plugins/codearts-bridge/test/hygiene.test.ts b/plugins/codearts-bridge/test/hygiene.test.ts
+new file mode 100644
+index 0000000000..8e8cd12954
+--- /dev/null
++++ b/plugins/codearts-bridge/test/hygiene.test.ts
+@@ -0,0 +1,449 @@
++/**
++ * T1-07 hygiene 治理测试（bun:test）。
++ *
++ * 覆盖（任务书 Step1 + 主控裁定 R-hy1..R-hy5）：
++ * - purge-dumps：plan 仅列超过 olderThanDays 的 dump-*.heapsnapshot（含子目录递归、
++ *   非转储不入选、未到期不入选）；dry-run 清单 = apply 实际删除清单（逐一断言）（R-hy4）；
++ * - wal-checkpoint：预置含热 WAL 的 sqlite（保持一条空闲连接使 WAL 非自愈态——
++ *   钉死"显式 PRAGMA 起效"而非"打开时自动恢复"），apply 后 WAL 尺寸趋零且数据完整
++ *   （原连接与重开只读连接双验）（R-hy1）；
++ * - rotate-logs：仅 kernel-*.log（按 mtime 保留最近 keep 个），experience-*.log 等
++ *   异构日志不参与轮转（R-hy2）；
++ * - 审计：apply 写 hygiene.apply（删除清单/checkpoint 结果/轮转数）；plan 纯只读不写审计
++ *   （R-hy4）；
++ * - 边界守卫：候选须位于 <kernelDataDir>/log 内（realpath + 前缀双重校验），越界/
++ *   符号链接外逃/名单不符/目标失踪一律显式报错且不删除；WAL 目标缺失不静默建库
++ *   （R-hy3 + 禁静默兜底）。
++ *
++ * 隔离纪律（主控裁定）：绝不触碰真实 HOME；FS 落点全在 .tmp/hygiene-test/，清理见钩子。
++ */
++import { afterAll, beforeEach, describe, expect, it } from "bun:test";
++import { Database } from "bun:sqlite";
++import { mkdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
++import * as path from "node:path";
++import { loadConfig } from "../src/core/config";
++import type { BridgeConfig } from "../src/core/config";
++import { BridgeError } from "../src/core/errors";
++import {
++  HYGIENE_DEFAULT_LOGS_KEEP,
++  HYGIENE_DEFAULT_OLDER_THAN_DAYS,
++  applyHygiene,
++  planHygiene,
++} from "../src/core/health";
++import type { HygieneAction } from "../src/core/health";
++
++const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
++const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "hygiene-test");
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++beforeEach(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++  await mkdir(TEST_ROOT, { recursive: true });
++});
++
++afterAll(async () => {
++  await rm(TEST_ROOT, { recursive: true, force: true });
++});
++
++/** 隔离配置（路径全在本测试根内，绝不依赖真实 HOME）。 */
++function cfgOf(): BridgeConfig {
++  return loadConfig(
++    {
++      installDir: path.join(TEST_ROOT, "installers"),
++      stateDir: path.join(TEST_ROOT, "state"),
++    },
++    {},
++  );
++}
++
++/** 把 mtime 固定到"now - days 天"（atime 同步设置，测试确定性不依赖写入先后）。 */
++async function ageFile(file: string, days: number): Promise<void> {
++  const t = new Date(Date.now() - days * DAY_MS);
++  await utimes(file, t, t);
++}
++
++/** 读取审计文件（install.jsonl）为对象数组；空行跳过。 */
++async function readAuditLines(stateDir: string): Promise<Array<Record<string, unknown>>> {
++  const text = await readFile(path.join(stateDir, "audit", "install.jsonl"), "utf8");
++  return text
++    .split("\n")
++    .filter((l) => l.trim().length > 0)
++    .map((l) => JSON.parse(l) as Record<string, unknown>);
++}
++
++/** 构造 purge 用 fixture：新旧转储（顶层+子目录）、非转储、内核日志各就位。 */
++async function makeDumpFixture(root: string, olderThanDays = 30): Promise<string> {
++  const kernelDataDir = path.join(root, "cli-data");
++  const logDir = path.join(kernelDataDir, "log");
++  await mkdir(path.join(logDir, "sub"), { recursive: true });
++
++  const dumpOld = path.join(logDir, "dump-old.heapsnapshot");
++  const dumpSub = path.join(logDir, "sub", "dump-nested.heapsnapshot");
++  const dumpYoung = path.join(logDir, "dump-young.heapsnapshot");
++  await writeFile(dumpOld, "old".repeat(10), "utf8");
++  await writeFile(dumpSub, "nested".repeat(10), "utf8");
++  await writeFile(dumpYoung, "young", "utf8");
++  await writeFile(path.join(logDir, "notes.txt"), "not a dump\n", "utf8");
++  await writeFile(
++    path.join(logDir, "kernel-a.log"),
++    "INFO  2026-10-30T20:26:00.000 +1ms service=session \"poll ok\" count=1\n",
++    "utf8",
++  );
++  await ageFile(dumpOld, olderThanDays + 10);
++  await ageFile(dumpSub, olderThanDays + 5);
++  await ageFile(dumpYoung, 1);
++  await ageFile(path.join(logDir, "kernel-a.log"), olderThanDays + 10);
++  return kernelDataDir;
++}
++
++/* ───── purge-dumps：plan 清单与 apply 删除一致（R-hy3/R-hy4） ───── */
++
++describe("planHygiene purge-dumps", () => {
++  it("仅列超过 olderThanDays 的 dump-*.heapsnapshot（递归含子目录；未到期/非转储不入选）", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "purge-plan"));
++    const actions = await planHygiene(cfgOf(), { kernelDataDir, olderThanDays: 30, logsKeep: 5 });
++
++    const purge = actions.find((a): a is Extract<HygieneAction, { kind: "purge-dumps" }> => a.kind === "purge-dumps");
++    expect(purge).toBeDefined();
++    expect([...purge!.files].sort()).toEqual([
++      path.join(kernelDataDir, "log", "dump-old.heapsnapshot"),
++      path.join(kernelDataDir, "log", "sub", "dump-nested.heapsnapshot"),
++    ]);
++    // 内核日志 1 个 ≤ logsKeep=5 → 无轮转动作；无 WAL → 无 checkpoint 动作
++    expect(actions.filter((a) => a.kind !== "purge-dumps")).toEqual([]);
++  });
++
++  it("plan 纯只读：不创建 stateDir/audit、不改写任何文件（R-hy4）", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "purge-readonly"));
++    const cfg = cfgOf();
++    await planHygiene(cfg, { kernelDataDir, olderThanDays: 30, logsKeep: 5 });
++    expect(await Bun.file(path.join(cfg.stateDir, "audit", "install.jsonl")).exists()).toBe(false);
++    // 计划清单内的文件仍在（未删除）
++    expect(await Bun.file(path.join(kernelDataDir, "log", "dump-old.heapsnapshot")).exists()).toBe(true);
++  });
++
++  it("默认参数（R-hy2）：olderThanDays=30 / logsKeep=20 — 21 天前转储不清理、第 21 个日志触发轮转", async () => {
++    expect(HYGIENE_DEFAULT_OLDER_THAN_DAYS).toBe(30);
++    expect(HYGIENE_DEFAULT_LOGS_KEEP).toBe(20);
++
++    const kernelDataDir = path.join(TEST_ROOT, "defaults", "cli-data");
++    const logDir = path.join(kernelDataDir, "log");
++    await mkdir(logDir, { recursive: true });
++    const dump21 = path.join(logDir, "dump-21d.heapsnapshot");
++    await writeFile(dump21, "d21", "utf8");
++    await ageFile(dump21, 21);
++    const dumpOld = path.join(logDir, "dump-40d.heapsnapshot");
++    await writeFile(dumpOld, "d40", "utf8");
++    await ageFile(dumpOld, 40);
++
++    for (let i = 0; i < 21; i++) {
++      const f = path.join(logDir, `kernel-${String(i).padStart(2, "0")}.log`);
++      await writeFile(f, `log-${i}\n`, "utf8");
++      await ageFile(f, i); // kernel-20.log 最新
++    }
++
++    const actions = await planHygiene(cfgOf(), { kernelDataDir });
++    const purge = actions.find((a): a is Extract<HygieneAction, { kind: "purge-dumps" }> => a.kind === "purge-dumps");
++    expect(purge?.files).toEqual([dumpOld]); // 21 天 < 30 天 → 不入选
++    expect(actions).toContainEqual({ kind: "rotate-logs", keep: 20 }); // 21 > 20 → 轮转
++  });
++});
++
++describe("applyHygiene purge-dumps（清单一致性）", () => {
++  it("dry-run 清单 = 实际删除清单：逐一删除、未入选者原位保留", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "purge-apply"));
++    const logDir = path.join(kernelDataDir, "log");
++    const planned = await planHygiene(cfgOf(), { kernelDataDir, olderThanDays: 30, logsKeep: 5 });
++    const purge = planned.find((a): a is Extract<HygieneAction, { kind: "purge-dumps" }> => a.kind === "purge-dumps");
++    expect(purge).toBeDefined();
++
++    const res = await applyHygiene(cfgOf(), planned, { kernelDataDir });
++    expect(res.applied).toEqual(["purge-dumps"]);
++    expect(res.auditId).toMatch(/^hy-\d+-[0-9a-f]+$/);
++
++    // 逐一断言：计划清单内文件全部消失
++    for (const f of purge!.files) expect(await Bun.file(f).exists()).toBe(false);
++    // 未入选者原位保留
++    expect(await Bun.file(path.join(logDir, "dump-young.heapsnapshot")).exists()).toBe(true);
++    expect(await Bun.file(path.join(logDir, "notes.txt")).exists()).toBe(true);
++    expect(await Bun.file(path.join(logDir, "kernel-a.log")).exists()).toBe(true);
++
++    // 审计删除清单与 plan 清单逐条一致（R-hy4）
++    const lines = await readAuditLines(cfgOf().stateDir);
++    const entry = lines.find((l) => l["kind"] === "hygiene.apply");
++    expect(entry).toBeDefined();
++    expect(entry?.["auditId"]).toBe(res.auditId);
++    expect(entry?.["result"]).toBe("ok");
++    expect([...(entry?.["purged"] as string[]).values()].sort()).toEqual([...purge!.files].sort());
++  });
++
++  it("空目录 → plan 为空数组；apply([]) 仅记审计、applied 为空", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "empty", "cli-data");
++    await mkdir(path.join(kernelDataDir, "log"), { recursive: true });
++    const actions = await planHygiene(cfgOf(), { kernelDataDir });
++    expect(actions).toEqual([]);
++    const res = await applyHygiene(cfgOf(), actions, { kernelDataDir });
++    expect(res.applied).toEqual([]);
++    const lines = await readAuditLines(cfgOf().stateDir);
++    expect(lines.filter((l) => l["kind"] === "hygiene.apply").length).toBe(1);
++  });
++});
++
++/* ───── wal-checkpoint（R-hy1） ───── */
++
++describe("applyHygiene wal-checkpoint", () => {
++  it("预置含热 WAL 的库：apply 后 WAL 趋零、数据完整（原连接可读 + 重开可读）", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "wal", "cli-data");
++    await mkdir(kernelDataDir, { recursive: true });
++    const dbPath = path.join(kernelDataDir, "opencode.db");
++    const walPath = `${dbPath}-wal`;
++
++    // 连接 A：WAL 模式建表插入；保持打开（空闲）使 WAL 处于非自愈态——
++    // 若实现漏掉 PRAGMA，打开时的自动恢复不会替它完成 checkpoint（测试真实性）
++    const dbA = new Database(dbPath);
++    dbA.run("PRAGMA journal_mode=WAL");
++    dbA.run("PRAGMA wal_autocheckpoint=0");
++    dbA.run("CREATE TABLE t(x TEXT)");
++    dbA.run("INSERT INTO t VALUES ('hello-checkpoint')");
++    const walBefore = (await stat(walPath)).size;
++    expect(walBefore).toBeGreaterThan(0);
++
++    const cfg = cfgOf();
++    const actions = await planHygiene(cfg, { kernelDataDir });
++    expect(actions).toContainEqual({ kind: "wal-checkpoint" });
++
++    const res = await applyHygiene(cfg, actions, { kernelDataDir });
++    expect(res.applied).toContain("wal-checkpoint");
++
++    const walAfter = (await stat(walPath)).size;
++    expect(walAfter).toBe(0); // 无并发读者 → TRUNCATE 趋零
++
++    // 数据完整：原连接可读 + 关闭后重开（只读）仍可读
++    expect(dbA.query("SELECT x FROM t").get()).toEqual({ x: "hello-checkpoint" });
++    dbA.close();
++    const dbC = new Database(dbPath, { readonly: true });
++    expect(dbC.query("SELECT x FROM t").get()).toEqual({ x: "hello-checkpoint" });
++    dbC.close();
++
++    // 审计记录 checkpoint 结果
++    const lines = await readAuditLines(cfg.stateDir);
++    const entry = lines.find((l) => l["kind"] === "hygiene.apply");
++    const wal = entry?.["walCheckpoint"] as Record<string, unknown> | undefined;
++    expect(wal).toBeDefined();
++    expect(wal?.["busy"]).toBe(0);
++    expect(wal?.["dbPath"]).toBe(dbPath);
++  });
++
++  it("db 缺失 → WAL_DB_MISSING 显式抛出，且不得静默创建空库文件", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "wal-missing", "cli-data");
++    await mkdir(kernelDataDir, { recursive: true });
++    // 手工放一个 WAL 但没有 db（异常态）：apply 必须显式报错而非打开时静默建库
++    await writeFile(path.join(kernelDataDir, "opencode.db-wal"), "orphan-wal", "utf8");
++    const dbPath = path.join(kernelDataDir, "opencode.db");
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "wal-checkpoint" }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("WAL_DB_MISSING");
++    }
++    expect(await Bun.file(dbPath).exists()).toBe(false); // 未被静默创建
++  });
++
++  it("非 SQLite 垃圾文件 → WAL_CHECKPOINT_FAILED 显式抛出（打开/PRAGMA 失败不降级）", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "wal-garbage", "cli-data");
++    await mkdir(kernelDataDir, { recursive: true });
++    await writeFile(path.join(kernelDataDir, "opencode.db"), "this is not sqlite", "utf8");
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "wal-checkpoint" }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("WAL_CHECKPOINT_FAILED");
++    }
++  });
++});
++
++/* ───── rotate-logs（R-hy2） ───── */
++
++describe("planHygiene/applyHygiene rotate-logs", () => {
++  it("保留最近 keep 个 kernel-*.log（按 mtime），其余删除；异构日志不参与", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "rotate", "cli-data");
++    const logDir = path.join(kernelDataDir, "log");
++    await mkdir(logDir, { recursive: true });
++
++    const names = ["kernel-e.log", "kernel-a.log", "kernel-c.log", "kernel-b.log", "kernel-d.log"];
++    for (let i = 0; i < names.length; i++) {
++      const f = path.join(logDir, names[i]!);
++      await writeFile(f, `content-${names[i]}\n`, "utf8");
++      await ageFile(f, names.length - i); // kernel-d 最新(1天前) > kernel-b(2天) > c(3天) > a(4天) > e(5天)
++    }
++    await writeFile(path.join(logDir, "experience-2026-09-01.0.log"), "old exp log\n", "utf8");
++    await ageFile(path.join(logDir, "experience-2026-09-01.0.log"), 60);
++
++    const cfg = cfgOf();
++    const actions = await planHygiene(cfg, { kernelDataDir, olderThanDays: 3650, logsKeep: 2 });
++    const rotate = actions.find((a): a is Extract<HygieneAction, { kind: "rotate-logs" }> => a.kind === "rotate-logs");
++    expect(rotate).toEqual({ kind: "rotate-logs", keep: 2 });
++
++    const res = await applyHygiene(cfg, actions, { kernelDataDir });
++    expect(res.applied).toEqual(["rotate-logs"]);
++
++    // 幸存者 = mtime 最新的 2 个（kernel-d：1 天前、kernel-b：2 天前）
++    expect(await Bun.file(path.join(logDir, "kernel-b.log")).exists()).toBe(true);
++    expect(await Bun.file(path.join(logDir, "kernel-d.log")).exists()).toBe(true);
++    for (const gone of ["kernel-a.log", "kernel-c.log", "kernel-e.log"]) {
++      expect(await Bun.file(path.join(logDir, gone)).exists()).toBe(false);
++    }
++    // 异构日志不参与轮转
++    expect(await Bun.file(path.join(logDir, "experience-2026-09-01.0.log")).exists()).toBe(true);
++
++    // 审计：轮转数与被删清单
++    const lines = await readAuditLines(cfg.stateDir);
++    const entry = lines.find((l) => l["kind"] === "hygiene.apply");
++    expect(entry?.["rotatedCount"]).toBe(3);
++    expect([...(entry?.["rotated"] as string[]).values()].sort()).toEqual(
++      ["kernel-a.log", "kernel-c.log", "kernel-e.log"].map((n) => path.join(logDir, n)).sort(),
++    );
++  });
++
++  it("kernel 日志数 ≤ keep → 不产生轮转动作", async () => {
++    const kernelDataDir = path.join(TEST_ROOT, "rotate-none", "cli-data");
++    const logDir = path.join(kernelDataDir, "log");
++    await mkdir(logDir, { recursive: true });
++    await writeFile(path.join(logDir, "kernel-a.log"), "only\n", "utf8");
++    const actions = await planHygiene(cfgOf(), { kernelDataDir, olderThanDays: 3650, logsKeep: 20 });
++    expect(actions).toEqual([]);
++  });
++});
++
++/* ───── purge 边界守卫（R-hy3：realpath/前缀双重校验，越界显式报错不删除） ───── */
++
++describe("applyHygiene 边界守卫（R-hy3）", () => {
++  it("候选位于 log 目录之外 → HYGIENE_PATH_ESCAPE，文件原位保留", async () => {
++    const root = path.join(TEST_ROOT, "escape-outside");
++    const kernelDataDir = await makeDumpFixture(root);
++    const outside = path.join(root, "outside", "dump-evil.heapsnapshot");
++    await mkdir(path.dirname(outside), { recursive: true });
++    await writeFile(outside, "evil", "utf8");
++
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "purge-dumps", files: [outside] }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("HYGIENE_PATH_ESCAPE");
++    }
++    expect(await Bun.file(outside).exists()).toBe(true); // 未删除
++  });
++
++  it("log 目录内的符号链接指向外部文件 → realpath 校验拦截（HYGIENE_PATH_ESCAPE）", async () => {
++    const root = path.join(TEST_ROOT, "escape-symlink");
++    const kernelDataDir = await makeDumpFixture(root);
++    const logDir = path.join(kernelDataDir, "log");
++    const outside = path.join(root, "outside", "dump-victim.heapsnapshot");
++    await mkdir(path.dirname(outside), { recursive: true });
++    await writeFile(outside, "victim", "utf8");
++    const link = path.join(logDir, "dump-link.heapsnapshot");
++    await symlink(outside, link);
++
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "purge-dumps", files: [link] }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("HYGIENE_PATH_ESCAPE");
++    }
++    expect(await Bun.file(outside).exists()).toBe(true); // 外部目标未被删除
++  });
++
++  it("log 目录内但文件名不符 dump-*.heapsnapshot → HYGIENE_TARGET_INVALID", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "invalid-name"));
++    const inside = path.join(kernelDataDir, "log", "kernel-a.log");
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "purge-dumps", files: [inside] }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("HYGIENE_TARGET_INVALID");
++    }
++    expect(await Bun.file(inside).exists()).toBe(true);
++  });
++
++  it("计划后目标失踪（plan→apply 竞态）→ HYGIENE_TARGET_MISSING 显式报错", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "target-missing"));
++    const vanished = path.join(kernelDataDir, "log", "dump-vanished.heapsnapshot");
++    await writeFile(vanished, "soon gone", "utf8");
++    await ageFile(vanished, 40);
++    const actions = await planHygiene(cfgOf(), { kernelDataDir, olderThanDays: 30, logsKeep: 5 });
++    await rm(vanished); // plan 之后被外部删除
++
++    try {
++      await applyHygiene(cfgOf(), actions, { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("HYGIENE_TARGET_MISSING");
++    }
++  });
++});
++
++/* ───── 参数校验（禁静默截断/兜底） ───── */
++
++describe("参数校验", () => {
++  it("非法 olderThanDays / logsKeep（负数/非整数/非数字）→ HYGIENE_OPT_INVALID", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "opt-invalid"));
++    for (const bad of [{ olderThanDays: -1 }, { olderThanDays: 1.5 }, { olderThanDays: "30" as unknown as number }]) {
++      try {
++        await planHygiene(cfgOf(), { kernelDataDir, ...bad });
++        expect.unreachable();
++      } catch (e) {
++        expect(e).toBeInstanceOf(BridgeError);
++        expect((e as BridgeError).code).toBe("HYGIENE_OPT_INVALID");
++      }
++    }
++    for (const bad of [{ logsKeep: -1 }, { logsKeep: 0.5 }]) {
++      try {
++        await planHygiene(cfgOf(), { kernelDataDir, olderThanDays: 3650, ...bad });
++        expect.unreachable();
++      } catch (e) {
++        expect(e).toBeInstanceOf(BridgeError);
++        expect((e as BridgeError).code).toBe("HYGIENE_OPT_INVALID");
++      }
++    }
++  });
++
++  it("rotate 动作 keep 非法（伪造动作直接 apply）→ HYGIENE_OPT_INVALID", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "opt-apply-invalid"));
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "rotate-logs", keep: -3 }], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("HYGIENE_OPT_INVALID");
++    }
++  });
++
++  it("未支持的动作 kind → HYGIENE_ACTION_UNKNOWN（防静默跳过）", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "action-unknown"));
++    try {
++      await applyHygiene(cfgOf(), [{ kind: "nope" } as unknown as HygieneAction], { kernelDataDir });
++      expect.unreachable();
++    } catch (e) {
++      expect(e).toBeInstanceOf(BridgeError);
++      expect((e as BridgeError).code).toBe("HYGIENE_ACTION_UNKNOWN");
++    }
++  });
++});
++
++/* ───── realpath 基础设施自检（测试自身可靠性） ───── */
++
++describe("测试基础设施", () => {
++  it("makeDumpFixture 的时间戳生效（老转储确超 30 天）", async () => {
++    const kernelDataDir = await makeDumpFixture(path.join(TEST_ROOT, "fixture-selfcheck"));
++    const st = await stat(path.join(kernelDataDir, "log", "dump-old.heapsnapshot"));
++    expect(Date.now() - st.mtimeMs).toBeGreaterThan(30 * DAY_MS);
++    expect(await realpath(kernelDataDir)).toBe(await realpath(kernelDataDir));
++  });
++});

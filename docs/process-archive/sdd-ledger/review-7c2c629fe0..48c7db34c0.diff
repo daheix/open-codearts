@@ -1,0 +1,79 @@
+# Review package: 7c2c629fe0..48c7db34c0
+
+## Commits
+48c7db34c0 codearts-bridge(T3-03): 修复评审发现 — classifyModelError 补内部 stripAnsi（对齐 C++ 原语义）+ ANSI 包裹错误词用例 — I1
+
+## Files changed
+ plugins/codearts-bridge/src/core/goal/runner.ts | 8 +++++++-
+ plugins/codearts-bridge/test/runner.test.ts     | 7 +++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/plugins/codearts-bridge/src/core/goal/runner.ts b/plugins/codearts-bridge/src/core/goal/runner.ts
+index 943b925de1..df958d29d0 100644
+--- a/plugins/codearts-bridge/src/core/goal/runner.ts
++++ b/plugins/codearts-bridge/src/core/goal/runner.ts
+@@ -120,24 +120,30 @@ const MODEL_ERROR_PATTERNS: ReadonlyArray<readonly [ModelErrorKind, RegExp]> = [
+   ["rate_limit", /429|rate\s*limit|too\s+many\s+requests|限流|速度限制/i],
+   ["server", /\b5\d{2}\b\s*(internal|server|error)?|internal\s+server\s+error|服务端错误|服务器错误/i],
+   ["network", /ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|network\s+error|fetch\s+failed|网络中断|网络错误/i],
+   ["empty", /no\s+response|empty\s+response|无返回|没有返回|无响应/i],
+   ["refusal", /content\s+(filter|policy)|refused|被拒绝|内容拒绝/i],
+ ];
+ 
+ /**
+  * 从一段（可能混有转义序列的）模型输出中分类模型/网络错误（C++ 同名函数移植）。
+  * 命中返回类别；未命中返回 null。调用方保证先做注入回显剥离（与 C++ feed 同序）。
++ *
++ * 匹配前内部先 stripAnsi——对齐 C++ 原语义（goalprotocol.cpp:118-120："同 parse：
++ * 只剥离转义序列，不做编码规范化"）：真实 TUI 输出的转义序列可能落在错误词
++ * 中间/交错（如 `请求已超\x1b[0m时`），裸文本匹配漏检而 C++ 能检；也与本模块
++ * parseProgress 的内剥 ANSI 约定一致。
+  */
+ export function classifyModelError(text: string): ModelErrorKind | null {
++  const clean = stripAnsi(text);
+   for (const [kind, re] of MODEL_ERROR_PATTERNS) {
+-    if (re.test(text)) return kind;
++    if (re.test(clean)) return kind;
+   }
+   return null;
+ }
+ 
+ /**
+  * 接收文本规范化（源：GoalProtocol::normalizeReceived 的 TS 适配，分歧 2）：
+  * C++ 因 Qt receivedData 的 Latin1 通道做 toLatin1→fromUtf8 还原；TS 传输层
+  * 已按 UTF-8 解码，无需重编——仅将未配对代理项替换为 U+FFFD，防止下游
+  * 正则/码点切片错位。合法文本（含 CJK 与合法代理对）逐字原样保留。
+  */
+diff --git a/plugins/codearts-bridge/test/runner.test.ts b/plugins/codearts-bridge/test/runner.test.ts
+index deed971351..436d4988d0 100644
+--- a/plugins/codearts-bridge/test/runner.test.ts
++++ b/plugins/codearts-bridge/test/runner.test.ts
+@@ -576,20 +576,27 @@ describe("classifyModelError（源：GoalProtocol::classifyModelError 逐条搬
+     expect(classifyModelError("fetch failed")).toBe("network");
+     expect(classifyModelError("网络错误")).toBe("network");
+     // empty
+     expect(classifyModelError("no response")).toBe("empty");
+     expect(classifyModelError("无返回")).toBe("empty");
+     // refusal
+     expect(classifyModelError("content policy")).toBe("refusal");
+     expect(classifyModelError("被拒绝")).toBe("refusal");
+   });
+ 
++  it("ANSI 转义落在错误词中间/包裹时仍命中（对齐 C++ goalprotocol.cpp:118-120 内部 stripAnsi）", () => {
++    // 包裹形式：转义序列在错误词前后（裁定示例原样）
++    expect(classifyModelError("\x1b[?25l请求已超时\x1b[0m")).toBe("timeout");
++    // 交错形式：转义序列把"超时"劈开——裸文本匹配漏检，stripAnsi 后命中
++    expect(classifyModelError("请求已超\x1b[0m时\x1b[0m")).toBe("timeout");
++  });
++
+   it("\\b 词边界与负例（C++ `\\\\b` 即 TS 正则 \\b；timeout= 配置文本不算错误）", () => {
+     expect(classifyModelError("timeout: 30s")).toBeNull(); // (?!\s*[=:]) 负向前瞻
+     expect(classifyModelError("timeouted")).toBeNull(); // \\btimeout\\b 边界
+     expect(classifyModelError("xtimeout")).toBeNull();
+     expect(classifyModelError("hello world")).toBeNull();
+     expect(classifyModelError("")).toBeNull();
+   });
+ 
+   it("normalizeReceived（TS 适配：清理未配对代理；合法文本原样）", () => {
+     expect(normalizeReceived("中文 ok")).toBe("中文 ok");
