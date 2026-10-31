@@ -21,7 +21,7 @@ opencode V2 插件（薄壳）+ 核心库 + 守护进程：为 CodeArts CLI 提�
   停滞 60s 自动续跑；模型/网络错误**无限重试**（60s 封顶，连续 ≥10 次告警不停止）；进程死自动重建断点续跑；
   守护/宿主重启对账恢复；暂停/恢复/停止即时生效。
 - **三传输可切换**（显式选择、无静默降级）：
-  - `structured`：`codearts run --format json` 回合制进程（需 AK/SK；内存每回合归零）；
+  - `structured`：`codearts run --format json` 回合制进程（需 AK/SK；**codearts 内核**内存每回合归零——回合=独立进程；桥接侧会话缓冲有 512KB 封顶与丢弃计数）；
   - `pty`（tmux 优先）：可 attach 观看、跨守护重启存活（用 CLI 登录态）；
   - `pty`（script 兜底）：零依赖。
 - **守护进程**：systemd user service（Restart=always）+ 每分钟 watchdog（连续 2 次无响应自动重启）。
@@ -155,7 +155,7 @@ structured（run --format json 回合制）  │  pty（tmux / script 托管 TUI
   相对路径走 npm 解析被静默跳过；文件路径被拒）。2.2.5 起 `exports` 被采用，
   全局自动加载目录生效。详见[加载方式（实测）](#加载方式实测)。
 - 2.1.4 服务端无工具清单 HTTP 端点（2.2.5 有 `/api/plugin`）——工具可见性以会话内实测为准。
-- TUI 存在交互式自升级对话框（`OPENCODE_CHANNEL=latest`）：监督引擎带 TUI-ready 门后再注入。
+- TUI 存在交互式自升级对话框（`OPENCODE_CHANNEL=latest`）：停滞重试保障最终递达（实测第 5 轮递达）；TUI-ready 门为路线图增强。
 - 华为云升级流程存在"先改名后部署 + 跨数据集 rename"缺陷（本管家已规避并可自愈）。
 
 ## 故障排查
