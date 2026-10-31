@@ -127,8 +127,12 @@ export interface GoalHostDeps {
   clock: { now(): number };
   /** sweep 循环宿主。 */
   loop: TickLoop;
-  /** 独立验收执行器（透传 RunnerDeps.verifyRun；目标声明 verify 时必配）。 */
-  verifyRun?(cmd: string[]): Promise<{ ok: boolean; out: string }>;
+  /**
+   * 独立验收执行器（透传 RunnerDeps.verifyRun；目标声明 verify 时必配）。
+   * cwd 语义（修复环裁定① 2026-10-31）：cwd 缺省 = 目标 workdir（GoalHost 逐
+   * 目标绑定后传给执行器）；目标无 workdir → undefined（执行器自选落点）。
+   */
+  verifyRun?(cmd: string[], cwd?: string): Promise<{ ok: boolean; out: string }>;
 }
 
 /** POST /goals 请求体（任务书 API 契约 + autoNudge 逐目标覆盖）。 */
@@ -435,6 +439,10 @@ export class GoalHost {
   /** 以（落盘）状态构造 runner 并入册（R-dg1）。 */
   private rosterGoal(g: GoalState): RosterEntry {
     const sink = makeAuditSink(this.stateDir, g.goalId);
+    // 修复环裁定①（2026-10-31）：cwd 缺省目标 workdir——宿主在此逐目标绑定
+    // （RunnerDeps.verifyRun 签名保持 (cmd)，workdir 属目标状态、runner 不感知）。
+    const verifyRun =
+      this.deps.verifyRun === undefined ? undefined : (cmd: string[]) => this.deps.verifyRun!(cmd, g.workdir);
     const deps: RunnerDeps = {
       clock: this.deps.clock,
       transport: this.deps.transport,
@@ -445,7 +453,7 @@ export class GoalHost {
         console.error(`[codearts-bridge] ${JSON.stringify(e)}`);
       },
       thresholds: this.deps.cfg.thresholds,
-      verifyRun: this.deps.verifyRun,
+      verifyRun,
       cfg: this.deps.cfg,
       autoNudge: g.autoNudge ?? this.deps.cfg.autoNudge, // R-dg5-① 生效值解析
     };

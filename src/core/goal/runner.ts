@@ -811,15 +811,31 @@ export class GoalRunner {
 
   /**
    * 统一注入入口（C++ noteInjection+inject 合流）：留痕（上限 6）→ 开回显守卫
-   * 窗 → 审计 → 传输注入 → 复位三计时（C++ injectContract/Nudge 尾段同语义）。
-   * 调用方保证 phase=active 且 session 在场。
+   * 窗 → 传输注入 → 成功后落审计并复位三计时（C++ injectContract/Nudge 尾段
+   * 同语义）。调用方保证 phase=active 且 session 在场。
+   *
+   * 修复环裁定②（2026-10-31，状态失真治理）：留痕指纹与守卫窗**先于字节上线**
+   * （注入回显可能在本函数 await 窗口内经信号泵到达，stripInjectionEcho 的指纹
+   * 必须已就位）；审计与计时在传输成功后落——传输拒绝（显式上抛前）回滚
+   * injected 指纹 / rounds / 守卫窗，杜绝"注入被拒仍留 injected 指纹与 rounds+1"
+   * 的状态失真（真机 T4-02 实证：契约被传输拒绝却留下注入痕迹）。
    */
   private async injectPrompt(text: string, kind: InjectKind): Promise<void> {
     const now = this.now();
+    const prevDeafUntil = this.deafUntilMs;
     this.st.injected.push(text);
     while (this.st.injected.length > RECENT_INJECTION_CAP) this.st.injected.shift();
     this.deafUntilMs = now + this.deps.thresholds.echoGuardMs;
     this.st.rounds += 1;
+    try {
+      await this.deps.transport.inject(this.st.session as SessionRef, text);
+    } catch (e) {
+      // 回滚（text 是刚 push 的最后一条；shift 只可能移除更早条目，pop 恒正确）
+      this.st.injected.pop();
+      this.st.rounds -= 1;
+      this.deafUntilMs = prevDeafUntil;
+      throw e;
+    }
     this.deps.audit({
       type: "goal.inject",
       goalId: this.st.goalId,
@@ -827,7 +843,6 @@ export class GoalRunner {
       kind,
       rounds: this.st.rounds,
     });
-    await this.deps.transport.inject(this.st.session as SessionRef, text);
     this.lastFeedAt = this.lastActiveAt = this.lastProgressAt = now;
     this.st.lastProgressAt = now;
   }
@@ -846,6 +861,13 @@ export class GoalRunner {
 
   /* ───── resume / stop 锁内实现 ───── */
 
+  /**
+   * 人工恢复：paused/blocked → active 并注入继续指令；终态显式报错。
+   * 修复环裁定⑤（2026-10-31）：resume 前置存活检查——死会话先按进程死重建
+   * 路径（裁定③，restartLocked：销毁残留→重建活会话→断点/全文契约注入），
+   * 再返回 active；不再对死会话直接注入而永久 SESSION_NOT_ALIVE（真机控制三连
+   * 实证：死会话目标 resume 永久失败，仅 stop 可达终态）。
+   */
   private async resumeLocked(): Promise<GoalState> {
     if (this.st.phase === "complete" || this.st.phase === "stopped") {
       throw new BridgeError(
@@ -859,6 +881,10 @@ export class GoalRunner {
     this.deps.audit({ type: "goal.resume", goalId: this.st.goalId, at: this.now() });
     if (this.st.session === undefined) {
       await this.bootstrapLocked(); // 暂停中的全新目标：恢复即引导
+      return this.snap();
+    }
+    if (!(await this.deps.transport.alive(this.st.session))) {
+      await this.restartLocked(this.now()); // ⑤：死会话 → 重建 + resume 契约
       return this.snap();
     }
     await this.injectPrompt(this.continueText(), "continue");

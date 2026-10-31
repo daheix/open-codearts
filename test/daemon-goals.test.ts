@@ -105,7 +105,13 @@ interface Harness {
  * 组装并启动一套守护台架（goals 宿主接线 FakeTransport + 假时钟 + 手动循环）。
  * opts.autoNudge 注入 cfg.autoNudge（缺省走 loadConfig 默认 true）。
  */
-async function makeHarness(opts?: { autoNudge?: boolean }): Promise<Harness> {
+async function makeHarness(
+  opts?: {
+    autoNudge?: boolean;
+    /** 修复环①：verifyRun 记录器注入（缺省恒通过）。 */
+    verifyRun?: (cmd: string[], cwd?: string) => Promise<{ ok: boolean; out: string }>;
+  },
+): Promise<Harness> {
   const name = `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const cfg = loadConfig(
     {
@@ -124,7 +130,7 @@ async function makeHarness(opts?: { autoNudge?: boolean }): Promise<Harness> {
     transport,
     clock,
     loop: loop.loop,
-    verifyRun: async () => ({ ok: true, out: "OK" }),
+    verifyRun: opts?.verifyRun ?? (async () => ({ ok: true, out: "OK" })),
   });
   const daemon = createDaemon(cfg, undefined, host);
   openDaemons.push(daemon);
@@ -709,5 +715,66 @@ describe("响应形态卫生", () => {
     const body = (await fetch(`http://127.0.0.1:${h.port}/health`).then((r) => r.json())) as Record<string, unknown>;
     expect(body["ok"]).toBe(true);
     expect(body["actives"]).toBe(0);
+  });
+});
+
+/* ───── 修复环第 1 轮（真机 T4-02 缺陷①：verifyRun 生产装配接线） ───── */
+
+describe("修复环① verifyRun 装配接线", () => {
+  it("带 verify 目标 done 后执行验收：cmd 逐字透传、cwd=goal.workdir；通过 → complete 落盘", async () => {
+    const calls: Array<{ cmd: string[]; cwd?: string }> = [];
+    const h = await makeHarness({
+      verifyRun: async (cmd, cwd) => {
+        calls.push({ cmd, cwd });
+        return { ok: true, out: "OK" };
+      },
+    });
+    const workdir = path.join(TEST_ROOT, "verify-wd");
+    await mkdir(workdir, { recursive: true });
+    const created = (await call(h.port, "POST", "/goals", h.token, {
+      objective: "制造验收物",
+      verify: ["echo hi", "ls -la"],
+      workdir,
+    })).body as { goalId: string };
+    await h.loop.sweepOnce(); // 引导：建会话 + 契约注入
+    const st0 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
+    if (st0.session === undefined) throw new Error("引导后 session 应在场");
+    h.advance(4_000); // 越过回显守卫窗
+    h.transport.emit(st0.session, "output", "完成 [GOAL-DONE]");
+    await h.loop.sweepOnce(); // done 核验 → verifyRun 逐条执行 → 双过
+    const st1 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
+    expect(st1.phase).toBe("complete");
+    expect(calls.map((c) => c.cmd)).toEqual([["echo", "hi"], ["ls", "-la"]]);
+    expect(calls.every((c) => c.cwd === workdir)).toBe(true); // cwd 缺省目标 workdir（裁定①）
+    await new Promise((r) => setTimeout(r, 30)); // 审计队列为异步追加（sweep 成功路径最终一致），让渡落盘
+    const audit = await readFile(path.join(h.cfg.stateDir, "audit", `${created.goalId}.jsonl`), "utf8");
+    expect(audit).toContain("goal.verify");
+    expect(audit).toContain("goal.complete");
+  });
+
+  it("验收未过 → 注入失败原因继续驱动（verifyRun 失败透传，不 complete）", async () => {
+    let n = 0;
+    const h = await makeHarness({
+      verifyRun: async () => {
+        n += 1;
+        return { ok: false, out: "断言失败" };
+      },
+    });
+    const created = (await call(h.port, "POST", "/goals", h.token, {
+      objective: "必然失败",
+      verify: ["false"],
+    })).body as { goalId: string };
+    await h.loop.sweepOnce();
+    const st0 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
+    if (st0.session === undefined) throw new Error("引导后 session 应在场");
+    h.advance(4_000);
+    h.transport.emit(st0.session, "output", "完成 [GOAL-DONE]");
+    await h.loop.sweepOnce();
+    const st1 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
+    expect(st1.phase).toBe("active"); // 验收未过：继续驱动
+    expect(n).toBe(1);
+    expect(h.transport.injections.length).toBe(2); // 契约 + 验收失败重注
+    expect(h.transport.injections[1]!.text).toContain("验收未通过");
+    expect(h.transport.injections[1]!.text).toContain("断言失败");
   });
 });

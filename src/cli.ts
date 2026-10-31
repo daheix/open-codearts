@@ -44,6 +44,7 @@
  * 确定性驱动 SIGINT，生产不传即无感。
  */
 import { mkdir, readFile, unlink } from "node:fs/promises";
+import { spawn as nodeSpawn } from "node:child_process";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type { BridgeConfig } from "./core/config";
@@ -153,6 +154,74 @@ export interface DaemonCommandDeps {
   clock?: RunClock;
   /** sweep 循环宿主（缺省 defaultTickLoop(GOAL_SWEEP_INTERVAL_MS)）。 */
   loop?: TickLoop;
+  /**
+   * 独立验收执行器（修复环裁定① 2026-10-31：缺省 execVerify——生产 GoalHost
+   * 必接线 verifyRun，否则带 verify 的 POST /goals 生产必失败（真机 T4-02 实证
+   * GOAL_VERIFY_RUN_MISSING + 半成品目标落盘）；测试注入 fake 断言透传）。
+   */
+  execVerify?: (cmd: string[], cwd?: string) => Promise<{ ok: boolean; out: string }>;
+}
+
+/* ───── verify 独立验收执行器（修复环裁定① 生产缺省实现） ───── */
+
+/** verify 命令超时（裁定①：60s；超时 SIGKILL 并记验收失败）。 */
+export const VERIFY_TIMEOUT_MS = 60_000;
+
+/** verify 输出截断上限（字符）：审计/注入文案取摘要，防超大输出拖垮守护。 */
+export const VERIFY_OUT_MAX_CHARS = 8_000;
+
+function capVerifyOut(s: string): string {
+  return s.length > VERIFY_OUT_MAX_CHARS
+    ? `${s.slice(0, VERIFY_OUT_MAX_CHARS)}…(+${s.length - VERIFY_OUT_MAX_CHARS} 字符截断)`
+    : s;
+}
+
+/**
+ * 生产缺省 verifyRun（修复环裁定① 2026-10-31）：child_process 直 exec（不经
+ * shell、argv 数组传递）；60s 超时强杀；输出截断上限；cwd 透传（GoalHost 逐
+ * 目标绑定 = 缺省目标 workdir；目标无 workdir → 守护进程 cwd）。
+ * 退出码非 0 / 超时 / spawn 失败一律 ok=false 且 out 携带显式失败原因——"无法
+ * 完成验收"本身就是验收未过的事实，失败详情上供给 runner 注入续跑（非静默
+ * 兜底：错误可见、目标不被误判完成）；cmd[0] 缺失属调用方缺陷，显式抛错。
+ */
+export async function execVerify(cmd: string[], cwd?: string): Promise<{ ok: boolean; out: string }> {
+  const file = cmd[0];
+  if (file === undefined || file === "") {
+    throw new BridgeError("GOAL_VERIFY_CMD_INVALID", `验收命令为空（cmd[0] 缺失）：${JSON.stringify(cmd)}`);
+  }
+  return await new Promise<{ ok: boolean; out: string }>((resolve) => {
+    let out = "";
+    let settled = false;
+    const child = nodeSpawn(file, cmd.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const collect = (b: Buffer): void => {
+      if (out.length <= VERIFY_OUT_MAX_CHARS) out += b.toString("utf8");
+    };
+    const finish = (reason: string): void => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, out: capVerifyOut(`${reason}${out}`) });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(`验收命令超时（>${VERIFY_TIMEOUT_MS}ms）已被终止。`);
+    }, VERIFY_TIMEOUT_MS);
+    child.stdout?.on("data", collect);
+    child.stderr?.on("data", collect);
+    child.on("error", (e: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      finish(`验收命令无法执行：${e.code ?? "UNKNOWN"}（${e.message}）。`);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: true, out: capVerifyOut(out.trim()) });
+      } else {
+        finish(`验收命令退出码=${code ?? "null"}。`);
+      }
+    });
+  });
 }
 
 /**
@@ -198,6 +267,7 @@ export async function daemonCommand(
     transport,
     clock: deps.clock ?? defaultRunClock,
     loop: deps.loop ?? defaultTickLoop(GOAL_SWEEP_INTERVAL_MS),
+    verifyRun: deps.execVerify ?? execVerify, // 修复环裁定①：生产必接线（真机缺陷①治理）
   });
   const daemon = createDaemon(cfg, undefined, goals);
   const signals = ["SIGINT", "SIGTERM"] as const;

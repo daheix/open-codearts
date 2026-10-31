@@ -370,14 +370,17 @@ describe("R-tm3 两段式注入", () => {
     ]);
   });
 
-  it("多行文本 → INJECT_TEXT_MULTILINE（与 T2-02 同码）且不产生任何 send-keys", async () => {
+  it("② 多行文本合法（修复环裁定② 2026-10-31）：-l 字面整块发送 + Enter 提交（两段式保序）", async () => {
     const fake = makeFakeTmux();
     const t = createTmuxTransport(fake.exec);
     const ref = await t.start(CFG);
     fake.calls.length = 0;
-    await expect(t.inject(ref, "a\rb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
-    await expect(t.inject(ref, "a\nb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
-    expect(fake.calls.filter((c) => c.args[0] === "send-keys")).toHaveLength(0);
+    await t.inject(ref, "a\nb");
+    expect(fake.calls.map((c) => c.args)).toEqual([
+      ["has-session", "-t", ref.id],
+      ["send-keys", "-l", "-t", ref.id, "a\nb"],
+      ["send-keys", "-t", ref.id, "Enter"],
+    ]);
   });
 
   it("未知 ref → SESSION_UNKNOWN；会话已亡 → SESSION_NOT_ALIVE 且不注入", async () => {
@@ -420,16 +423,15 @@ describe("R-tm4 stop / alive / snapshot", () => {
     expect(await t.alive(ref)).toBe(false);
   });
 
-  it("alive = has-session 退出码；未知 ref → SESSION_UNKNOWN", async () => {
+  it("alive = has-session 退出码；未知 ref → false（④ 布尔查询，不抛错）", async () => {
     const fake = makeFakeTmux();
     const t = createTmuxTransport(fake.exec);
     const ref = await t.start(CFG);
     expect(await t.alive(ref)).toBe(true);
     fake.setExists(false);
     expect(await t.alive(ref)).toBe(false);
-    await expect(t.alive({ kind: "pty", id: "codearts-nope" })).rejects.toMatchObject({
-      code: "SESSION_UNKNOWN",
-    });
+    await expect(t.alive({ kind: "pty", id: "codearts-nope" })).resolves.toBe(false);
+    await expect(t.alive({ kind: "structured", id: ref.id })).resolves.toBe(false); // kind 不符亦 false
   });
 
   it("snapshot：raw = capture-pane -p 输出；meta 含 host=tmux/target/alive/log；会话亡 → raw 空 + alive:false", async () => {
@@ -452,6 +454,18 @@ describe("R-tm4 stop / alive / snapshot", () => {
     const dead = await t.snapshot(ref);
     expect(dead.raw).toBe("");
     expect(dead.meta).toMatchObject({ alive: false });
+  });
+
+  it("snapshot raw 封顶（终审修复波 F1）：capture 超 512KB 保留最新尾部；meta.rawDroppedBytes 如实计数（pane 全量仍由 tmux history 持有）", async () => {
+    const fake = makeFakeTmux();
+    const t = createTmuxTransport(fake.exec);
+    const ref = await t.start(CFG);
+    fake.setPane("z".repeat(600 * 1024) + "TAIL-MARK\n");
+    const snap = await t.snapshot(ref);
+    expect(Buffer.byteLength(snap.raw, "utf8")).toBeLessThanOrEqual(512 * 1024);
+    expect(snap.raw.endsWith("TAIL-MARK\n")).toBe(true); // 以尾部内容结尾（尾滚动）
+    // 精确对账：capture 总量（600K + 10B 尾标）− cap = 本次捕获丢弃量
+    expect(snap.meta.rawDroppedBytes).toBe(600 * 1024 + 10 - 512 * 1024);
   });
 });
 

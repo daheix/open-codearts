@@ -9,7 +9,9 @@
  * 主控裁定对照（2026-10-31，逐条落实）：
  * - R-p1 两段式注入：inject = write(text) → 可注入时钟等待 120ms →
  *   write("\r") 单独提交（v0.2.6 教训：文本+回车同块会被粘贴识别吞掉）。
- *   文本含 \r/\n 显式抛 INJECT_TEXT_MULTILINE（与两段式契约冲突，禁静默截断）。
+ *   文本允许多行（修复环裁定② 2026-10-31：整块写入 = TUI 粘贴语义；原
+ *   INJECT_TEXT_MULTILINE 拒绝分支已删——多行契约是目标协议正文，拒绝即
+ *   PTY 形态下任何目标的首个契约都无法送达，真机 T4-02 实证）。
  * - R-p2 日志信号源：observe 额外 tail `<kernelDataDir>/log/kernel-*.log`
  *   增量（kernelDataDir 经 ObserveOptions 传参，缺省 ~/.codeartsdoer/cli-data，
  *   不扩展 BridgeConfig——与 R-h3/R-h5 同风格）；`service=` 行转为 output
@@ -43,18 +45,39 @@
  *   AK/SK 前置，无 TUI 授权门，见 structured.ts 同名注释）。
  * - R-p6 UTF-8：PTY 流按 chunk 到达，stdout/stderr 各持独立 StringDecoder，
  *   多字节序列跨 chunk 完整还原（两流独立解码器，交错不破坏字节边界）。
+ * - 修复环第 1 轮（2026-10-31 真机 T4-02 验收裁定，逐条落实）：
+ *   ④ alive() 是**布尔查询**——未知 / kind 不符 / 已终态 / 已消亡 ref 一律返回
+ *   false（不抛错）。依据：守护重启后进程内存 sessions 表为空，磁盘目标的
+ *   session ref 必然未知，reconcile（state.ts）凭 alive=false 走重建路径；若
+ *   抛 SESSION_UNKNOWN 则 reconcile 上抛 → 守护崩溃循环（演练 B 实证：存在
+ *   活跃目标时守护被杀 = 永久下线）。仅"无法判定"的基础设施错误才抛（本宿主
+ *   为纯内存判定，无此路径）。
+ *   ③ start(ref) 对已存在但已亡的同名会话：**销毁旧会话残留（组杀清理）并
+ *   新建活会话**（同名重建，与 tmux 宿主对账语义同构）；对未知但形态合法的
+ *   ref（跨守护重启对账）同样采纳重建。回传前自检 child 存活——不满足则
+ *   显式抛 PTY_START_FAILED（契约：start 回传的 ref 必须满足 alive(ref)=true，
+ *   禁回传死 ref 制造重启风暴，演练 A 实证）。非法 ref（kind 不符/空 id）
+ *   仍显式 SESSION_UNKNOWN。
+ *   ② inject 多行合法——目标契约天然多行（协议正文），整块一次性写入全部
+ *   文本（TUI 粘贴语义；开启括号粘贴的 TUI 将整块视作字面文本），随后独立
+ *   "\r" 提交（R-p1 两段式时序保留）。**回退开关登记（裁定②原文）**：若真机
+ *   复验发现目标 TUI 无括号粘贴、多行块被逐行提前提交（契约截断），回退方案
+ *   为注入前将 \n 替换为空格的单行扁平化（在此处加开关常量并同步 pty-tmux）。
+ *   先实测再定——截至本轮真机复验未观察到截断，维持整块语义。
  *
  * 语义裁决（显式报错，禁静默兜底；与 FakeTransport 对齐项注明）：
- * - 未知 ref：全部方法抛 SESSION_UNKNOWN（与 Fake 同）；
+ * - 未知 ref：inject/observe/stop/snapshot 抛 SESSION_UNKNOWN（与 Fake 同）；
+ *   alive 返回 false、start 采纳重建（修复环④③裁定，见上）；
  * - 对非存活会话 inject：抛 SESSION_NOT_ALIVE（与 Fake 同）；等待 120ms 提交
  *   窗口期间会话死亡：同样显式抛出，不向死进程写字节；
  * - 同一 ref 并发第二个 observe：抛 OBSERVER_ACTIVE（单观察者模型，与 Fake 同）；
- * - start 带 ref 复用：存活会话幂等返回同 ref；已结束会话抛 SESSION_NOT_ALIVE
- *   （真实 PTY 不可复活，禁静默重建）；
+ * - start 带 ref 复用：存活会话幂等返回同 ref；已亡/未知 → 同名重建（③）；
  * - 进程自然退出：observe 产出一次性 done 信号（接口未携带退出码，text 省略）
  *   后迭代正常结束；stop() 终止则不产 done、观察直接终止（与 Fake 同态）；
  * - snapshot.raw = PTY 输出缓冲（全部 chunk 解码按序累积，模拟终端缓冲区，
- *   与是否被 observe 消费无关）；日志源信号不进 raw（raw 仅 PTY 输出）。
+ *   与是否被 observe 消费无关；F1 终审修复波起封顶——只保留最新
+ *   SESSION_RAW_CAP_BYTES（512KB）尾部，丢弃量见 meta.rawDroppedBytes）；
+ *   日志源信号不进 raw（raw 仅 PTY 输出）。
  *   meta.log = { available, file, serviceLines }：available = 观察进行中且正在
  *   tail 某 kernel-*.log；file = 当前 tail 的文件名（basename）；serviceLines =
  *   日志源产出的信号累计数（跨观察累计，留痕不丢）。
@@ -68,7 +91,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { armLogTailer, lookPath, shQuote, type PtyClock } from "./shared";
+import { armLogTailer, CappedTailBuffer, lookPath, shQuote, type PtyClock } from "./shared";
 import type { BridgeConfig } from "../config";
 import { BridgeError } from "../errors";
 import type {
@@ -204,8 +227,10 @@ export function nodeScriptSpawnPty(args: string[], env: NodeJS.ProcessEnv): PtyC
 interface PtySession {
   ref: SessionRef;
   child: PtyChild;
-  /** PTY 输出缓冲：全部 chunk 解码按序累积（snapshot.raw，与消费无关）。 */
-  raw: string;
+  /** PTY 输出缓冲（F1 封顶尾缓冲）：全部 chunk 解码按序累积（snapshot.raw，与
+   * 消费无关）；只保留最新 SESSION_RAW_CAP_BYTES 尾部，丢弃量经 rawDroppedBytes
+   * 暴露（snapshot.meta，审计可见非静默）。 */
+  rawBuf: CappedTailBuffer;
   /** 待消费信号队列（PTY chunk / 日志 service 行 / done）。 */
   queue: Signal[];
   /** observe 挂起等待者（wakeAll 唤醒后自旋复查状态）。 */
@@ -275,10 +300,57 @@ export function createScriptTransport(
         "SESSION_NOT_ALIVE",
         `会话已结束，拒绝操作：id=${ref.id}`,
         {
-          remediation: "script 宿主会话不可复活；请新建会话（start 不带 ref）。",
+          remediation: "以 transport.start(cfg, ref) 同名重建（修复环裁定③），或不带 ref 新建会话。",
         },
       );
     }
+  }
+
+  /**
+   * 修复环裁定③：spawn 新会话体（同名重建共用）。wrapper 检查 → spawn →
+   * 接线 onData → 回传前自检存活（child 即刻死亡 = wrapper 启动即崩，显式
+   * PTY_START_FAILED，绝不回传死 ref）。失败路径不登记会话表。
+   */
+  function spawnSession(cfg: BridgeConfig, id: string, prev: PtySession | undefined): PtySession {
+    // 修复环裁定①（2026-10-31）：PTY 宿主一律经官方 wrapper <installDir>/codearts
+    // 启动（见 start 处原注释）；wrapper 缺失显式报错，禁静默回退 bin 直启。
+    const wrapper = path.join(cfg.installDir, "codearts");
+    if (!existsSync(wrapper)) {
+      throw new BridgeError("WRAPPER_MISSING", `官方启动 wrapper 缺失：${wrapper}`, {
+        remediation:
+          "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
+      });
+    }
+    const cmd = shQuote(wrapper);
+    // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
+    const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
+    const created: SessionRef = { kind, id };
+    const s: PtySession = {
+      ref: created,
+      child,
+      rawBuf: new CappedTailBuffer(),
+      queue: [],
+      waiters: [],
+      observer: null,
+      closed: false,
+      exitHandled: false,
+      // 日志账目对象继承（I1 原地变更语义，与 tmux 同名重建同口径）
+      log: prev?.log ?? { available: false, file: null, serviceLines: 0 },
+    };
+    // onData 单播：start 时接线一次，输出持续入 rawBuf + 队列（与是否观察无关）
+    child.onData((chunk) => {
+      s.rawBuf.append(chunk);
+      s.queue.push({ t: "output", at: Date.now(), text: chunk });
+      wakeAll(s);
+    });
+    // ③ 自检：回传的 ref 必须满足 alive(ref)=true（spawn 后即刻死亡 = 启动
+    // 即崩，显式报错；禁回传死 ref 制造 restart→tick-failed 重启风暴）
+    if (!child.alive()) {
+      throw new BridgeError("PTY_START_FAILED", `会话进程启动即死，重建失败：id=${id}`, {
+        remediation: "检查官方 wrapper 与目标 TUI 可执行性（journal 可能有启动错误输出）。",
+      });
+    }
+    return s;
   }
 
   const transport: CodeartsTransport = {
@@ -286,58 +358,45 @@ export function createScriptTransport(
 
     async start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef> {
       if (ref !== undefined) {
-        const s = requireSession(ref);
-        assertInjectable(s, ref);
-        return { ...s.ref }; // 复用语义：存活会话幂等返回（真实 PTY 无恢复概念）
+        if (ref.kind !== kind || ref.id === "") {
+          throw new BridgeError("SESSION_UNKNOWN", `非法会话引用：kind=${ref.kind} id=${ref.id}`, {
+            remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
+          });
+        }
+        const prev = sessions.get(ref.id);
+        if (prev !== undefined && !prev.closed && prev.child.alive()) {
+          return { ...prev.ref }; // 存活会话幂等返回（真实 PTY 复用无恢复概念）
+        }
+        // 修复环裁定③：已亡（存在但死）或未知（跨守护重启对账）ref = 同名重建。
+        // 旧会话残留销毁：置 closed（旧观察循环见 closed 即按 stop 语义终止，
+        // I1 同款）→ 残余进程组杀（R-p4 两级终止）→ 唤醒释放等待者；新会话体
+        // 以全新 raw/队列起步（旧输出不属新生命期，与 tmux 同名重建同口径）。
+        if (prev !== undefined) {
+          prev.closed = true;
+          if (prev.child.alive()) prev.child.kill();
+          wakeAll(prev);
+        }
+        const s = spawnSession(cfg, ref.id, prev); // 失败抛错：不登记、不改旧账
+        sessions.set(ref.id, s);
+        return { ...s.ref };
       }
-      const id = `script-${++idNext}`;
-      const created: SessionRef = { kind, id };
-      // 修复环裁定①（2026-10-31）：PTY 宿主一律经官方 wrapper <installDir>/codearts
-      // 启动——wrapper 设置全量内核 env（SCENARIO/KERNEL_DATA_DIR/OPENCODE_* 等，
-      // 单一环境真相源，与 TUI 桌面快捷方式语义一致）；bin 直启裸传父环境会使
-      // TUI 停在交互式授权门（真机冒烟实证）。wrapper 缺失显式报错，禁静默回退
-      // bin 直启（回退即掩盖部署缺陷，与全局"禁静默兜底"约束同源）。
-      const wrapper = path.join(cfg.installDir, "codearts");
-      if (!existsSync(wrapper)) {
-        throw new BridgeError("WRAPPER_MISSING", `官方启动 wrapper 缺失：${wrapper}`, {
-          remediation:
-            "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
-        });
-      }
-      const cmd = shQuote(wrapper);
-      // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
-      const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
-      const s: PtySession = {
-        ref: created,
-        child,
-        raw: "",
-        queue: [],
-        waiters: [],
-        observer: null,
-        closed: false,
-        exitHandled: false,
-        log: { available: false, file: null, serviceLines: 0 },
-      };
-      // onData 单播：start 时接线一次，输出持续入 raw + 队列（与是否观察无关）
-      child.onData((chunk) => {
-        s.raw += chunk;
-        s.queue.push({ t: "output", at: Date.now(), text: chunk });
-        wakeAll(s);
-      });
+      // 新会话：跳过已被外部采纳重建占用的 id（防碰撞覆写）
+      let id: string;
+      do {
+        id = `script-${++idNext}`;
+      } while (sessions.has(id));
+      const s = spawnSession(cfg, id, undefined);
       sessions.set(id, s);
-      return { ...created };
+      return { ...s.ref };
     },
 
     async inject(ref: SessionRef, text: string): Promise<void> {
       const s = requireSession(ref);
       assertInjectable(s, ref);
-      if (text.includes("\r") || text.includes("\n")) {
-        throw new BridgeError(
-          "INJECT_TEXT_MULTILINE",
-          `注入文本含换行符（长度=${text.length}），与两段式提交契约冲突`,
-          { remediation: "单行文本注入；多行内容分行多次 inject，每段单独提交。" },
-        );
-      }
+      // 修复环裁定②：多行文本合法（目标契约天然多行）——整块一次性写入全部
+      // 文本（TUI 粘贴语义），随后独立 "\r" 提交（R-p1 两段式时序保留）。
+      // 回退开关登记：若真机复验发现目标 TUI 逐行提前提交（契约截断），在
+      // 此处加 \n→空格 扁平化开关（并同步 pty-tmux），见文件头修复环②条目。
       s.child.write(text);
       await clock(INJECT_COMMIT_DELAY_MS); // R-p1：两段式提交窗口
       assertInjectable(s, ref); // 窗口期死亡：显式报错，不向死进程写 "\r"
@@ -418,7 +477,11 @@ export function createScriptTransport(
     },
 
     async alive(ref: SessionRef): Promise<boolean> {
-      const s = requireSession(ref);
+      // 修复环裁定④：alive 是布尔查询——未知 / kind 不符 / 已终态 / 已消亡
+      // ref 一律 false（不抛错）。守护重启后 reconcile 必经未知 ref 路径，
+      // false 使其走重建而非崩溃（见文件头修复环④条目）。
+      const s = ref.kind === kind ? sessions.get(ref.id) : undefined;
+      if (s === undefined) return false;
       return !s.closed && s.child.alive();
     },
 
@@ -434,7 +497,8 @@ export function createScriptTransport(
     async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
       const s = requireSession(ref);
       return {
-        raw: s.raw,
+        // F1 封顶：只保留最新 512KB 尾部，丢弃量见 meta.rawDroppedBytes
+        raw: s.rawBuf.value(),
         meta: {
           id: s.ref.id,
           kind: s.ref.kind,
@@ -442,6 +506,7 @@ export function createScriptTransport(
           pid: s.child.pid,
           alive: !s.closed && s.child.alive(),
           closed: s.closed,
+          rawDroppedBytes: s.rawBuf.droppedBytes,
           log: { ...s.log },
         },
       };

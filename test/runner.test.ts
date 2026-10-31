@@ -12,7 +12,10 @@
  * - R-rn5 classifyModelError/normalizeReceived 移植（含 `\\b`→`\b` 适配）。
  */
 import { describe, expect, it } from "bun:test";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import * as path from "node:path";
 import type { BridgeConfig } from "../src/core/config";
+import { loadConfig } from "../src/core/config";
 import {
   CONTINUE_PROMPT,
   buildContract,
@@ -27,7 +30,8 @@ import {
 } from "../src/core/goal/runner";
 import { BridgeError } from "../src/core/errors";
 import { FakeTransport } from "../src/core/transport/fake";
-import type { SessionRef } from "../src/core/transport/types";
+import { createScriptTransport, type PtyChild } from "../src/core/transport/pty-script";
+import type { CodeartsTransport, SessionRef } from "../src/core/transport/types";
 
 /* ───── 测试台架：假时钟 + FakeTransport + 审计/log 收集 ───── */
 
@@ -654,5 +658,165 @@ describe("quiesce 同块连推多信号（T3-05 集成发现回归）", () => {
     h.transport.emit(ref, "output", "done [GOAL-DONE]");
     await r.tick();
     expect(r.state().phase).toBe("complete"); // done 未迟到（6 信号全消费）
+  });
+});
+
+/* ───── 修复环第 1 轮（真机 T4-02 五缺陷：③⑤②） ───── */
+
+// script 传输台架（真实 createScriptTransport + 受控 fake child）：重建语义在
+// 真实传输层验证（FakeTransport 的复活语义天然满足裁定，测不出风暴回归）。
+// wrapper fixture 落插件 test/.tmp/（用后即删由 rm -rf .tmp 纪律覆盖）。
+
+const T4_TMP = path.join(import.meta.dir, ".tmp", "runner-t4");
+const T4_INSTALL = path.join(T4_TMP, "install");
+mkdirSync(T4_INSTALL, { recursive: true });
+writeFileSync(path.join(T4_INSTALL, "codearts"), "#!/bin/sh\nexit 0\n", "utf8");
+chmodSync(path.join(T4_INSTALL, "codearts"), 0o755);
+const SCRIPT_CFG: BridgeConfig = loadConfig(
+  { stateDir: "/nonexistent/runner-t4", installDir: T4_INSTALL },
+  {},
+);
+
+interface T4Child extends PtyChild {
+  writes: string[];
+  isAlive: boolean;
+  die(): void;
+}
+
+function makeT4Child(pid: number): T4Child {
+  let cb: ((chunk: string) => void) | null = null;
+  const c: T4Child = {
+    pid,
+    writes: [],
+    isAlive: true,
+    onData(fn) {
+      cb = fn;
+    },
+    write(d) {
+      c.writes.push(d);
+    },
+    kill() {
+      c.isAlive = false;
+    },
+    alive() {
+      return c.isAlive;
+    },
+    die() {
+      c.isAlive = false;
+    },
+  };
+  return c;
+}
+
+interface ScriptHarness {
+  transport: CodeartsTransport;
+  audits: AuditEvent[];
+  deps: RunnerDeps;
+  state: GoalState;
+  children: T4Child[];
+  advance(ms: number): void;
+}
+
+function makeScriptHarness(): ScriptHarness {
+  const children: T4Child[] = [];
+  const transport = createScriptTransport({
+    spawnPty(): PtyChild {
+      const c = makeT4Child(600000 + children.length);
+      children.push(c);
+      return c;
+    },
+  });
+  const audits: AuditEvent[] = [];
+  let t = 1_000_000;
+  const state: GoalState = {
+    goalId: "g-script",
+    objective: "实现登录页",
+    verify: [],
+    phase: "active",
+    rounds: 0,
+    steps: [],
+    strikes: 0,
+    injected: [],
+    lastProgressAt: t,
+  };
+  const deps: RunnerDeps = {
+    clock: { now: () => t },
+    transport,
+    audit: (e) => audits.push(e as AuditEvent),
+    log: () => undefined,
+    thresholds: { stallSeconds: 60, retryCapSeconds: 60, strikes: 3, echoGuardMs: 3000 },
+    cfg: SCRIPT_CFG,
+  };
+  return {
+    transport,
+    audits,
+    deps,
+    state,
+    children,
+    advance: (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
+/** 注入可拒绝的传输替身（② 状态失真回归用）：failNext 置位后下一次 inject 显式抛错。 */
+class RejectingInjectTransport extends FakeTransport {
+  failNext = false;
+  override async inject(ref: SessionRef, text: string): Promise<void> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new BridgeError("INJECT_REJECTED", "模拟传输拒绝注入（真机 INJECT_TEXT 场景同型）");
+    }
+    return super.inject(ref, text);
+  }
+}
+
+describe("修复环第 1 轮（真机 T4-02 五缺陷）", () => {
+  it("③ 一次 restart 后不再连续 restart（时钟推进两 tick 断言）：死会话 → 重建活会话 + 契约重发", async () => {
+    const h = makeScriptHarness();
+    const r = new GoalRunner(h.state, h.deps);
+    await r.tick(); // 引导：child0 + 契约注入
+    expect(h.children.length).toBe(1);
+    h.children[0]!.die(); // 进程死（模拟外部 kill -9）
+    h.advance(1_000);
+    await r.tick(); // restart：销毁残留 → 重建 child1 + 重发契约
+    expect(h.audits.filter((e) => e.type === "goal.restart").length).toBe(1);
+    expect(h.children.length).toBe(2);
+    expect(await h.transport.alive(r.state().session!)).toBe(true);
+    // 时钟推进两 tick：不再连续 restart（风暴期症状 = 每 tick 一次 restart/tick-failed）
+    h.advance(5_000);
+    await r.tick();
+    h.advance(5_000);
+    await r.tick();
+    expect(h.audits.filter((e) => e.type === "goal.restart").length).toBe(1);
+    expect(h.children.length).toBe(2); // 无新 spawn
+  });
+
+  it("⑤ 死会话 resume：先按重建路径复活会话 → 注入续跑契约 → phase=active（不再永久失败）", async () => {
+    const h = makeHarness();
+    const r = await boot(h);
+    const ref = r.state().session!;
+    r.pause();
+    await h.transport.stop(ref); // 暂停期间会话死亡
+    await r.resume();
+    expect(r.state().phase).toBe("active");
+    expect(await h.transport.alive(r.state().session!)).toBe(true);
+    expect(h.transport.injections.length).toBe(2); // 契约 + 重建后契约/续跑注入
+    expect(ofType(h, "goal.restart").length).toBe(1); // 死会话走重建路径（审计可溯）
+  });
+
+  it("② 注入被传输拒绝 → 状态零失真：injected 指纹回滚、rounds 不变、无 goal.inject 审计", async () => {
+    const h = makeHarness();
+    const rt = new RejectingInjectTransport();
+    h.deps.transport = rt;
+    h.transport = rt;
+    const r = await boot(h); // bootstrap 注入成功
+    expect(rt.injections.length).toBe(1);
+    rt.failNext = true;
+    h.advance(61_000);
+    await expect(r.tick()).rejects.toBeInstanceOf(BridgeError); // nudge 注入被拒 → 显式上抛
+    expect(r.state().rounds).toBe(1); // 回滚：rounds 不变（真机缺陷②"注入被拒仍 rounds+1"回归断言）
+    expect(rt.injections.length).toBe(1); // 无注入留痕
+    expect(h.audits.filter((e) => e.type === "goal.inject").length).toBe(1); // 仅 bootstrap 一条
   });
 });

@@ -483,6 +483,24 @@ describe("R-s5 事件→信号映射", () => {
     expect(snap.meta.alive).toBe(true); // 回合结束 ≠ 会话死亡（可续接新回合）
     expect(snap.meta.lastExit).toEqual({ code: 0, signal: null });
   });
+
+  it("raw 封顶（终审修复波 F1）：超限输出丢弃最旧字节保留最新 512KB 尾部；meta.rawDroppedBytes 如实计数（审计可见，非静默）", async () => {
+    const ctx = makeCtx();
+    const fake = makeFakeExec();
+    const t = createStructuredTransport(fake.exec);
+    const ref = await t.start(ctx.cfg);
+    await t.inject(ref, "p");
+    const p = fake.procs[0]!;
+    const big = "x".repeat(600 * 1024);
+    p.emitLine(JSON.stringify({ type: "message.part", part: { text: big } }));
+    p.emitLine('{"type":"message.part","part":{"text":"TAIL-MARK"}}');
+    p.exit(0, null);
+    const snap = await t.snapshot(ref);
+    expect(Buffer.byteLength(snap.raw, "utf8")).toBeLessThanOrEqual(512 * 1024);
+    expect(snap.raw.endsWith("TAIL-MARK\n")).toBe(true); // 以尾部内容结尾（尾滚动）
+    // 精确对账：累积总量（600K 文本 + 每条 \n + 10B 尾标）− cap = 丢弃量
+    expect(snap.meta.rawDroppedBytes).toBe(600 * 1024 + 1 + 10 - 512 * 1024);
+  });
 });
 
 /* ═══════ classifyError（R-s5 纯函数） ═══════ */
@@ -535,7 +553,7 @@ describe("R-s4 并发与生命周期", () => {
     expect(fake.procs[0]!.killed).toBe(1);
   });
 
-  it("stop 后：inject → SESSION_NOT_ALIVE；start(ref) → SESSION_NOT_ALIVE（stop 为会话终态）", async () => {
+  it("stop 后：inject → SESSION_NOT_ALIVE（终态拒绝注入）；start(ref) → 重建活会话（③ 裁定：可再发起新回合）", async () => {
     const ctx = makeCtx();
     const fake = makeFakeExec();
     const t = createStructuredTransport(fake.exec);
@@ -544,10 +562,24 @@ describe("R-s4 并发与生命周期", () => {
     fake.procs[0]!.exit(0, null);
     await t.stop(ref);
     await expectBridgeError(() => t.inject(ref, "q"), "SESSION_NOT_ALIVE");
-    await expectBridgeError(() => t.start(ctx.cfg, ref), "SESSION_NOT_ALIVE");
+    const ref2 = await t.start(ctx.cfg, ref); // ③：重建（终态复位）
+    expect(ref2).toEqual(ref);
+    expect(await t.alive(ref2)).toBe(true);
+    await t.inject(ref2, "r"); // 重建后可发起新回合
+    expect(fake.calls.length).toBe(2);
   });
 
-  it("未知 ref（未注册 / kind 不符）→ 各方法 SESSION_UNKNOWN", async () => {
+  it("④ alive 布尔查询：未知 ref / kind 不符 → false（不抛错）", async () => {
+    const ctx = makeCtx();
+    const t = createStructuredTransport(makeFakeExec().exec);
+    await t.start(ctx.cfg);
+    const ghost: SessionRef = { kind: "structured", id: "structured-999" };
+    const wrongKind: SessionRef = { kind: "pty", id: "structured-1" };
+    await expect(t.alive(ghost)).resolves.toBe(false);
+    await expect(t.alive(wrongKind)).resolves.toBe(false);
+  });
+
+  it("未知 ref（未注册 / kind 不符）→ 各方法 SESSION_UNKNOWN；alive 除外（④ 布尔查询）", async () => {
     const ctx = makeCtx();
     const t = createStructuredTransport(makeFakeExec().exec);
     await t.start(ctx.cfg);
@@ -556,7 +588,6 @@ describe("R-s4 并发与生命周期", () => {
     await expectBridgeError(() => t.inject(ghost, "x"), "SESSION_UNKNOWN");
     await expectBridgeError(() => t.inject(wrongKind, "x"), "SESSION_UNKNOWN");
     expectSyncBridgeError(() => t.observe(ghost), "SESSION_UNKNOWN");
-    await expectBridgeError(() => t.alive(ghost), "SESSION_UNKNOWN");
     await expectBridgeError(() => t.stop(ghost), "SESSION_UNKNOWN");
     await expectBridgeError(() => t.snapshot(ghost), "SESSION_UNKNOWN");
   });

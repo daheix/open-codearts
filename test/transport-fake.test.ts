@@ -70,7 +70,7 @@ describe("FakeTransport.start / 会话生命周期", () => {
     expect(t.kind).toBe("structured");
   });
 
-  it("start 带 ref：复用已知 session（返回同一 ref、复活 alive）；未知 ref 显式抛 SESSION_UNKNOWN", async () => {
+  it("start 带 ref：复用已知 session（返回同一 ref、复活 alive）；未知 ref → 采纳为新会话（③ 跨守护对账对齐）", async () => {
     const t = new FakeTransport();
     const ref = await t.start(CFG);
     await t.stop(ref);
@@ -80,9 +80,12 @@ describe("FakeTransport.start / 会话生命周期", () => {
     expect(again).toEqual(ref);
     expect(await t.alive(ref)).toBe(true);
 
+    // ③：未知但形态合法的 ref = 跨守护重启对账语义（与真实传输对齐）：采纳为新会话
     const ghost: SessionRef = { kind: "pty", id: "fake-999" };
-    // async 方法（alive）的未知 ref 以 rejection 形态显式报错；observe 的同步抛见下方"未知 ref"用例
-    await expect(t.alive(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
+    const adopted = await t.start(CFG, ghost);
+    expect(adopted).toEqual(ghost);
+    expect(await t.alive(ghost)).toBe(true);
+    await expect(t.inject(ghost, "x")).resolves.toBeUndefined(); // 采纳后可注入
   });
 });
 
@@ -114,13 +117,13 @@ describe("FakeTransport.inject 注入留痕（R-tr3-②）", () => {
     expect(t.injections.map((i) => i.text)).toEqual(["活着"]);
   });
 
-  it("inject/observe/stop/snapshot 对未知 ref 一律显式抛 SESSION_UNKNOWN", async () => {
+  it("inject/observe/stop/snapshot 对未知 ref 一律显式抛 SESSION_UNKNOWN；alive 除外（④ 布尔查询 → false）", async () => {
     const t = new FakeTransport();
     const ghost: SessionRef = { kind: "pty", id: "nope" };
     await expect(t.inject(ghost, "x")).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
     await expect(t.stop(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
     await expect(t.snapshot(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
-    await expect(t.alive(ghost)).rejects.toMatchObject({ code: "SESSION_UNKNOWN" });
+    await expect(t.alive(ghost)).resolves.toBe(false); // ④：布尔查询不抛错
     expect(() => t.observe(ghost)).toThrow(BridgeError);
   });
 });

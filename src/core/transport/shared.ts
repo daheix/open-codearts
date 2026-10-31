@@ -20,6 +20,11 @@
  * （script 为同步 child.alive() + onData 独立生产者；tmux 为异步 has-session
  * 探测 + 生成器体内轮询 capture-pane 生产者），**不做**提取——按 R-tm5 的
  * "否则最小重复实现"处理，两宿主各自实现并互相标注来源。
+ *
+ * 终审修复波 F1（2026-10-31）：新增会话 raw 封顶尾缓冲（CappedTailBuffer /
+ * SESSION_RAW_CAP_BYTES / capRawTail）——三传输（structured/script/tmux）共享
+ * 的桥接侧内存收口（内存要求③），三宿主一致语义：raw 只保留最新 512KB 尾部，
+ * 丢弃量以 rawDroppedBytes 计数暴露于 snapshot().meta（审计可见，非静默）。
  */
 
 import { accessSync, constants, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
@@ -263,4 +268,94 @@ export function armLogTailer(
   if (current !== null) rearmFileWatcher(current);
 
   return tailer;
+}
+
+/* ───── 会话 raw 封顶尾缓冲（终审修复波 F1，2026-10-31） ───── */
+
+/**
+ * 会话 raw 缓冲字节上限（512KB）。守护长驻下会话 raw 若无限累积，桥接侧 RSS
+ * 单调增长（终审实证 raw 无消费者、仅调试快照用）；封顶后最坏占用恒为 cap。
+ */
+export const SESSION_RAW_CAP_BYTES = 512 * 1024;
+
+/**
+ * 封顶尾缓冲（F1 唯一真相源）：按追加序累积文本，总量（UTF-8 字节）超过
+ * cap 时丢弃**最旧**字节、保留最新 ≤cap 字节（尾滚动）；累计丢弃字节数经
+ * droppedBytes 暴露（snapshot.meta.rawDroppedBytes，审计可见非静默）。
+ *
+ * 实现纪律：
+ * - 块列表累积（追加 O(1)）；裁剪先整块丢弃、边界块内按**码点**粒度裁剪——
+ *   永不劈开代理对/多字节字符（slice 落在码点边界，UTF-8 重编码无损）；
+ * - 字节口径统一 Buffer.byteLength(·, "utf8")（与"512KB 内存"的语义一致，
+ *   非 UTF-16 code unit 数）；
+ * - 本类不做任何兜底/吞错：纯内存结构，无失败路径。
+ */
+export class CappedTailBuffer {
+  readonly #cap: number;
+  #chunks: string[] = [];
+  #bytes = 0;
+  #dropped = 0;
+
+  constructor(cap: number = SESSION_RAW_CAP_BYTES) {
+    this.#cap = cap;
+  }
+
+  /** 追加一段输出（空串为无操作）；超限即时裁剪，#bytes 恒 ≤ max(cap, 单块字节)。 */
+  append(text: string): void {
+    if (text === "") return;
+    this.#chunks.push(text);
+    this.#bytes += Buffer.byteLength(text, "utf8");
+    this.#trim();
+  }
+
+  /** 当前保留的尾部内容（拼接一次；≤ cap 字节）。 */
+  value(): string {
+    return this.#chunks.join("");
+  }
+
+  /** 累计丢弃的最旧字节数（snapshot.meta.rawDroppedBytes）。 */
+  get droppedBytes(): number {
+    return this.#dropped;
+  }
+
+  /** 超限裁剪：先整块丢（不改边界），末块码点粒度精确裁到 cap。 */
+  #trim(): void {
+    while (this.#bytes > this.#cap) {
+      const head = this.#chunks[0]!;
+      const headBytes = Buffer.byteLength(head, "utf8");
+      if (this.#chunks.length > 1 && this.#bytes - headBytes >= this.#cap) {
+        // 整块丢弃后仍 ≥ cap：安全整丢（不触码点边界）
+        this.#chunks.shift();
+        this.#bytes -= headBytes;
+        this.#dropped += headBytes;
+        continue;
+      }
+      // 边界块（或单块超限）：只丢超出部分，码点对齐防劈开字符
+      const excess = this.#bytes - this.#cap;
+      let removed = 0;
+      let cut = 0;
+      for (const ch of head) {
+        if (removed >= excess) break;
+        removed += Buffer.byteLength(ch, "utf8");
+        cut += ch.length;
+      }
+      this.#chunks[0] = head.slice(cut);
+      this.#bytes -= removed;
+      this.#dropped += removed;
+    }
+  }
+}
+
+/**
+ * 一次性封顶（无状态场景：tmux capture-pane 快照等非累积 raw）：返回按
+ * SESSION_RAW_CAP_BYTES 尾保留的内容与本次丢弃字节数。语义与 CappedTailBuffer
+ * 单次 append 逐字一致（同一实现路径，无第二真相源）。
+ */
+export function capRawTail(
+  text: string,
+  cap: number = SESSION_RAW_CAP_BYTES,
+): { raw: string; droppedBytes: number } {
+  const buf = new CappedTailBuffer(cap);
+  buf.append(text);
+  return { raw: buf.value(), droppedBytes: buf.droppedBytes };
 }

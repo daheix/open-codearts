@@ -668,9 +668,10 @@ describe("codearts_run 工具接线（server 层）", () => {
     expect(payload.status).toBe("cancelled");
   });
 
-  it("错误路径（R-t1）：续接未知会话 → SESSION_UNKNOWN 结构化 error content", async () => {
+  it("错误路径（R-t1）：续接非法会话引用（kind 不符）→ SESSION_UNKNOWN 结构化 error content；同 kind 未知 ref 按修复环③裁定采纳重建（不报错）", async () => {
     root = mkdtempSync(path.join(TMP_ROOT, "exec-err-"));
     const spy = makeBuildTransportSpy();
+    const tr = spy.transport as FakeTransport;
     const added = await setupTools({
       configOverrides: { stateDir: path.join(root, "state"), installDir: path.join(root, "installers"), transport: "pty", ptyHost: "script" },
       buildTransport: spy.build,
@@ -678,12 +679,23 @@ describe("codearts_run 工具接线（server 层）", () => {
     });
     const run = added.find((t) => t.name === "run")!;
     const result = await run.execute(
-      { prompt: "hi", session: { kind: "pty", id: "ghost" } },
+      { prompt: "hi", session: { kind: "structured", id: "ghost" } },
       { sessionID: "s", messageID: "m", id: "t" } satisfies FakeToolCtx,
     );
     const payload = JSON.parse(result.content[0]!.text) as { error?: { code?: string } };
     expect(payload.error?.code).toBe("SESSION_UNKNOWN");
     expect(result.content[1]!.text).toContain("SESSION_UNKNOWN");
+    // 修复环③（2026-10-31）：同 kind 的未知 ref = 跨守护对账采纳语义——start
+    // 采纳重建并正常驱动（不再 SESSION_UNKNOWN；错误映射由 kind 不符路径承载）
+    const runPromise = run.execute(
+      { prompt: "hi", session: { kind: "pty", id: "adopted-1" } },
+      { sessionID: "s", messageID: "m", id: "t" } satisfies FakeToolCtx,
+    );
+    const adopted = await injectedRef(tr);
+    expect(adopted.id).toBe("adopted-1");
+    tr.emit(adopted, "done");
+    await runPromise;
+    expect(tr.injections.some((i) => i.ref.id === "adopted-1")).toBe(true);
   });
 
   it("输入校验（R-t1）：空 prompt / timeoutMs=0 → TOOL_INPUT_INVALID error content", async () => {

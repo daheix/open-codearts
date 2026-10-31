@@ -135,6 +135,25 @@ function recordingExec(child: PtyChild) {
   };
 }
 
+/** 多子进程 exec 记录器：每次 spawnPty 产出新 fake child（修复环裁定③ 重建语义测试用）。 */
+function multiChildExec() {
+  const children: FakeChild[] = [];
+  const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
+  return {
+    children,
+    calls,
+    exec: {
+      spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild {
+        calls.push({ args, env });
+        const c = makeFakeChild();
+        c.pid = 500000 + children.length;
+        children.push(c);
+        return c;
+      },
+    },
+  };
+}
+
 /** 真实 spawn：经 nodeScriptSpawnPty 以 script(1) 包装 bash fixture（离线本地）。 */
 function realExec(scenario?: string): { exec: { spawnPty(args: string[], env: NodeJS.ProcessEnv): PtyChild } } {
   const cmd = `bash ${shQuote(FIXTURE)}${scenario ? ` --scenario ${scenario}` : ""}`;
@@ -286,18 +305,75 @@ describe("createScriptTransport.start / R-p5 argv 形态", () => {
     expect(calls[0]!.args![2]).toBe(shQuote(path.join(spaced, "codearts")));
   });
 
-  it("start 复用：存活会话幂等返回同 ref；已死会话显式 SESSION_NOT_ALIVE；未知 ref 显式 SESSION_UNKNOWN", async () => {
-    const child = makeFakeChild();
-    const t = makeTransport(recordingExec(child).exec);
+  it("start 复用：存活会话幂等返回同 ref；已死会话 → 同名重建（③）；未知 ref → 跨守护采纳重建（③）；非法 ref 显式拒绝", async () => {
+    const h = multiChildExec();
+    const t = makeTransport(h.exec);
     const ref = await t.start(CFG);
     const again = await t.start(CFG, ref);
     expect(again).toEqual(ref);
+    expect(h.children.length).toBe(1); // 存活幂等：不重复 spawn
 
-    child.die();
-    await expect(t.start(CFG, ref)).rejects.toMatchObject({ code: "SESSION_NOT_ALIVE" });
-    await expect(t.alive({ kind: "pty", id: "script-999" })).rejects.toMatchObject({
+    h.children[0]!.die();
+    const rebuilt = await t.start(CFG, ref); // ③：已死同名会话 → 重建活会话
+    expect(rebuilt).toEqual(ref);
+    expect(await t.alive(rebuilt)).toBe(true);
+    expect(h.children.length).toBe(2);
+
+    const adopted = await t.start(CFG, { kind: "pty", id: "script-42" }); // ③：跨守护重启（未知 ref）→ 采纳重建
+    expect(adopted.id).toBe("script-42");
+    expect(await t.alive(adopted)).toBe(true);
+
+    // 非法 ref（kind 不符 / 空 id）：显式拒绝，零 spawn
+    const before = h.calls.length;
+    await expect(t.start(CFG, { kind: "structured", id: "script-1" })).rejects.toMatchObject({
       code: "SESSION_UNKNOWN",
     });
+    await expect(t.start(CFG, { kind: "pty", id: "" })).rejects.toMatchObject({
+      code: "SESSION_UNKNOWN",
+    });
+    expect(h.calls.length).toBe(before);
+  });
+});
+
+describe("修复环第 1 轮（真机 T4-02 缺陷③④）：死会话重建与 alive 布尔契约", () => {
+  it("③ 已死会话 start(ref) 重建细节：新 child 承载新生命期（raw/队列清空、pid 更新）；已死 child 无残余可补杀", async () => {
+    const h = multiChildExec();
+    const t = makeTransport(h.exec);
+    const ref = await t.start(CFG);
+    h.children[0]!.emit("旧生命期输出");
+    h.children[0]!.die(); // 外部杀进程（非 stop）：child 已死，无进程组残留
+    const ref2 = await t.start(CFG, ref);
+    expect(ref2).toEqual(ref);
+    expect(h.children[0]!.killCalls).toBe(0); // 已死进程不补杀（存活守卫：仅残余进程才组杀）
+    expect(h.children.length).toBe(2);
+    h.children[1]!.emit("fresh");
+    const snap = await t.snapshot(ref2);
+    expect(snap.raw).toBe("fresh"); // 旧输出不属新生命期（与 tmux 同名重建同口径）
+    expect(snap.meta.pid).toBe(h.children[1]!.pid);
+    expect(snap.meta.alive).toBe(true);
+  });
+
+  it("③ 重建回传前自检：spawn 后 child 即刻死亡 → PTY_START_FAILED 显式报错（不回传死 ref）", async () => {
+    const h = multiChildExec();
+    const t = makeTransport(h.exec);
+    const ref = await t.start(CFG);
+    // 替换 spawn 行为：下一 spawn 直接产出已死 child（模拟 wrapper 启动即崩）
+    h.exec.spawnPty = (args, env) => {
+      const c = makeFakeChild();
+      c.die();
+      return c;
+    };
+    h.children[0]!.die();
+    await expect(t.start(CFG, ref)).rejects.toMatchObject({ code: "PTY_START_FAILED" });
+  });
+
+  it("④ alive 是布尔查询：未知 ref → false（不抛错）；已 stop ref → false（不抛错）", async () => {
+    const t = makeTransport(multiChildExec().exec);
+    await expect(t.alive({ kind: "pty", id: "script-999" })).resolves.toBe(false); // 守护重启对账必经路径
+    await expect(t.alive({ kind: "structured", id: "script-1" })).resolves.toBe(false); // kind 不符亦 false
+    const ref = await t.start(CFG);
+    await t.stop(ref);
+    await expect(t.alive(ref)).resolves.toBe(false);
   });
 });
 
@@ -316,13 +392,19 @@ describe("R-p1 两段式注入", () => {
     expect(child.writes).toEqual(["继续", "\r"]);
   });
 
-  it("inject 文本含 \\r 或 \\n → INJECT_TEXT_MULTILINE 显式报错且不写任何字节", async () => {
+  it("② 多行注入（修复环裁定② 2026-10-31）：多行文本合法——整块一次性写入（TUI 粘贴语义）→ 120ms → 独立 \\r 提交", async () => {
     const child = makeFakeChild();
-    const t = makeTransport(recordingExec(child).exec);
+    const { exec } = recordingExec(child);
+    const order: string[] = [];
+    const clock = async (ms: number): Promise<void> => {
+      order.push(`clock:${ms}`);
+    };
+    const t = makeTransport(exec, { clock });
     const ref = await t.start(CFG);
-    await expect(t.inject(ref, "a\rb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
-    await expect(t.inject(ref, "a\nb")).rejects.toMatchObject({ code: "INJECT_TEXT_MULTILINE" });
-    expect(child.writes).toEqual([]);
+    const text = "【/goal 契约】\n目标：实现登录页\n步骤协议：[GOAL-STEP n/N] …";
+    await t.inject(ref, text);
+    expect(child.writes).toEqual([text, "\r"]); // 整块写入 + 独立提交（两段式时序保留）
+    expect(order).toEqual(["clock:120"]);
   });
 
   it("inject 对未知 ref → SESSION_UNKNOWN；对已 stop 会话 → SESSION_NOT_ALIVE 且不写", async () => {
@@ -595,6 +677,19 @@ describe("snapshot / alive", () => {
       log: { available: false, file: null, serviceLines: 0 },
     });
     expect(await t.alive(ref)).toBe(true);
+  });
+
+  it("raw 封顶（终审修复波 F1）：超限 PTY 输出丢弃最旧字节保留最新 512KB 尾部；meta.rawDroppedBytes 如实计数", async () => {
+    const child = makeFakeChild();
+    const t = makeTransport(recordingExec(child).exec);
+    const ref = await t.start(CFG);
+    child.emit("y".repeat(600 * 1024));
+    child.emit("TAIL-MARK");
+    const snap = await t.snapshot(ref);
+    expect(Buffer.byteLength(snap.raw, "utf8")).toBeLessThanOrEqual(512 * 1024);
+    expect(snap.raw.endsWith("TAIL-MARK")).toBe(true); // 以尾部内容结尾（尾滚动）
+    // 精确对账：累积总量（600K + 9B 尾标）− cap = 丢弃量
+    expect(snap.meta.rawDroppedBytes).toBe(600 * 1024 + 9 - 512 * 1024);
   });
 
   it("serviceLines 计数与 log 可用性在观察后如实反映", async () => {

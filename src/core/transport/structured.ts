@@ -3,9 +3,11 @@
  *
  * 职责：CodeartsTransport 的结构化通道实现——**每回合 = 一个独立
  * `<installDir>/bin/codearts run <prompt> --format json --print-logs` 进程**
- * （回合进程退出即回合结束，内核内存每回合归零——痛点②治理主路径；会话连续性
- * 经 `--session <id>` 续接）。契约唯一真相源为 types.ts；本文件实现其全部六方法，
- * 并对齐 T2-01 FakeTransport 的可观测语义（T3-03 监督状态机可迁移基准）。
+ * （回合进程退出即回合结束，**codearts 内核**内存每回合归零——回合=独立进程，
+ * 痛点②治理主路径；桥接侧会话缓冲另有 512KB 封顶与丢弃计数，见 F1/rawBuf；
+ * 会话连续性经 `--session <id>` 续接）。契约唯一真相源为 types.ts；本文件实现
+ * 其全部六方法，并对齐 T2-01 FakeTransport 的可观测语义（T3-03 监督状态机
+ * 可迁移基准）。
  *
  * 主控裁定对照（2026-10-31，逐条落实）：
  * - R-s1 回合=进程：inject(ref, prompt) 即发起新回合——spawn argv 一律数组传递
@@ -45,6 +47,10 @@
  *   classifyError(line)：ECONNRESET / timeout / 429 / 503 → "retryable"；
  *   认证失败 → "fatal"（**优先于 retryable**——凭据缺失重试无意义，须人工配置）；
  *   其余 → undefined。子串宽容匹配（面向 T3 重试策略的分类线索，非解析器）。
+ * - F1（终审修复波 2026-10-31）会话 raw 封顶：rawBuf 只保留最新
+ *   SESSION_RAW_CAP_BYTES（512KB）尾部（尾滚动），丢弃量以 meta.rawDroppedBytes
+ *   如实计数（审计可见，非静默）；按"会话"累计口径不变——跨回合不重置、
+ *   stop 重建留痕不丢，仅在会话生命期内封顶（shared.ts CappedTailBuffer）。
  *
  * 设计裁决（实现者决策，供评审）：
  * - 签名：`createStructuredTransport(exec)`——plan 卡写 `(cfg, exec, aksk?)`，
@@ -61,7 +67,9 @@
  *   产 error 信号但**不**宣告会话死亡（监督层可续接新回合重试，T3 依赖此语义；
  *   与 PTY 宿主"进程死=会话死"的固有差异源于回合=进程模型）。
  * - stop 为会话终态（closed）：终止活跃回合进程组、观察终止（不产 done）、
- *   后续 inject/start(ref) 显式 SESSION_NOT_ALIVE（与 PTY 宿主终态语义一致）。
+ *   后续 inject 显式 SESSION_NOT_ALIVE；start(ref) 对终态会话 = 重建活会话
+ *   （修复环裁定③ 2026-10-31：codeartsSessionId 保留、回合账清零、滞留信号
+ *   清空——死 ref 重启风暴治理，与 PTY 双宿主同源裁定）。
  * - stdout/stderr 合并为同一行流（按到达序）；每流独立 StringDecoder（多字节
  *   跨 chunk 完整还原）；进程退出时冲刷残段（stdout 先于 stderr）——最后一行
  *   无换行符的事件不丢失。
@@ -86,7 +94,7 @@ import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { readAksk, type Aksk, type BridgeConfig } from "../config";
 import { BridgeError } from "../errors";
-import { lookPath } from "./shared";
+import { CappedTailBuffer, lookPath } from "./shared";
 import type {
   CodeartsTransport,
   ObserveOptions,
@@ -268,8 +276,12 @@ interface StructSession {
   roundSeq: number;
   /** 最近一次回合退出信息（snapshot.meta.lastExit）。 */
   lastExit: ProcExit | null;
-  /** raw 缓冲：output/error 信号 text 按序累积（每条后接 \n；与消费无关）。 */
-  raw: string;
+  /**
+   * raw 缓冲（F1 封顶尾缓冲）：output/error 信号 text 按序累积（每条后接 \n；
+   * 与消费无关）；只保留最新 SESSION_RAW_CAP_BYTES 尾部，丢弃量见 rawDroppedBytes
+   * （snapshot.meta），丢弃不静默。
+   */
+  rawBuf: CappedTailBuffer;
   /** 待消费信号队列（事件行 / 回合终局信号）。 */
   queue: Signal[];
   /** observe 挂起等待者（wakeAll 唤醒后自旋复查状态）。 */
@@ -347,21 +359,21 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
             ? ((part as Record<string, unknown>).text as string)
             : null;
         const text = partText ?? (typeof ev.text === "string" ? ev.text : line);
-        s.raw += `${text}\n`;
+        s.rawBuf.append(`${text}\n`);
         s.queue.push({ t: "output", at: Date.now(), text });
         wakeAll(s);
         return;
       }
       if (type === "error") {
         const text = typeof ev.message === "string" ? ev.message : line;
-        s.raw += `${text}\n`;
+        s.rawBuf.append(`${text}\n`);
         s.queue.push({ t: "error", at: Date.now(), text });
         wakeAll(s);
         return;
       }
       // 其余 JSON 对象：落到下方原文 output（宽容不丢弃）
     }
-    s.raw += `${line}\n`;
+    s.rawBuf.append(`${line}\n`);
     s.queue.push({ t: "output", at: Date.now(), text: line });
     wakeAll(s);
   }
@@ -391,9 +403,16 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
       if (ref !== undefined) {
         const s = requireSession(ref);
         if (s.closed) {
-          throw new BridgeError("SESSION_NOT_ALIVE", `会话已停止，不可复用：id=${ref.id}`, {
-            remediation: "structured 会话 stop 后为终态；请新建会话（start 不带 ref）。",
-          });
+          // 修复环裁定③（2026-10-31）：已亡（stop 终态）同名会话 = 重建活会话，
+          // 不再永久拒绝（runner.restartLocked / 对账路径传死 ref 必须得到活会话，
+          // 否则 5s 周期 restart→tick-failed 风暴，真机演练 A 实证）。重建语义：
+          // 终态复位 + 回合账清零（活跃回合进程已由 stop 组杀，无残留可清理）+
+          // 终态期滞留信号清空（不属新生命期，与 tmux 同名重建同口径）；
+          // codeartsSessionId 保留——`--session` 续接是 structured 固有的断点
+          // 续跑通道，重建不抹除对话连续性；raw/roundSeq/lastExit 账目留痕不丢。
+          s.closed = false;
+          s.round = null;
+          s.queue.length = 0;
         }
         s.cfg = cfg; // 刷新绑定配置与凭据（下一回合装配用最新值）
         s.aksk = aksk;
@@ -409,7 +428,7 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
         round: null,
         roundSeq: 0,
         lastExit: null,
-        raw: "",
+        rawBuf: new CappedTailBuffer(),
         queue: [],
         waiters: [],
         observer: null,
@@ -468,7 +487,7 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
         } else {
           // 回合失败：error 信号（会话不死亡——可续接新回合，见 alive() 语义注）
           const detail = `回合进程异常退出：code=${exit.code} signal=${exit.signal ?? "null"}`;
-          s.raw += `${detail}\n`;
+          s.rawBuf.append(`${detail}\n`);
           s.queue.push({ t: "error", at: Date.now(), text: detail });
         }
         wakeAll(s);
@@ -540,7 +559,12 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
     async alive(ref: SessionRef): Promise<boolean> {
       // structured 语义：会话可接受新回合即"存活"（回合进程存活状态见
       // snapshot.meta.activeRound/lastExit；回合失败不宣告会话死亡）。
-      return !requireSession(ref).closed;
+      // 修复环裁定④（2026-10-31）：alive 是布尔查询——未知 / kind 不符 ref
+      // 一律 false（不抛错），守护重启对账凭 false 走重建路径（与 PTY 双宿主
+      // 同源裁定；本宿主跨守护 ref 采纳经 start(ref) 重建）。
+      const s = ref.kind === kind ? sessions.get(ref.id) : undefined;
+      if (s === undefined) return false;
+      return !s.closed;
     },
 
     async stop(ref: SessionRef): Promise<void> {
@@ -557,8 +581,9 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
     async snapshot(ref: SessionRef): Promise<{ raw: string; meta: Record<string, unknown> }> {
       const s = requireSession(ref);
       return {
-        // raw = output/error 信号文本按序累积（每条后接 \n）；step/done 不入 raw
-        raw: s.raw,
+        // raw = output/error 信号文本按序累积（每条后接 \n；step/done 不入 raw）；
+        // F1 封顶：只保留最新 512KB 尾部，丢弃量见 meta.rawDroppedBytes
+        raw: s.rawBuf.value(),
         meta: {
           id: s.ref.id,
           kind: s.ref.kind,
@@ -567,6 +592,7 @@ export function createStructuredTransport(exec: StructuredExec): CodeartsTranspo
           activeRound: s.round !== null && !s.round.exitSeen,
           rounds: s.roundSeq,
           lastExit: s.lastExit === null ? null : { ...s.lastExit },
+          rawDroppedBytes: s.rawBuf.droppedBytes,
           alive: !s.closed,
           closed: s.closed,
         },

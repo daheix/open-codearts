@@ -346,6 +346,22 @@ describe("reconcile 对账恢复", () => {
     expect(transport.injections[0]!.text).toBe(buildContract("目标 g1", []));
   });
 
+  it("④③ 跨守护重启（未知 ref）→ alive 布尔契约判死 → 重建路径恢复（守护崩溃循环回归断言）", async () => {
+    // 场景复刻演练 B：守护被杀重启后内存会话表为空，磁盘目标的 session ref 必然
+    // 未知——修复前 alive() 抛 SESSION_UNKNOWN → reconcile 崩溃 → 守护永久下线。
+    const dir = freshDir("reconcile-cross-daemon");
+    const transport = new FakeTransport(); // 新进程：从未见过该 ref
+    await saveGoal(dir, makeState("g1", { session: { kind: "pty", id: "fake-77" }, steps: [1] }));
+    const r = await reconcile(dir, { transport });
+    expect(r.resumed).toEqual(["g1"]);
+    expect(r.blocked).toEqual([]);
+    expect(transport.injections.length).toBe(1);
+    expect(transport.injections[0]!.ref.id).toBe("fake-77"); // 复用旧 ref 重建（断点续跑契约）
+    expect(transport.injections[0]!.text).toBe(buildResumeContract({ objective: "目标 g1", doneSteps: [1] }));
+    const after = (await loadGoals(dir)).goals.find((g) => g.goalId === "g1")!;
+    expect(after.phase).toBe("active");
+  });
+
   it("重建失败 → phase=blocked 落盘 + fatal 审计 + blocked 列表", async () => {
     const dir = freshDir("reconcile-rebuild-fail");
     const transport = new FailingStartTransport();

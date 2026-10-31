@@ -62,10 +62,12 @@ export const DAEMON_HTTP_TIMEOUT_MS = 10_000;
 /** 目标回呼轮询周期（R-g3 固定 30s；导出供测试钉死唯一真相）。 */
 export const GOAL_POLL_INTERVAL_MS = 30_000;
 
-/** R-g2 启动指引（remediation 固定文案；CLI daemon 命令见 src/cli.ts）。 */
+/** R-g2 启动指引（remediation 固定文案；CLI daemon 命令见 src/cli.ts）。
+ * 终审修复波 F2（2026-10-31）：生产常驻指引改为指向已交付能力（T3-07
+ * `service install`：systemd user service + 每分钟 watchdog），不再称"后续任务交付"。 */
 export const DAEMON_START_REMEDIATION =
   "先启动守护进程再重试：bun <本插件包>/src/cli.ts daemon（全局安装可用 codearts-bridge daemon）；" +
-  "生产常驻（systemd 服务自启）由后续任务交付。";
+  "生产常驻请执行 `codearts-bridge service install`（systemd user service + 每分钟 watchdog）。";
 
 /** 守护 HTTP 响应的最小结构面（与全局 fetch 的 Response 结构兼容）。 */
 export interface DaemonHttpResponse {
@@ -471,7 +473,13 @@ const GOAL_START_INPUT_SCHEMA = {
       description: "独立验收命令清单（每条须独立执行并通过；缺省无）",
     },
     workdir: { type: "string", description: "目标工作目录（绝对路径；缺省随守护）" },
-    maxRounds: { type: "integer", minimum: 1, description: "注入轮次上限（缺省守护默认）" },
+    // F3（终审修复波 2026-10-31）：如实表述——当前守护只持久化记录该值，轮次
+    // 上限的消费（到轮强制停止）为路线图项，不夸大为已生效的强制上限。
+    maxRounds: {
+      type: "integer",
+      minimum: 1,
+      description: "目标轮次上限（持久化记录；守护消费为路线图项）",
+    },
     autoNudge: { type: "boolean", description: "逐目标自动续跑覆盖（缺省随宿主配置）" },
   },
   required: ["objective"],

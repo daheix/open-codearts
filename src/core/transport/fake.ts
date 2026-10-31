@@ -19,7 +19,10 @@
  *   start 复用归零（新生命期的确定性起点）。
  *
  * 语义裁决（显式报错，禁静默兜底）：
- * - 未知 ref：全部方法同步抛 `SESSION_UNKNOWN`，不产生任何副作用；
+ * - 未知 ref：inject/observe/stop/snapshot 同步抛 `SESSION_UNKNOWN`，不产生任何
+ *   副作用；alive 为**布尔查询**返回 false、start 采纳未知 ref 为新会话
+ *   （修复环第 1 轮裁定③④，2026-10-31：与真实传输同源对齐——守护重启对账
+ *   必经未知 ref，alive=false 走重建、start(未知 ref)=采纳重建）；
  * - 对非存活会话 inject：抛 `SESSION_NOT_ALIVE` 且不留痕；
  * - 同一 ref 并发第二个 observe：同步抛 `OBSERVER_ACTIVE`（单观察者模型，
  *   消除多消费者争抢信号的歧义；迭代器结束/return/abort 释放后可重新 observe）；
@@ -91,7 +94,29 @@ export class FakeTransport implements CodeartsTransport {
     // cfg 仅满足接口签名；Fake 不读配置、无副作用（R-tr4）。显式标注以示故意。
     void cfg;
     if (ref !== undefined) {
-      const s = this.requireSession(ref);
+      if (ref.kind !== this.kind) {
+        // kind 不符 = 非本传输的引用（与 script/tmux 非法引用同裁决：SESSION_UNKNOWN）
+        throw new BridgeError("SESSION_UNKNOWN", `非法会话引用：kind=${ref.kind} id=${ref.id}`, {
+          remediation: "仅可使用本 transport.start 返回过的 SessionRef。",
+        });
+      }
+      let s = this.sessions.get(ref.id);
+      if (s === undefined) {
+        // 修复环裁定③（2026-10-31）：未知但形态合法的 ref = 跨守护重启对账
+        // 语义（与真实传输对齐）：采纳为新会话（id 保留调用方值）。
+        s = {
+          ref: { ...ref },
+          alive: true,
+          closed: false,
+          pending: [],
+          signalCount: 0,
+          raw: "",
+          atNext: 0,
+          waiters: [],
+          observer: null,
+        };
+        this.sessions.set(ref.id, s);
+      }
       // 复用/恢复语义：复活会话并归零时间线；信号队列、raw 缓冲、注入留痕
       // 一律保留（留痕是审计事实，重启不抹除）。
       s.alive = true;
@@ -191,7 +216,9 @@ export class FakeTransport implements CodeartsTransport {
   }
 
   async alive(ref: SessionRef): Promise<boolean> {
-    return this.requireSession(ref).alive;
+    // 修复环裁定④（2026-10-31）：布尔查询——未知 ref → false（不抛错，
+    // 与真实传输同源对齐；守护重启对账凭 false 走重建路径）。
+    return this.sessions.get(ref.id)?.alive ?? false;
   }
 
   async stop(ref: SessionRef): Promise<void> {

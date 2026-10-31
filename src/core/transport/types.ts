@@ -49,6 +49,12 @@ export interface CodeartsTransport {
   /**
    * 启动（或复用）一个目标会话。ref 缺省创建新会话；传入 start 返回过的 ref
    * 表示复用/恢复该会话（语义由实现定义并注明）。
+   *
+   * 修复环裁定③（2026-10-31）：对已存在但已亡的同名会话（以及跨守护重启后
+   * 未知但形态合法的 ref），实现**必须销毁旧会话残留并新建活会话**（重建语义），
+   * 回传的 ref 必须满足 alive(ref)=true（回传前自检；自检不过显式报错，禁回传
+   * 死 ref）。依据：监督层进程死重建与对账路径都会把持久化的旧 ref 传回 start，
+   * 拒绝复活即制造 restart→tick-failed 重启风暴（真机 T4-02 演练 A 实证）。
    */
   start(cfg: BridgeConfig, ref?: SessionRef): Promise<SessionRef>;
 
@@ -64,7 +70,15 @@ export interface CodeartsTransport {
    */
   observe(ref: SessionRef, opts?: ObserveOptions): AsyncIterable<Signal>;
 
-  /** 会话是否存活。 */
+  /**
+   * 会话是否存活。
+   *
+   * 修复环裁定④（2026-10-31）：alive 是**布尔查询**——未知 / 已终态 / 已消亡
+   * ref 一律返回 false（不抛错）；只有"无法判定"的基础设施错误（如 exec 通道
+   * 崩溃）才抛。依据：守护重启后 reconcile 必经未知 ref（内存会话表为空），
+   * 抛错即 reconcile 上抛 → 守护崩溃循环 = 存在活跃目标时守护被杀永久下线
+   * （真机 T4-02 演练 B 实证）。
+   */
   alive(ref: SessionRef): Promise<boolean>;
 
   /** 停止会话；对已停止会话幂等。 */

@@ -39,6 +39,7 @@ import {
   watchdogProbeCommand,
 } from "../src/cli";
 import type { FetchLike, ServiceDeps } from "../src/cli";
+import type { RunClock } from "../src/core/run";
 
 const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
 const TEST_ROOT = path.join(PLUGIN_ROOT, ".tmp", "service-test");
@@ -666,3 +667,119 @@ describe("CLI 分派（service 命令组）", () => {
     expect(await main(["frobnicate"])).toBe(2);
   });
 });
+
+/* ───── 修复环第 1 轮（真机 T4-02 缺陷①：daemonCommand 生产 verifyRun 接线） ───── */
+
+describe("daemonCommand 生产 verifyRun 装配（①）", () => {
+  it("daemonCommand 装配的 GoalHost 携带 verifyRun：带 verify 目标创建成功（修复前 GOAL_VERIFY_RUN_MISSING）且 done 后经 fake execVerify 验收 → complete（cmd/cwd 透传）", async () => {
+    const { FakeTransport } = await import("../src/core/transport/fake");
+    const port = await freeTcpPort();
+    const stateDir = path.join(TEST_ROOT, "daemon-verify");
+    const cfg = loadConfig({ stateDir, daemonUrl: `http://127.0.0.1:${port}` }, {});
+    const transport = new FakeTransport();
+    const verifyCalls: Array<{ cmd: string[]; cwd?: string }> = [];
+    let sweepFn: (() => Promise<void>) | undefined;
+    const loop = {
+      start(s: () => Promise<void>) {
+        sweepFn = s;
+      },
+      wake() {},
+      stop() {
+        sweepFn = undefined;
+      },
+    };
+    let t = 1_000_000;
+    // RunClock 注入（now + 可取消 delay；本用例假时钟无真延时需求，delay 仅需形态合法）
+    const clock: RunClock = {
+      now: () => t,
+      delay(ms: number) {
+        let handle: ReturnType<typeof setTimeout> | undefined;
+        const promise = new Promise<void>((resolve) => {
+          handle = setTimeout(resolve, ms);
+        });
+        return {
+          promise,
+          cancel: () => {
+            if (handle !== undefined) clearTimeout(handle);
+          },
+        };
+      },
+    };
+    const rcPromise = daemonCommand(
+      cfg,
+      { onReady: () => undefined },
+      {
+        buildTransport: () => transport,
+        loop,
+        clock,
+        execVerify: async (cmd, cwd) => {
+          verifyCalls.push({ cmd, cwd });
+          return { ok: true, out: "OK" };
+        },
+      },
+    );
+    try {
+      const tokenPath = path.join(stateDir, "daemon-token");
+      const deadline = Date.now() + 5000;
+      while (!(await fileExists(tokenPath))) {
+        if (Date.now() > deadline) throw new Error("daemonCommand 启动超时（token 未生成）");
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const token = (await readFile(tokenPath, "utf8")).trim();
+      const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+      // 带 verify + workdir 的目标：生产装配路径（daemonCommand → GoalHost → runner deps）。
+      // 修复前：GoalHost 未接线 verifyRun → 此 POST 即 500 GOAL_VERIFY_RUN_MISSING（真机缺陷①）。
+      const workdir = path.join(TEST_ROOT, "verify-wd");
+      await mkdir(workdir, { recursive: true });
+      const post = await fetch(`http://127.0.0.1:${port}/goals`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({ objective: "制造验收物", verify: ["echo hi"], workdir }),
+      });
+      expect(post.status).toBe(200);
+      const created = (await post.json()) as { goalId: string };
+      await sweepFn?.(); // 引导 tick：建会话 + 契约注入
+      const st0 = (await fetch(`http://127.0.0.1:${port}/goals/${created.goalId}`, { headers: auth }).then((r) =>
+        r.json(),
+      )) as { session?: { id: string }; phase: string };
+      if (st0.session === undefined) throw new Error("引导后 session 应在场");
+      t += 4_000; // 越过回显守卫
+      transport.emit({ kind: "pty", id: st0.session.id }, "output", "完成 [GOAL-DONE]");
+      await sweepFn?.(); // done 核验 → verifyRun（fake execVerify）→ complete
+      const st1 = (await fetch(`http://127.0.0.1:${port}/goals/${created.goalId}`, { headers: auth }).then((r) =>
+        r.json(),
+      )) as { phase: string };
+      expect(st1.phase).toBe("complete");
+      expect(verifyCalls).toEqual([{ cmd: ["echo", "hi"], cwd: workdir }]); // cmd/cwd 逐字透传（裁定①）
+    } finally {
+      // 收尾：SIGTERM → daemonCommand 优雅停止（其处理器已注册，默认终止被接管）
+      process.kill(process.pid, "SIGTERM");
+      const rc = await Promise.race([
+        rcPromise,
+        new Promise<number>((_, rej) => setTimeout(() => rej(new Error("daemonCommand 未在限期优雅停止")), 5000)),
+      ]);
+      expect(rc).toBe(0);
+    }
+  }, 20000);
+
+  it("execVerify 生产缺省实现（真执行冒烟）：echo 通过 / 非零退出显式 ok=false", async () => {
+    const { execVerify } = await import("../src/cli");
+    const ok = await execVerify(["/bin/echo", "verify-ok"], undefined);
+    expect(ok.ok).toBe(true);
+    expect(ok.out).toContain("verify-ok");
+    const fail = await execVerify(["/bin/false"], undefined);
+    expect(fail.ok).toBe(false);
+    const missing = await execVerify(["/nonexistent/codearts-bridge-no-such-cmd"], undefined);
+    expect(missing.ok).toBe(false); // spawn 失败 = 验收未过（显式失败，非静默）
+  });
+});
+
+/** 文件存在性探测（轮询启动就绪用）。 */
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}

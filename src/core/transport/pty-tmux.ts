@@ -24,12 +24,18 @@
  * - R-tm3 inject 两段式：`send-keys -t <target> <text>` 与
  *   `send-keys -t <target> Enter` 为两次独立调用且保序；文本段加 `-l`
  *   （字面文本——否则 "C-c"/"F1" 等会被 tmux 解释为键名，Enter 段刻意不加
- *   -l 以发送键）；多行文本显式拒绝（与 T2-02 同码 INJECT_TEXT_MULTILINE）。
+ *   -l 以发送键）；多行文本合法（修复环裁定② 2026-10-31：契约天然多行，
+ *   -l 字面整块发送 + Enter 提交，原 INJECT_TEXT_MULTILINE 拒绝分支已删；
+ *   回退开关登记：若真机复验发现 TUI 逐行提前提交致契约截断，回退为注入前
+ *   \n→空格 单行扁平化，与 pty-script 同步登记）。
  *   不设 120ms 时延窗口：send-keys 为 tmux 服务器侧原子操作，两次独立调用
  *   的次序由服务器保证（v0.2.6 教训针对的是单块写入被粘贴识别吞回车）。
  * - R-tm4 stop/alive/snapshot：stop=`kill-session -t <target>`（不存在→幂等，
  *   复查 has-session 证实后标记 closed，非字符串匹配 stderr）；alive=
  *   `has-session` 退出码；snapshot=`capture-pane -p -t <target>`（含 meta）。
+ *   alive 为**布尔查询**（修复环裁定④ 2026-10-31）：未知/kind 不符 ref 一律
+ *   false（不抛错）——守护重启后 reconcile 必经未知 ref 路径，false 使其走
+ *   tmux 既有同名重建对账语义而非崩溃（与 pty-script 修复环④同源）。
  * - R-tm5 共享提取：日志 tailer/lookPath/shQuote/时钟类型提取至 shared.ts
  *   （pty-script.ts 同步改为 import，行为与测试零改动）；观察循环骨架因两宿主
  *   探测/生产机制差异不做提取，最小重复并标注来源。
@@ -66,7 +72,10 @@
  *   语义由会话队列跨观察持久承担（测试钉死）。pane 捕获在 observe() 返回后
  *   才异步进行（tmux 探测为异步），故存活校验发生在首次 next（显式
  *   SESSION_NOT_ALIVE，与 script 的同步抛错时点差异已注明）。
- * - snapshot.raw = 即时 capture-pane 输出；会话亡故 → raw=""（无 pane 可捕获）。
+ * - snapshot.raw = 即时 capture-pane 输出（F1 终审修复波：桥接侧快照按
+ *   SESSION_RAW_CAP_BYTES（512KB）尾保留，丢弃量见 meta.rawDroppedBytes——pane
+ *   全量仍由 tmux history 自身持有，本封顶只收口桥接侧内存）；会话亡故 →
+ *   raw=""（无 pane 可捕获）。
  * - 一次性 done 语义：observe 期间会话外部消亡 → 产一次 done 后迭代结束
  *   （对齐 script 进程自然退出）；本传输 stop() 终止则不产 done（与 Fake 同态）。
  *
@@ -86,7 +95,7 @@ import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { BridgeConfig } from "../config";
 import { BridgeError } from "../errors";
-import { armLogTailer, lookPath, shQuote, type PtyClock } from "./shared";
+import { armLogTailer, capRawTail, lookPath, shQuote, type PtyClock } from "./shared";
 import type {
   CodeartsTransport,
   ObserveOptions,
@@ -400,13 +409,10 @@ export function createTmuxTransport(
     async inject(ref: SessionRef, text: string): Promise<void> {
       const s = requireSession(ref);
       await assertAlive(s, ref);
-      if (text.includes("\r") || text.includes("\n")) {
-        throw new BridgeError(
-          "INJECT_TEXT_MULTILINE",
-          `注入文本含换行符（长度=${text.length}），与两段式提交契约冲突`,
-          { remediation: "单行文本注入；多行内容分行多次 inject，每段单独提交。" },
-        );
-      }
+      // 修复环裁定②：多行文本合法（目标契约天然多行）——-l 字面整块发送
+      // （换行符随字面文本进入 pane），Enter 段独立提交（两段式保序不变）。
+      // 回退开关登记：TUI 逐行提前提交致契约截断时回退 \n→空格 扁平化
+      // （与 pty-script 同步，见该文件修复环②条目）。
       // R-tm3：两段独立调用且保序；文本段 -l 字面发送，Enter 段发键（见文件头）
       const r1 = await exec.run(["send-keys", "-l", "-t", s.target, text]);
       await ensureSent(r1, s, ref);
@@ -495,7 +501,9 @@ export function createTmuxTransport(
     },
 
     async alive(ref: SessionRef): Promise<boolean> {
-      const s = requireSession(ref);
+      // 修复环裁定④：布尔查询——未知 / kind 不符 ref → false（不抛错）。
+      if (ref.kind !== kind || !sessions.has(ref.id)) return false;
+      const s = sessions.get(ref.id) as TmuxSession;
       if (s.closed) return false;
       return hasSessionName(s.target); // R-tm4：alive = has-session 退出码
     },
@@ -519,6 +527,7 @@ export function createTmuxTransport(
       const s = requireSession(ref);
       const alive = !s.closed && (await hasSessionName(s.target));
       let raw = "";
+      let rawDroppedBytes = 0;
       if (alive) {
         const r = await exec.run(["capture-pane", "-p", "-t", s.target]); // R-tm4
         if (r.exitCode !== 0) {
@@ -527,10 +536,15 @@ export function createTmuxTransport(
             `capture-pane 失败（退出码 ${r.exitCode}）：${r.stderr.trim()}`,
           );
         }
-        raw = r.stdout;
+        // F1（终审修复波）：桥接侧快照封顶尾保留（tmux history 仍持全量，非静默——
+        // 丢弃量如实入 meta）
+        const capped = capRawTail(r.stdout);
+        raw = capped.raw;
+        rawDroppedBytes = capped.droppedBytes;
       }
       return {
-        // raw = 即时 capture；会话亡故无 pane 可捕获 → 空串（meta.alive 如实标注）
+        // raw = 即时 capture（512KB 尾封顶）；会话亡故无 pane 可捕获 → 空串
+        //（meta.alive 如实标注）
         raw,
         meta: {
           id: s.ref.id,
@@ -539,6 +553,7 @@ export function createTmuxTransport(
           target: s.target,
           alive,
           closed: s.closed,
+          rawDroppedBytes,
           log: { ...s.log },
         },
       };
