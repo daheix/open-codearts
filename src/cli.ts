@@ -75,6 +75,11 @@ import type { CodeartsTransport } from "./core/transport/types";
 import { GOAL_SWEEP_INTERVAL_MS, GoalHost, defaultTickLoop } from "./daemon-goals";
 import type { TickLoop } from "./daemon-goals";
 import { createDaemon, daemonPidPath } from "./daemon";
+import { doctorCommand as doctorReport } from "./core/doctor";
+import { SELF_UPGRADE_GATE_MAX_OUTPUT_BYTES, SELF_UPGRADE_GATE_TIMEOUT_MS, selfUpgrade } from "./core/selfupgrade";
+import { uninstallCommand } from "./core/uninstaller";
+import type { UninstallDeps } from "./core/uninstaller";
+import { upgradeCli } from "./core/upgrade";
 
 const USAGE = `用法: codearts-bridge <命令>
 
@@ -86,6 +91,14 @@ const USAGE = `用法: codearts-bridge <命令>
   service status     查看单元在场性与运行状态（stdout JSON）
   service uninstall  卸载单元（只删本插件单元，不动其他单元）
   watchdog-probe     watchdog 探测（systemd timer 每分钟调用；连续 2 次无响应重启守护）
+  doctor             环境体检八项（opencode/bun/codearts CLI/凭据/systemd/守护/磁盘/网络）
+                     ✓/⚠/✗ + 修复指引；尾部输出结构化 JSON；--json 仅 JSON；✗→退出码 1
+  self-upgrade       bridge 自升级（git fetch→reset --hard origin/main→门禁→守护重启；
+                     失败自动回滚备份提交；--skip-tests/--skip-typecheck 可跳门禁）
+  upgrade-cli        codearts CLI 受控升级（探测→无更新即已最新→否则官方包受控升级，
+                     失败零损坏）
+  uninstall          卸载接线（opencode 自动加载入口 + systemd 单元；默认保留状态目录
+                     与 codearts CLI；--purge 清状态目录；非交互须 --yes）
   help               打印本帮助`;
 
 /** status 命令的探活超时（R-d5 固定 3s；导出供测试引用同一真相）。 */
@@ -651,6 +664,95 @@ export async function watchdogProbeCommand(cfg: BridgeConfig = loadConfig(), dep
   }
 }
 
+/* ───── T4-05：doctor / self-upgrade / upgrade-cli / uninstall 命令 ───── */
+
+/** 门禁与 git/systemctl 命令的生产缺省 Exec（self-upgrade 门禁可达数十秒）。 */
+function gateExec(): Exec {
+  return createNodeExec({ timeoutMs: SELF_UPGRADE_GATE_TIMEOUT_MS, maxOutputBytes: SELF_UPGRADE_GATE_MAX_OUTPUT_BYTES });
+}
+
+/** doctor 命令：环境体检八项（--json 仅结构化输出）；退出码=聚合判定（✗→1）。 */
+export async function doctorCliCommand(argv: readonly string[], cfg: BridgeConfig = loadConfig()): Promise<number> {
+  const json = argv.includes("--json");
+  return doctorReport(cfg, {}, { json });
+}
+
+/** self-upgrade 命令：安全自升级（--skip-tests/--skip-typecheck 跳门禁）。 */
+export async function selfUpgradeCliCommand(
+  argv: readonly string[],
+  cfg: BridgeConfig = loadConfig(),
+): Promise<number> {
+  let result;
+  try {
+    result = await selfUpgrade(
+      cfg,
+      { exec: gateExec() },
+      { skipTests: argv.includes("--skip-tests"), skipTypecheck: argv.includes("--skip-typecheck") },
+    );
+  } catch (e) {
+    const be = e instanceof BridgeError ? e : undefined;
+    printCliError(
+      be?.code ?? "SELF_UPGRADE_FAILED",
+      `self-upgrade 失败：${e instanceof Error ? e.message : String(e)}`,
+      be?.remediation,
+    );
+    return 1;
+  }
+  console.log(JSON.stringify(result, null, 2));
+  return 0;
+}
+
+/** upgrade-cli 命令：codearts CLI 受控升级（探测→无更新→受控升级，失败零损坏）。 */
+export async function upgradeCliCommand(cfg: BridgeConfig = loadConfig()): Promise<number> {
+  try {
+    const result = await upgradeCli(cfg, { exec: gateExec() });
+    console.log(JSON.stringify(result, null, 2));
+    return 0;
+  } catch (e) {
+    const be = e instanceof BridgeError ? e : undefined;
+    printCliError(
+      be?.code ?? "UPGRADE_CLI_FAILED",
+      `codearts CLI 升级失败：${e instanceof Error ? e.message : String(e)}`,
+      be?.remediation,
+    );
+    return 1;
+  }
+}
+
+/** uninstall 命令参数解析结果。 */
+interface UninstallArgs {
+  yes: boolean;
+  purge: boolean;
+}
+
+/** 解析 uninstall 参数；未知参数显式报错（禁静默忽略）。 */
+function parseUninstallArgs(argv: readonly string[]): UninstallArgs | undefined {
+  const args: UninstallArgs = { yes: false, purge: false };
+  for (const a of argv) {
+    if (a === "--yes") args.yes = true;
+    else if (a === "--purge") args.purge = true;
+    else {
+      printCliError("CLI_ARG_INVALID", `uninstall 未知参数 "${a}"（仅支持 --yes/--purge）`);
+      return undefined;
+    }
+  }
+  return args;
+}
+
+/** uninstall 命令：卸载接线（默认保留状态目录与 codearts CLI）。 */
+export async function uninstallCliCommand(
+  argv: readonly string[],
+  cfg: BridgeConfig = loadConfig(),
+): Promise<number> {
+  const args = parseUninstallArgs(argv);
+  if (args === undefined) return 2;
+  const deps: UninstallDeps = {
+    exec: createNodeExec({ timeoutMs: 30_000 }),
+    serviceUninstall: serviceUninstallCommand,
+  };
+  return uninstallCommand(cfg, deps, { yes: args.yes, purge: args.purge });
+}
+
 /** CLI 命令分派（返回退出码；仅 import.meta.main 时由底部出口真正 exit）。 */
 export async function main(argv: readonly string[]): Promise<number> {
   const cmd = argv[0];
@@ -678,6 +780,18 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
   if (cmd === "watchdog-probe") {
     return watchdogProbeCommand(loadConfig());
+  }
+  if (cmd === "doctor") {
+    return doctorCliCommand(argv.slice(1));
+  }
+  if (cmd === "self-upgrade") {
+    return selfUpgradeCliCommand(argv.slice(1));
+  }
+  if (cmd === "upgrade-cli") {
+    return upgradeCliCommand(loadConfig());
+  }
+  if (cmd === "uninstall") {
+    return uninstallCliCommand(argv.slice(1));
   }
   console.error(`codearts-bridge: 未知命令 "${cmd}"\n${USAGE}`);
   return 2;

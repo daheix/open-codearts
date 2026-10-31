@@ -59,6 +59,7 @@ import {
   appendInstallAudit,
   binPathOf,
   detectVersion,
+  probeInstall,
   statOrEnoent,
   type Exec,
   type ExecResult,
@@ -614,4 +615,33 @@ export async function upgradeInstall(
       await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
+}
+
+/* ───── upgradeCli（T4-05：受控升级的"开箱"封装） ───── */
+
+/** upgradeCli 结果：无更新（already-latest）或完整受控升级结果（语义继承 UpgradeResult）。 */
+export type UpgradeCliResult =
+  | { action: "already-latest"; version: string }
+  | ({ action: "upgraded" } & UpgradeResult);
+
+/**
+ * codearts CLI 受控升级封装（T4-05 §D 薄封装）：
+ * 1. probeInstall 探测当前安装（只读快照）；
+ * 2. fetcher.latest() 取官方清单；
+ * 3. 当前版本与清单一致（在场且可解析）→ already-latest，零下载零部署；
+ * 4. 否则 → upgradeInstall 受控升级（锚定同一清单版本，防两次调用间清单漂移；
+ *    失败零损坏语义——下载/校验/解压/自检任何失败都不触碰现有安装——完整继承）。
+ *
+ * 未安装（present=false）不属"无更新"：直接走受控升级完成首次安装（开箱形态）。
+ * 审计由 upgradeInstall 内部落账（install.jsonl 单一审计流），本封装零额外审计。
+ */
+export async function upgradeCli(cfg: BridgeConfig, deps: UpgradeDeps): Promise<UpgradeCliResult> {
+  const status = await probeInstall(cfg, { exec: deps.exec });
+  const fetcher = deps.fetcher ?? httpFetcher;
+  const release = await fetcher.latest();
+  if (status.present && status.version !== undefined && status.version === release.version) {
+    return { action: "already-latest", version: release.version };
+  }
+  const result = await upgradeInstall(cfg, deps, { version: release.version });
+  return { action: "upgraded", ...result };
 }

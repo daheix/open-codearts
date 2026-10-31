@@ -12,14 +12,18 @@ opencode V2 插件（薄壳）+ 核心库 + 守护进程：为 CodeArts CLI 提�
 
 ```
 plugins/codearts-bridge/
+├── install.sh          # 安装引导（幂等；接线/守护/质量门/体检）
+├── uninstall.sh        # 卸载引导（转调 codearts-bridge uninstall）
 ├── package.json        # name: codearts-bridge；exports["."/"./server"] → src/server.ts
 ├── tsconfig.json       # strict + moduleResolution bundler + bun-types
 ├── index.ts            # 目录加载兼容入口（见下"加载方式（实测）"）
 ├── plugin/index.ts     # 裸目录 shim（备用入口，实测注释）
 ├── src/
 │   ├── server.ts       # opencode 插件入口：Plugin.define + codearts_status 冒烟工具
-│   └── core/config.ts  # 全局常量（PLUGIN_ID / TOOL_NAMESPACE / 版本）
-└── test/server.test.ts # bun:test：插件形状 + 工具注册 + execute 行为
+│   ├── cli.ts          # CLI：daemon/service/doctor/self-upgrade/upgrade-cli/uninstall
+│   └── core/           # config/install/upgrade/doctor/selfupgrade/uninstaller/service/
+│                       # health/fsx/run/transport/goal（核心库）
+└── test/               # bun:test 全量用例（含 install.sh 沙箱 HOME 集成）
 ```
 
 ## 常用命令
@@ -29,6 +33,32 @@ bun install          # 安装依赖（@opencode/plugin 2.2.3 钉版）
 bun test             # 单元测试
 bun run typecheck    # tsc --noEmit
 ```
+
+## 给别人安装（三行）
+
+```bash
+git clone https://github.com/daheix/open-codearts && cd open-codearts
+bash install.sh                 # 缺 bun 自动装；接线 opencode；默认装 systemd 守护；跑质量门
+codearts-bridge doctor          # 体检（等价：bun src/cli.ts doctor）
+```
+
+- `install.sh` 幂等可重跑；常用参数：`--no-daemon`（跳过 systemd 守护）、
+  `--state-dir <绝对路径>`（自定义状态根）、`--help`。
+- install.sh 不安装 codearts CLI（独立产品）：`bun src/cli.ts upgrade-cli` 一键安装/升级；
+  凭据配置见下文 AK/SK 节（或 `codearts login` 后用登录态）。
+- 卸载：`bash uninstall.sh --yes`（默认保留 `~/.codearts-bridge` 数据与 codearts CLI；
+  `--purge` 连状态目录一并清除）。
+
+## 升级
+
+| 组件 | 命令 | 说明 |
+|------|------|------|
+| bridge 自身 | `codearts-bridge self-upgrade` | `git fetch` → 有更新则 `reset --hard origin/main` → bun install（lock 变更时）→ typecheck+test 门 → 守护重启 → /health 验证；**失败自动回滚备份提交**（记录在 `<stateDir>/self-upgrade-backup.json`）。`--skip-tests`/`--skip-typecheck` 可跳门禁 |
+| codearts CLI | `codearts-bridge upgrade-cli` | 官方 release-info → 已最新即返回 → 否则受控升级（哈希校验/原子部署/复验/旧版转备份，失败零损坏） |
+| opencode | 官方渠道 | 兼容矩阵：≥2.1 支持 V2 插件（本插件硬性要求）；2.1.4 走项目级 `plugin` 键+目录路径；**2.2.5 起推荐全局自动加载目录** `~/.config/opencode/plugins/*.ts`（install.sh 的接线形态，`exports` 被采用、热加载生效） |
+
+`codearts-bridge doctor` 可随时体检八项组件状态（opencode/bun/codearts CLI/凭据/
+systemd 单元/守护 /health/磁盘占用/官方端点网络），任何 ✗ 退出码非 0。
 
 ## 插件契约
 
