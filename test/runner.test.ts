@@ -400,7 +400,7 @@ describe("done 双过验收", () => {
     const r = await boot(h);
     const ref = r.state().session!;
     h.advance(4_000); // 过守卫窗
-    h.transport.emit(ref, "output", "全部完成 [GOAL-DONE]");
+    h.transport.emit(ref, "output", "全部完成\n[GOAL-DONE]");
     await r.tick();
     expect(h.verifyCalls).toEqual([["bun", "test"]]); // argv 切分
     expect(r.state().phase).toBe("complete");
@@ -444,12 +444,12 @@ describe("回显守卫与 feed 顺序", () => {
     const h = makeHarness({ verify: ["bun test"] });
     const r = await boot(h);
     const ref = r.state().session!;
-    h.transport.emit(ref, "output", "已完成 [GOAL-DONE]");
+    h.transport.emit(ref, "output", "已完成\n[GOAL-DONE]");
     await r.tick(); // 注入后 3s 内
     expect(h.verifyCalls.length).toBe(0); // 守卫作废
     expect(r.state().phase).toBe("active");
     h.advance(3_100); // 过守卫窗
-    h.transport.emit(ref, "output", "已完成 [GOAL-DONE]");
+    h.transport.emit(ref, "output", "已完成\n[GOAL-DONE]");
     await r.tick();
     expect(h.verifyCalls.length).toBe(1); // 真实申报生效
     expect(r.state().phase).toBe("complete");
@@ -640,7 +640,7 @@ describe("quiesce 同块连推多信号（T3-05 集成发现回归）", () => {
     const ref = r.state().session!;
     h.advance(4000); // 越过回显守卫窗口
     h.transport.emit(ref, "output", "[GOAL-STEP 1/1] 完成 | 推荐方案: x");
-    h.transport.emit(ref, "output", "全部完成 [GOAL-DONE]");
+    h.transport.emit(ref, "output", "全部完成\n[GOAL-DONE]");
     await r.tick(); // 同一 tick：步进标记落地 + done 申报 + 双过核验
     expect(r.state().phase).toBe("complete");
     // 1/1 标记 = 当前步语义（C++ steps[i].done：n 号标记把 1..n-1 记完成）→ 无完成步
@@ -655,7 +655,7 @@ describe("quiesce 同块连推多信号（T3-05 集成发现回归）", () => {
     for (let i = 1; i <= 5; i++) {
       h.transport.emit(ref, "output", `chunk-${i} 文本${i}`);
     }
-    h.transport.emit(ref, "output", "done [GOAL-DONE]");
+    h.transport.emit(ref, "output", "done\n[GOAL-DONE]");
     await r.tick();
     expect(r.state().phase).toBe("complete"); // done 未迟到（6 信号全消费）
   });

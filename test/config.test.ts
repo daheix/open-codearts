@@ -39,10 +39,10 @@ describe("loadConfig 默认值", () => {
     expect(cfg.installDir).toBe(path.join(homedir(), ".codeartsdoer", "installers"));
     expect(cfg.daemonUrl).toBe("http://127.0.0.1:4577");
     expect(cfg.thresholds).toEqual({
-      stallSeconds: 60,
+      stallSeconds: 240,
       retryCapSeconds: 60,
       strikes: 3,
-      echoGuardMs: 3000,
+      echoGuardMs: 45000,
     });
     // akskFile 默认由解析后的 stateDir 派生：<stateDir>/config.env
     expect(cfg.akskFile).toBe(path.join(homedir(), ".codearts-bridge", "config.env"));
@@ -56,7 +56,7 @@ describe("loadConfig 默认值", () => {
     const a = loadConfig({}, {});
     a.thresholds.stallSeconds = 999;
     const b = loadConfig({}, {});
-    expect(b.thresholds.stallSeconds).toBe(60);
+    expect(b.thresholds.stallSeconds).toBe(240);
   });
 });
 
@@ -137,7 +137,7 @@ describe("loadConfig 非法输入显式报错（禁静默兜底）", () => {
             stallSeconds: -1,
             retryCapSeconds: 60,
             strikes: 3,
-            echoGuardMs: 3000,
+            echoGuardMs: 45000,
           },
         },
         {},

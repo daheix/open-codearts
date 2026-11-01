@@ -118,20 +118,33 @@ export function copyExtract(
  * 文件缺失/无标记 → 非零退出码（对应真实"无法执行/解析失败"，detectVersion 转 undefined）。
  */
 export function contentVersionExec(calls: string[][]): Exec {
+  const probe = async (p: string): Promise<{ code: number; stdout: string; stderr: string } | null> => {
+    let text: string;
+    try {
+      text = await readFile(p, "utf8");
+    } catch {
+      return null;
+    }
+    const match = /VERSION=(\d+\.\d+\.\d+)/.exec(text);
+    if (match === null) return null;
+    return { code: 0, stdout: `${match[1]}\n`, stderr: "" };
+  };
   return {
     run: async (cmd: string[]) => {
       calls.push(cmd);
       const target = cmd[0];
       if (target === undefined) return { code: 1, stdout: "", stderr: "empty cmd" };
-      let text: string;
-      try {
-        text = await readFile(target, "utf8");
-      } catch {
-        return { code: 127, stdout: "", stderr: `cannot open ${target}` };
+      const self = await probe(target);
+      if (self !== null) return self;
+      // wrapper 委托语义（2026-11-01 热修同源）：官方入口脚本自身无版本标记，
+      // 版本来自其 exec 的引擎——fake 按部署布局探测同目录引擎候选，
+      // 与生产 wrapper 置好环境后 exec 引擎的行为同构。
+      const dir = path.dirname(target);
+      for (const rel of ["bin/codearts", "bin/agentkernel", "agentkernel"]) {
+        const delegated = await probe(path.join(dir, rel));
+        if (delegated !== null) return delegated;
       }
-      const match = /VERSION=(\d+\.\d+\.\d+)/.exec(text);
-      if (match === null) return { code: 1, stdout: "", stderr: "no version marker" };
-      return { code: 0, stdout: `${match[1]}\n`, stderr: "" };
+      return { code: 1, stdout: "", stderr: "no version marker" };
     },
   };
 }

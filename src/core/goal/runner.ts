@@ -852,8 +852,14 @@ export class GoalRunner {
    * parseProgress 不外露 N，task-15 M61 口径；CONTINUE_PROMPT 常量承载核心语义）。
    */
   private continueText(): string {
+    // 运维热修（2026-11-01）：重建/续跑会话原先只收 33 字短文本，新会话没有
+    // 契约全文，模型只能满世界翻 .goal_state.json 找上下文。此处重申目标全文
+    // 与验收命令，保证任何续跑会话都自包含。
     return (
       "【/goal 继续】对话已中断，目标不变、进度保留。\n" +
+      "目标全文（重申，本会话唯一契约）：\n" +
+      `${this.st.objective}\n` +
+      `验收命令（全部通过才算完成，勿自行改判）：${[...(this.st.verify ?? [])].join(" && ")}\n` +
       `请**${CONTINUE_PROMPT}**，不要重新开始：直接从下一步按协议输出 ` +
       "[GOAL-STEP n/N] <步骤> | 推荐方案: …，全部完成后输出 [GOAL-DONE]。\n"
     );

@@ -198,10 +198,12 @@ describe("T1-05 upgradeInstall（happy path，R-up9 收尾语义）", () => {
     expect(deps.downloads[0]?.dest).toBe(path.join(stagingDirOf(fx), "package.tar.gz"));
     expect(deps.extracts.length).toBe(1);
     expect(deps.extracts[0]?.destDir).toBe(path.join(stagingDirOf(fx), "extracted"));
+    // 复验口径（2026-11-01 热修）：官方入口 wrapper 优先——第三次 exec 探测的是
+    // 部署后的 wrapper 脚本（fake exec 委托引擎取版本），不再是 bin 本体。
     expect(deps.execCalls).toEqual([
       [fx.binPath, "--version"],
       [path.join(stagingDirOf(fx), "extracted", "bin", "codearts"), "--version"],
-      [fx.binPath, "--version"],
+      [path.join(fx.installDir, "codearts"), "--version"],
     ]);
 
     // 暂存清理（R-up3 临时件清理）

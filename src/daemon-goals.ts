@@ -57,7 +57,7 @@ import { appendAudit, auditFilePath, loadGoals, reconcile, requireValidGoalId, s
 import type { ReconcileResult } from "./core/goal/state";
 import { GoalRunner } from "./core/goal/runner";
 import type { GoalPhase, GoalState, RunnerDeps } from "./core/goal/runner";
-import type { CodeartsTransport } from "./core/transport/types";
+import type { CodeartsTransport, TransportKind } from "./core/transport/types";
 
 /* ───── tick 循环宿主抽象（R-dg1：定时器唯一宿主） ───── */
 
@@ -345,6 +345,55 @@ export class GoalHost {
       strikes: g.strikes,
       objective: g.objective.slice(0, 120),
     }));
+  }
+
+  /**
+   * 视图端点（2026-11-01 用户裁决：非托管 TUI 可在侧栏查看画面）：在册目标的
+   * 会话引用清单（内存 roster，不读磁盘——/goals 的磁盘全量读在守护忙时可达
+   * 秒级，视图轮询路径必须轻量）。仅返回持会话的目标；会话引用不透明，消费方
+   * （dsh-codearts 插件）凭 refId 调 viewSnapshot 取 PTY 输出快照。
+   */
+  listSessions(): Array<{ goalId: string; phase: GoalPhase; ref: { kind: TransportKind; id: string } }> {
+    const out: Array<{ goalId: string; phase: GoalPhase; ref: { kind: TransportKind; id: string } }> = [];
+    for (const [goalId, entry] of this.roster) {
+      const st = entry.runner.state();
+      if (st.session !== undefined) {
+        out.push({ goalId, phase: st.phase, ref: { ...st.session } });
+      }
+    }
+    return out;
+  }
+
+  /** 视图层传输访问器（画面注册表喂入用；只读快照路径，不开放注入）。 */
+  get viewTransport(): CodeartsTransport {
+    return this.deps.transport;
+  }
+
+  /**
+   * 视图端点：按会话引用取输出快照（PTY 输出尾缓冲或结构化会话文本）。
+   * 只读语义：本方法仅读 snapshot，绝不 inject/stop——目标会话由监督循环驱动，
+   * 侧栏画面为只读观察（输入注入仍归守护监督器独占）。
+   * refId 必须归属某个在册目标（防任意引用探测）；未知/非法形态显式 SESSION_UNKNOWN。
+   */
+  async viewSnapshot(refId: string): Promise<{
+    raw: string;
+    meta: Record<string, unknown>;
+    goalId: string;
+    phase: GoalPhase;
+  }> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(refId)) {
+      throw new BridgeError("SESSION_UNKNOWN", `非法会话引用形态：${JSON.stringify(refId.slice(0, 64))}`);
+    }
+    for (const [goalId, entry] of this.roster) {
+      const st = entry.runner.state();
+      if (st.session !== undefined && st.session.id === refId) {
+        const snap = await this.deps.transport.snapshot(st.session);
+        return { raw: snap.raw, meta: snap.meta, goalId, phase: st.phase };
+      }
+    }
+    throw new BridgeError("SESSION_UNKNOWN", `会话引用不属于任何在册目标：${JSON.stringify(refId)}`, {
+      remediation: "仅可查看 GET /tuis 列出的会话。",
+    });
   }
 
   /** 单目标完整状态（在册优先实时，否则读磁盘）。 */

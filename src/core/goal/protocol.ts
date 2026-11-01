@@ -243,7 +243,12 @@ function extractPlanItems(rest: string): string[] {
  */
 export function parseProgress(text: string): ParsedProgress {
   const clean = stripAnsi(text);
-  const done = clean.includes(GOAL_DONE_MARK);
+  // 运维热修（2026-11-01）：契约/验收失败注入文本自身含 "[GOAL-DONE]" 字样，
+  // 全文子串命中会把回显当申报（PTY 折行破坏回显剥离指纹后必误判）。
+  // 改为行级精确匹配：模型按协议申报是独立一行；契约回流行带前缀不命中。
+  const done = clean
+    .split(/\r?\n/)
+    .some((line) => line.trim() === GOAL_DONE_MARK);
 
   const steps: ParsedStep[] = [];
   for (const m of clean.matchAll(GOAL_STEP_RE)) {

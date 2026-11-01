@@ -460,11 +460,11 @@ describe("矩阵1：模型错误连续重试", () => {
     h.transport.emit(ref, "output", "[GOAL-STEP 1/2] 调研 | 推荐方案: A");
     await h.loop.sweepOnce();
     expect(h.transport.injections.length).toBe(5); // 恢复后不再注入
-    h.advance(ECHO_GUARD_MS + 1_000); // 越过回显守卫窗（下同）
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s // 越过回显守卫窗（下同）
     h.transport.emit(ref, "output", "[GOAL-STEP 2/2] 收尾 | 推荐方案: B");
     await h.loop.sweepOnce();
-    h.advance(ECHO_GUARD_MS + 1_000);
-    h.transport.emit(ref, "output", "全部步骤完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "全部步骤完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
 
     const st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
@@ -509,11 +509,11 @@ describe("矩阵2：网络类错误注入", () => {
     }
 
     // 恢复路径：步进 → done → complete
-    h.advance(ECHO_GUARD_MS + 1_000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     h.transport.emit(ref, "output", "[GOAL-STEP 1/1] 联调 | 推荐方案: A");
     await h.loop.sweepOnce();
-    h.advance(ECHO_GUARD_MS + 1_000);
-    h.transport.emit(ref, "output", "完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
 
     const st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
@@ -561,8 +561,8 @@ describe("矩阵3：杀回合进程", () => {
     expect(st["rounds"]).toBe(2); // 契约 + 断点续跑
 
     // 续跑至完成
-    h.advance(ECHO_GUARD_MS + 1_000);
-    h.transport.emit(ref, "output", "完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
     expect(h.transport.injections.length).toBe(2); // 重建后不再注入
     st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
@@ -630,7 +630,7 @@ describe("矩阵4：杀守护", () => {
 
     // 续跑至完成
     hB.advance(ECHO_GUARD_MS + 1_000);
-    hB.transport.emit(ref, "output", "完成 [GOAL-DONE]");
+    hB.transport.emit(ref, "output", "完成\n[GOAL-DONE]");
     await hB.loop.sweepOnce();
     st = (await call(hB.port, "GET", `/goals/${goalId}`, hB.token)).body as Record<string, unknown>;
     expect(st["phase"]).toBe("complete");
@@ -680,15 +680,15 @@ describe("矩阵5：opencode 服务重启（插件重载）", () => {
     expect(await healthOf(h.port)).toMatchObject({ ok: true, actives: 1 });
     let st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
     expect(st["phase"]).toBe("active");
-    h.advance(61_000);
+    h.advance(241_000); // 跨停滞阈值（stallSeconds=240，2026-11-01 热修）
     await h.loop.sweepOnce(); // 守护 sweep 循环仍在驱动（停滞续跑注入）
     expect(h.transport.injections.length).toBe(2);
     expect(h.transport.injections[1]!.text).toContain(CONTINUE_PROMPT);
 
     // 守护生命周期独立于插件重载：继续驱动至完成
-    h.advance(ECHO_GUARD_MS + 1_000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     const ref = h.transport.injections[0]!.ref;
-    h.transport.emit(ref, "output", "完成 [GOAL-DONE]");
+    h.transport.emit(ref, "output", "完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
     st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
     expect(st["phase"]).toBe("complete");
@@ -714,7 +714,7 @@ describe("矩阵6：回显防护", () => {
     expect(h.transport.injections.length).toBe(1); // 未误注入
 
     // (b) 守卫窗外整段契约回显 → stripInjectionEcho 剥离 → 同样不误判
-    h.advance(ECHO_GUARD_MS + 1_000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     h.transport.emit(ref, "output", contract);
     await h.loop.sweepOnce();
     st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
@@ -723,8 +723,8 @@ describe("矩阵6：回显防护", () => {
     expect(h.transport.injections.length).toBe(1);
 
     // (c) 真实完成申报（窗外、非回显文本）→ 双过 → complete
-    h.advance(ECHO_GUARD_MS + 1_000);
-    h.transport.emit(ref, "output", "全部步骤完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "全部步骤完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
     st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
     expect(st["phase"]).toBe("complete");
@@ -756,8 +756,8 @@ describe("矩阵7：双过验收", () => {
     const ref = h.transport.injections[0]!.ref;
 
     // 第一次自报完成 → verify 失败 → 注入失败原因继续（不终止、不 blocked）
-    h.advance(ECHO_GUARD_MS + 1_000);
-    h.transport.emit(ref, "output", "全部完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "全部完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
     let st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
     expect(st["phase"]).toBe("active"); // 验收未过不完成
@@ -768,8 +768,8 @@ describe("矩阵7：双过验收", () => {
     expect(h.transport.injections[1]!.text).toContain("[GOAL-DONE]"); // 驱动再次申报
 
     // 第二次自报 → verify 通过 → complete
-    h.advance(ECHO_GUARD_MS + 1_000);
-    h.transport.emit(ref, "output", "已修复，全部完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "已修复，全部完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
     st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
     expect(st["phase"]).toBe("complete");
@@ -815,7 +815,7 @@ describe("矩阵8：pause/resume/stop 即时生效", () => {
     expect(h.transport.injections[1]!.text).toContain(CONTINUE_PROMPT);
 
     // 进度推进后 stop：终态 + 会话停止 + 出册
-    h.advance(ECHO_GUARD_MS + 1_000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     h.transport.emit(ref, "output", "[GOAL-STEP 1/2] 调研 | 推荐方案: A");
     await h.loop.sweepOnce();
     const stopped = await call(h.port, "POST", `/goals/${goalId}/control`, h.token, { action: "stop" });

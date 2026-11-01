@@ -64,6 +64,7 @@ import { BridgeError } from "./core/errors";
 import { atomicWriteFile, errnoOf } from "./core/fsx";
 import type { ReconcileResult } from "./core/goal/state";
 import type { GoalHost } from "./daemon-goals";
+import { ViewRegistry } from "./core/view-registry";
 
 /** token 文件名（位于状态根，与裁定 <stateDir>/daemon-token 一致；mode 0600）。 */
 const TOKEN_FILE_NAME = "daemon-token";
@@ -426,6 +427,7 @@ export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks, goals?: Goa
   let startedAtMs: number | undefined; // uptime 基准（start 时置位）
   let listening = false; // stop 幂等判据（listen 成功才置 true）
   let startPromise: Promise<{ port: number }> | undefined; // start 幂等复用句柄
+  let views: ViewRegistry | undefined; // 画面状态注册表（start 且 goals 挂载时装配）
 
   /** /goals* 路由分发（goals 宿主已挂载前提；领域逻辑在 GoalHost）。 */
   async function handleGoalRoute(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
@@ -508,6 +510,91 @@ export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks, goals?: Goa
       await handleGoalRoute(req, res, url);
       return;
     }
+    // 视图端点（2026-11-01 用户裁决：非托管 TUI 画面可在侧栏只读查看）：
+    // 只读观察面——不提供任何注入/停止通道，目标驱动权保持在监督循环。
+    if (url.pathname === "/tuis" && req.method === "GET") {
+      if (goals === undefined) {
+        sendJson(res, 501, {
+          error: {
+            code: "GOAL_HOST_DISABLED",
+            message: "守护未挂载目标域宿主（GoalHost），/tuis 端点不可用",
+            remediation: "以 createDaemon(cfg, hooks, goals) 挂载 GoalHost 后启动。",
+          },
+        });
+        return;
+      }
+      const tuis = [];
+      for (const s of goals.listSessions()) {
+        try {
+          const snap = await goals.viewSnapshot(s.ref.id);
+          tuis.push({
+            goalId: s.goalId,
+            phase: s.phase,
+            refId: s.ref.id,
+            kind: typeof snap.meta["kind"] === "string" ? (snap.meta["kind"] as string) : null,
+            pid: typeof snap.meta["pid"] === "number" ? (snap.meta["pid"] as number) : null,
+            alive: snap.meta["alive"] === true,
+            rawLen: snap.raw.length,
+            rawDroppedBytes: typeof snap.meta["rawDroppedBytes"] === "number" ? (snap.meta["rawDroppedBytes"] as number) : 0,
+          });
+        } catch (e) {
+          // 单会话快照失败不拖垮整个清单（其余会话照常列出），错误如实进条目
+          tuis.push({
+            goalId: s.goalId,
+            phase: s.phase,
+            refId: s.ref.id,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      sendJson(res, 200, { ok: true, tuis });
+      return;
+    }
+    if (url.pathname === "/tui/view" && req.method === "GET") {
+      if (goals === undefined) {
+        sendJson(res, 501, {
+          error: {
+            code: "GOAL_HOST_DISABLED",
+            message: "守护未挂载目标域宿主（GoalHost），/tui/view 端点不可用",
+            remediation: "以 createDaemon(cfg, hooks, goals) 挂载 GoalHost 后启动。",
+          },
+        });
+        return;
+      }
+      if (views === undefined) {
+        sendJson(res, 501, {
+          error: {
+            code: "VIEW_REGISTRY_DISABLED",
+            message: "画面状态注册表未装配（仅守护 start 路径装配）",
+            remediation: "经 createDaemon(...).start() 启动守护（测试直调 handler 不会装配）。",
+          },
+        });
+        return;
+      }
+      const refId = url.searchParams.get("ref") ?? "";
+      if (refId === "") {
+        sendJson(res, 400, {
+          error: { code: "GOAL_INPUT_INVALID", message: "缺少 ref 查询参数（会话引用）" },
+        });
+        return;
+      }
+      // ref 必须归属在册目标（防任意引用探测）；喂入增量后序列化当前网格
+      const session = goals.listSessions().find((s) => s.ref.id === refId);
+      if (session === undefined) {
+        throw new BridgeError("SESSION_UNKNOWN", `会话引用不属于任何在册目标：${JSON.stringify(refId)}`, {
+          remediation: "仅可查看 GET /tuis 列出的会话。",
+        });
+      }
+      const rev = await views.feed(session.ref);
+      sendJson(res, 200, {
+        ok: true,
+        refId,
+        rev,
+        rows: views.rowsOf(refId).map(([y, frame]) => [y, frame]),
+        meta: { ...views.metaOf(refId), goalId: session.goalId, phase: session.phase },
+      });
+      return;
+    }
     // 鉴权已通过但无此路由
     sendJson(res, 404, {
       error: { code: "NOT_FOUND", message: `未知路由：${req.method} ${url.pathname}` },
@@ -543,6 +630,12 @@ export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks, goals?: Goa
         );
       }
       startedAtMs = Date.now();
+      if (goals !== undefined) {
+        // 画面状态注册表（2026-11-02）：持续喂入会话 raw 增量，维护可随时序列化的
+        // 屏幕网格（码道 TUI 增量重绘 + rawBuf 512KB 尾截断，重放 raw 无法重建画面）
+        views = new ViewRegistry(goals.viewTransport);
+        views.start(() => goals.listSessions().map((s) => s.ref));
+      }
       await listenOnce(server, port, "127.0.0.1"); // R-d1：绑定地址恒 127.0.0.1
       listening = true;
       // 监听建立后的偶发 socket 错误：显式落 stderr（可见），保持守护存活
@@ -567,6 +660,7 @@ export function createDaemon(cfg: BridgeConfig, hooks?: DaemonHooks, goals?: Goa
   async function stop(): Promise<void> {
     startPromise = undefined; // 允许 stop 后再次 start（重启复用 token 的重启路径）
     goals?.stop(); // 先摘目标 sweep 循环（不再产生 tick）；会话与状态不销毁（重启对账续跑）
+    views?.stop(); // 摘画面网格 ticker 并清状态（start 重建时随新会话重灌）
     if (!listening) {
       // 未启动/已停止：幂等空操作；pidfile 若在本进程 start 失败路径残留，
       // 也按自身声明清除（content 校验使未持有者不会被误删）

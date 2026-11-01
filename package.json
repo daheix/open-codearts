@@ -1,6 +1,6 @@
 {
   "name": "codearts-bridge",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "codearts-bridge：opencode 插件薄壳 + 核心库 + 守护（安装管家/双传输/目标引擎）",
   "type": "module",
   "exports": {
@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode/plugin": "2.2.3"
+    "@opencode/plugin": "2.2.3",
+    "@xterm/headless": "^6.0.0"
   },
   "devDependencies": {
     "@types/bun": "^1.4.4",

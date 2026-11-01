@@ -30,7 +30,7 @@ import { FakeTransport } from "../src/core/transport/fake";
 import { saveGoal } from "../src/core/goal/state";
 import { BridgeError } from "../src/core/errors";
 import type { GoalState } from "../src/core/goal/runner";
-import { CONTINUE_PROMPT } from "../src/core/goal/protocol";
+import { CONTINUE_PROMPT, ECHO_GUARD_MS } from "../src/core/goal/protocol";
 
 /** 插件根目录（test/ 的上一级）。 */
 const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
@@ -225,7 +225,7 @@ describe("POST /goals 全流程到 complete（R-dg1）", () => {
     expect(health["actives"]).toBe(1);
 
     // 步进：第 2 步标记出现 → 第 1 步记完成（回显守卫窗口先越过）
-    h.advance(4000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     const ref = h.transport.injections[0]!.ref;
     h.transport.emit(ref, "output", "[GOAL-STEP 2/2] 收尾联调 | 推荐方案: 先回归主链路");
     await h.loop.sweepOnce();
@@ -236,8 +236,8 @@ describe("POST /goals 全流程到 complete（R-dg1）", () => {
     expect(st["rounds"]).toBe(1);
 
     // AI 自报完成 → 双过核验（verifyRun 恒过）→ complete
-    h.advance(4000);
-    h.transport.emit(ref, "output", "全部步骤完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(ref, "output", "全部步骤完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
 
     st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as Record<string, unknown>;
@@ -283,10 +283,10 @@ describe("control 语义（R-dg2：pause/resume/stop 即时生效）", () => {
     expect(stateOf(r)["phase"]).toBe("paused");
 
     // paused 期间信号与 sweep 都不产生注入
-    h.advance(4000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     const ref = h.transport.injections[0]!.ref;
     h.transport.emit(ref, "output", "[GOAL-STEP 2/2] 任意输出 | 推荐方案: x");
-    h.advance(61_000); // 越过停滞阈值：paused 也不允许 nudge
+    h.advance(241_000); // 跨停滞阈值（stallSeconds=240，2026-11-01 热修） // 越过停滞阈值：paused 也不允许 nudge
     await h.loop.sweepOnce();
     expect(h.transport.injections.length).toBe(1);
 
@@ -330,7 +330,7 @@ describe("control 语义（R-dg2：pause/resume/stop 即时生效）", () => {
     const h = await makeHarness();
     // 直接触发 blocked：error 信号 + refusal 分类（runner fatal 路径）
     const goalId = await createGoal(h);
-    h.advance(4000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     const ref = h.transport.injections[0]!.ref;
     h.transport.emit(ref, "error", "content policy refused");
     await h.loop.sweepOnce();
@@ -432,10 +432,10 @@ describe("并发多目标隔离（R-dg4）", () => {
 
     // B 暂停后 A 继续驱动到完成
     await call(h.port, "POST", `/goals/${b}/control`, h.token, { action: "pause" });
-    h.advance(4000);
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
     h.transport.emit(refA!, "output", "[GOAL-STEP 2/2] 收尾 | 推荐方案: x"); // 2/2 → 步 1 记完成
-    h.advance(4000);
-    h.transport.emit(refA!, "output", "done [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s
+    h.transport.emit(refA!, "output", "done\n[GOAL-DONE]");
     await h.loop.sweepOnce();
 
     const sa = (await call(h.port, "GET", `/goals/${a}`, h.token)).body as Record<string, unknown>;
@@ -510,7 +510,8 @@ describe("守护启动对账接线（R-dg1 落盘构造 / R-st4 不重复注入 
     await loop.sweepOnce();
     expect(transport.injections.length).toBe(1);
     // 越过停滞阈值再 sweep：会话活、无信号 → nudge 注入继续（证明 roster runner 在驱动）
-    t += 61_000;
+    // （stallSeconds=240，2026-11-01 热修——60s 不再构成停滞）
+    t += 241_000;
     await loop.sweepOnce();
     expect(transport.injections.length).toBe(2);
     expect(transport.injections[1]!.text).toContain(CONTINUE_PROMPT);
@@ -524,7 +525,7 @@ describe("autoNudge 接线（R-dg5-①：宿主 cfg 默认 + 逐目标覆盖）"
     const h = await makeHarness({ autoNudge: false });
     const quiet = await createGoal(h);
     expect(h.transport.injections.length).toBe(1);
-    h.advance(61_000);
+    h.advance(241_000); // 跨停滞阈值（stallSeconds=240，2026-11-01 热修）
     await h.loop.sweepOnce();
     expect(h.transport.injections.length).toBe(1); // 停滞不自动续跑
     let st = (await call(h.port, "GET", `/goals/${quiet}`, h.token)).body as Record<string, unknown>;
@@ -534,7 +535,7 @@ describe("autoNudge 接线（R-dg5-①：宿主 cfg 默认 + 逐目标覆盖）"
     const loud = await createGoal(h, { objective: "覆盖目标", autoNudge: true });
     await h.loop.sweepOnce();
     expect(h.transport.injections.length).toBe(2);
-    h.advance(61_000);
+    h.advance(241_000); // 跨停滞阈值（stallSeconds=240，2026-11-01 热修）
     await h.loop.sweepOnce();
     expect(h.transport.injections.length).toBe(3);
     expect(h.transport.injections[2]!.text).toContain(CONTINUE_PROMPT);
@@ -739,8 +740,8 @@ describe("修复环① verifyRun 装配接线", () => {
     await h.loop.sweepOnce(); // 引导：建会话 + 契约注入
     const st0 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
     if (st0.session === undefined) throw new Error("引导后 session 应在场");
-    h.advance(4_000); // 越过回显守卫窗
-    h.transport.emit(st0.session, "output", "完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s // 越过回显守卫窗（新口径 45s） // 越过回显守卫窗
+    h.transport.emit(st0.session, "output", "完成\n[GOAL-DONE]");
     await h.loop.sweepOnce(); // done 核验 → verifyRun 逐条执行 → 双过
     const st1 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
     expect(st1.phase).toBe("complete");
@@ -767,8 +768,8 @@ describe("修复环① verifyRun 装配接线", () => {
     await h.loop.sweepOnce();
     const st0 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
     if (st0.session === undefined) throw new Error("引导后 session 应在场");
-    h.advance(4_000);
-    h.transport.emit(st0.session, "output", "完成 [GOAL-DONE]");
+    h.advance(46_000); // 跨回显守卫窗（thresholds.echoGuardMs=45000，2026-11-01 热修）+1s // 越过回显守卫窗（新口径 45s）
+    h.transport.emit(st0.session, "output", "完成\n[GOAL-DONE]");
     await h.loop.sweepOnce();
     const st1 = (await call(h.port, "GET", `/goals/${created.goalId}`, h.token)).body as GoalState;
     expect(st1.phase).toBe("active"); // 验收未过：继续驱动
@@ -776,5 +777,80 @@ describe("修复环① verifyRun 装配接线", () => {
     expect(h.transport.injections.length).toBe(2); // 契约 + 验收失败重注
     expect(h.transport.injections[1]!.text).toContain("验收未通过");
     expect(h.transport.injections[1]!.text).toContain("断言失败");
+  });
+});
+
+/* ───── 视图端点（/tuis、/tui/view；2026-11-01 用户裁决：非托管 TUI 侧栏只读查看） ───── */
+
+describe("GET /tuis + GET /tui/view（只读画面转发）", () => {
+  it("创建目标并驱动后：/tuis 列出会话（refId/alive/kind/pid）；rawLen 反映输出缓冲", async () => {
+    const h = await makeHarness();
+    const goalId = await createGoal(h); // 引导 tick：建会话 + 注入契约
+    const st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as GoalState;
+    if (st.session === undefined) throw new Error("引导后 session 应在场");
+    h.transport.emit(st.session, "output", "Hello PTY 画面");
+
+    const r = await call(h.port, "GET", "/tuis", h.token);
+    expect(r.status).toBe(200);
+    const body = r.body as { ok: boolean; tuis: Array<Record<string, unknown>> };
+    expect(body.ok).toBe(true);
+    expect(body.tuis).toHaveLength(1);
+    const t = body.tuis[0]!;
+    expect(t["goalId"]).toBe(goalId);
+    expect(t["refId"]).toBe(st.session.id);
+    expect(t["kind"]).toBe("pty");
+    expect(t["alive"]).toBe(true);
+    // Fake 传输无进程句柄：pid 如实为 null（真实 script 传输为 script 进程 pid）
+    expect(t["pid"]).toBeNull();
+    expect(t["rawLen"]).toBeGreaterThan(0);
+  });
+
+  it("GET /tui/view?ref=：返回网格行帧（rev 单调）与归属元数据；输出后续追加可见", async () => {
+    const h = await makeHarness();
+    const goalId = await createGoal(h);
+    const st = (await call(h.port, "GET", `/goals/${goalId}`, h.token)).body as GoalState;
+    if (st.session === undefined) throw new Error("引导后 session 应在场");
+    h.transport.emit(st.session, "output", "第一帧画面");
+
+    const r1 = await call(h.port, "GET", `/tui/view?ref=${st.session.id}`, h.token);
+    expect(r1.status).toBe(200);
+    const b1 = r1.body as { ok: boolean; refId: string; rev: number; rows: Array<[number, string]>; meta: Record<string, unknown> };
+    expect(b1.ok).toBe(true);
+    expect(b1.refId).toBe(st.session.id);
+    expect(b1.rows.map(([, f]) => f).join("")).toContain("第一帧画面");
+    expect(b1.meta["goalId"]).toBe(goalId);
+    expect(b1.rev).toBeGreaterThan(0);
+
+    h.transport.emit(st.session, "output", "第二帧画面");
+    const r2 = await call(h.port, "GET", `/tui/view?ref=${st.session.id}`, h.token);
+    const b2 = r2.body as { rev: number; rows: Array<[number, string]> };
+    expect(b2.rev).toBeGreaterThan(b1.rev);
+    expect(b2.rows.map(([, f]) => f).join("")).toContain("第一帧画面");
+    expect(b2.rows.map(([, f]) => f).join("")).toContain("第二帧画面");
+  }, 20000);
+
+  it("未归属任何在册目标的 ref → 结构化错误（SESSION_UNKNOWN）；缺 ref 参数 → 400", async () => {
+    const h = await makeHarness();
+    await createGoal(h);
+    const bad = await call(h.port, "GET", "/tui/view?ref=fake-999", h.token);
+    expect(bad.status).toBeGreaterThanOrEqual(400);
+    const err = (bad.body as { error?: { code?: string } }).error;
+    expect(err?.code).toBe("SESSION_UNKNOWN");
+
+    const noRef = await call(h.port, "GET", "/tui/view", h.token);
+    expect(noRef.status).toBe(400);
+  });
+
+  it("多目标各持会话：/tuis 全部列出；view 各自归属正确", async () => {
+    const h = await makeHarness();
+    const g1 = await createGoal(h);
+    const g2 = await createGoal(h);
+    const r = await call(h.port, "GET", "/tuis", h.token);
+    const body = r.body as { tuis: Array<{ goalId: string; refId: string }> };
+    expect(body.tuis.map((t) => t.goalId).sort()).toEqual([g1, g2].sort());
+    for (const t of body.tuis) {
+      const v = await call(h.port, "GET", `/tui/view?ref=${t.refId}`, h.token);
+      expect((v.body as { meta: { goalId: string } }).meta.goalId).toBe(t.goalId);
+    }
   });
 });

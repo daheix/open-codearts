@@ -743,8 +743,8 @@ describe("daemonCommand 生产 verifyRun 装配（①）", () => {
         r.json(),
       )) as { session?: { id: string }; phase: string };
       if (st0.session === undefined) throw new Error("引导后 session 应在场");
-      t += 4_000; // 越过回显守卫
-      transport.emit({ kind: "pty", id: st0.session.id }, "output", "完成 [GOAL-DONE]");
+      t += 46_000; // 越过回显守卫（thresholds.echoGuardMs=45000，2026-11-01 热修；4s 不再够）
+      transport.emit({ kind: "pty", id: st0.session.id }, "output", "完成\n[GOAL-DONE]");
       await sweepFn?.(); // done 核验 → verifyRun（fake execVerify）→ complete
       const st1 = (await fetch(`http://127.0.0.1:${port}/goals/${created.goalId}`, { headers: auth }).then((r) =>
         r.json(),

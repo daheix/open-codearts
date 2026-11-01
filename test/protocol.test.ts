@@ -84,9 +84,12 @@ describe("buildContract（源：GoalProtocol::contractPrompt）", () => {
     expect(c.match(/最终验收命令/g)?.length).toBe(1);
   });
 
-  it("【源用例22 前提】契约原文自身含 [GOAL-DONE] 字样——parseProgress 直接解析必置 done（回显守卫存在的原因，钉死）", () => {
+  it("【源用例22 前提·2026-11-01 热修语义】契约原文含 [GOAL-DONE] 字样但为句内出现——行级精确匹配下 parseProgress 不置 done（双保险：回显守卫之外的天然防线）", () => {
     const c = buildContract("目标Z", ["true"]);
-    expect(parseProgress(c).done).toBe(true);
+    // 热修前：全文子串命中 → 契约回显即误判 done（回显守卫存在的原因）。
+    // 热修后：marker 必须独立成行（trim 后全文相等）才置 done——契约内句内
+    // 出现不再命中，即使回显剥离失效也不会误判（回显守卫降级为第二道防线）。
+    expect(parseProgress(c).done).toBe(false);
   });
 });
 
@@ -132,8 +135,12 @@ describe("parseProgress：步骤行与完成标记", () => {
     expect(parseProgress("[GOAL-PLAN] 后面没写清单").plan).toBeUndefined();
   });
 
-  it("【源用例3】[GOAL-DONE] 置 done=true；无标记文本 done=false", () => {
-    expect(parseProgress("[GOAL-DONE] 全部完成").done).toBe(true);
+  it("【源用例3·2026-11-01 热修语义】[GOAL-DONE] 独立成行置 done=true；句内出现/无标记均 false", () => {
+    expect(parseProgress("[GOAL-DONE]\n全部完成").done).toBe(true);
+    expect(parseProgress("全部完成\n[GOAL-DONE]").done).toBe(true);
+    expect(parseProgress("  [GOAL-DONE]  ").done).toBe(true); // trim 后全等仍命中
+    // 热修：句内出现不再命中（契约/验收文案自身含该字样时防误判）
+    expect(parseProgress("[GOAL-DONE] 全部完成").done).toBe(false);
     expect(parseProgress("工作中，尚未完成").done).toBe(false);
   });
 
@@ -172,8 +179,9 @@ describe("parseProgress：步骤行与完成标记", () => {
     expect(p2.steps[0]?.title).toBe("实现");
   });
 
-  it("ANSI 打断标记不破坏解析（C++ parse 内部先 stripAnsi 同语义）", () => {
-    expect(parseProgress("[GOAL-DO\x1b[2KNE] 完成").done).toBe(true);
+  it("ANSI 打断标记不破坏解析（行级语义：marker 独立成行、行内 ANSI 清洗后 trim 全等）", () => {
+    expect(parseProgress("[GOAL-DO\x1b[2KNE]").done).toBe(true);
+    expect(parseProgress("[GOAL-DO\x1b[2KNE] 完成").done).toBe(false); // 行级语义：同行有其余文字不命中
     expect(parseProgress("[GOAL-STEP 1\x1b[?25h/2] 实现").steps.length).toBe(1);
   });
 });
@@ -249,12 +257,12 @@ describe("hasRealContent：内容判定", () => {
 /* ───── stripInjectionEcho（源：GoalRunner::stripInjectionEcho 逐行剔除） ───── */
 
 describe("stripInjectionEcho：注入回显剥离", () => {
-  it("【源用例22·e2e 回归】注入契约回显（含 [GOAL-DONE] 字样）剥离后 parseProgress 不产生 done", () => {
+  it("【源用例22·e2e 回归·2026-11-01 热修语义】注入契约回显剥离后 parseProgress 不产生 done（行级匹配为第一道防线，剥离为内容清洁）", () => {
     const contract = buildContract("目标Z", ["true"]);
     const echoed = contract; // 终端把注入文本原样回显
-    // 不剥离必误判（v0.2.5 修复前的一启动即 Verifying 缺陷，钉死病灶）
-    expect(parseProgress(echoed).done).toBe(true);
-    // 剥离后干净
+    // 行级精确匹配下，契约内句内 marker 不置 done（热修前的误判病灶已根治）
+    expect(parseProgress(echoed).done).toBe(false);
+    // 剥离后内容干净（步进行/杂讯零残留）
     const cleaned = stripInjectionEcho(echoed, [contract]);
     const p = parseProgress(cleaned);
     expect(p.done).toBe(false);
@@ -287,7 +295,7 @@ describe("stripInjectionEcho：注入回显剥离", () => {
 
   it("【源用例19 组合语义】注入回显剥离后，真实 AI 输出的步骤与完成标记完好（feed 顺序契约：先剥离再解析）", () => {
     const contract = buildContract("完成任务", ["true"]);
-    const real = "[GOAL-STEP 1/2] 步骤一 | 推荐方案: A\n[GOAL-DONE] 全部完成";
+    const real = "[GOAL-STEP 1/2] 步骤一 | 推荐方案: A\n[GOAL-DONE]";
     const p = parseProgress(stripInjectionEcho(`${contract}\n${real}`, [contract]));
     expect(p.steps.length).toBe(1);
     expect(p.steps[0]?.title).toBe("步骤一");

@@ -45,7 +45,8 @@
  */
 import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { open as fsOpen, mkdir, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, open as fsOpen, mkdir, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
@@ -202,6 +203,27 @@ export async function defaultExtract(exec: Exec, packagePath: string, destDir: s
       `tar 解压失败：package=${packagePath} code=${result.code} stderr=${result.stderr.slice(0, 400)}`,
       { remediation: "安装包缺失/损坏或格式不受支持（默认仅支持 gzip tar）：确认下载完整性后重试升级" },
     );
+  }
+}
+
+/**
+ * 解压后补执行位（26.10.13 官方包实测：包内二进制无 +x 位，直接探测 EACCES）。
+ * 候选路径存在才 chmod 0755；不存在静默跳过（布局识别自会处理缺失候选）。
+ */
+async function ensureExecBits(destDir: string, relpaths: readonly string[]): Promise<void> {
+  for (const rel of relpaths) {
+    const target = path.join(destDir, rel);
+    try {
+      await chmod(target, 0o755);
+    } catch (e) {
+      const code = errnoOf(e);
+      if (code !== "ENOENT") {
+        throw new BridgeError("FS_CHMOD_FAILED", `补执行位失败：path=${target} reason=${code}`, {
+          remediation: "检查暂存目录权限与文件系统",
+          cause: e,
+        });
+      }
+    }
   }
 }
 
@@ -450,6 +472,7 @@ export async function upgradeInstall(
         await deps.extract(packagePath, extractDir);
       } else {
         await defaultExtract(deps.exec, packagePath, extractDir);
+        await ensureExecBits(extractDir, CANDIDATE_BIN_RELPATHS);
       }
     } catch (e) {
       if (e instanceof BridgeError) throw e;
@@ -470,7 +493,14 @@ export async function upgradeInstall(
     });
 
     step = "self-check";
-    const newVersion = await detectVersion(deps.exec, layout.newBinPath);
+    // 官方入口优先（26.10.13+ 新架构实测）：agentkernel 为引擎核心、codearts 为
+    // 环境 wrapper（设 LD/内核参数后 exec 引擎）。直接探测 agentkernel 会因缺
+    // wrapper 环境失败（PACKAGE_BINARY_INVALID 实测）——有 wrapper 探 wrapper。
+    // 自检顺序：引擎本体（chmod 后）→ wrapper（staging 无部署布局，wrapper 大概率失败，仅末位尝试）
+    let newVersion = await detectVersion(deps.exec, layout.newBinPath);
+    if (newVersion === undefined && layout.scriptPath !== undefined) {
+      newVersion = await detectVersion(deps.exec, layout.scriptPath);
+    }
     if (newVersion === undefined) {
       throw new BridgeError(
         "PACKAGE_BINARY_INVALID",
@@ -514,7 +544,12 @@ export async function upgradeInstall(
     //      反映回滚状态。
     step = "verify";
     const deployedSha256 = await sha256File(binPath);
-    const deployedVersion = await detectVersion(deps.exec, binPath);
+    // 复验版本同样走官方入口（wrapper 优先，与自检口径一致）
+    const deployedScriptPath = path.join(cfg.installDir, SCRIPT_NAME);
+    const deployedVersion = await detectVersion(
+      deps.exec,
+      layout.scriptPath !== undefined && existsSync(deployedScriptPath) ? deployedScriptPath : binPath,
+    );
     if (deployedSha256 !== layout.newBinSha256 || deployedVersion !== release.version) {
       if (oldSnapshot !== undefined) {
         try {

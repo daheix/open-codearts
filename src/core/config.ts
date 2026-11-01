@@ -79,12 +79,17 @@ const ENV_PREFIX = "CODEARTS_BRIDGE_";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:4577";
 
-/** 阈值默认值（裁定 5）：stall 60s / 重试上限 60s / 连击 3 次 / 回显守卫 3000ms。 */
+/** 阈值默认值（裁定 5）：stall 240s / 重试上限 60s / 连击 3 次 / 回显守卫 45000ms。 */
 const DEFAULT_THRESHOLDS: Thresholds = {
-  stallSeconds: 60,
+  // 运维热修（2026-11-01）：进度检测按协议行（[GOAL-STEP]）判定，编译/测试等
+  // 长静默相位会被误判 stall 并反复注入打断（60s 一轮实证）。240s 给构建循环
+  // 留出整周期；协议行一旦出现即重置计时，不影响真挂起的发现速度量级。
+  stallSeconds: 240,
   retryCapSeconds: 60,
   strikes: 3,
-  echoGuardMs: 3000,
+  // 运维热修（2026-11-01）：TUI 冷启动含 403 重试/keyring 失败/自升级下载，30s+；
+  // 原 3000ms 守卫窗口内回显尚未到达，注入文本被误认申报。45000ms 实证安全带。
+  echoGuardMs: 45000,
 };
 
 /** 状态根子目录（裁定 4）。 */
