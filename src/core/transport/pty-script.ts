@@ -311,7 +311,7 @@ export function createScriptTransport(
    * 接线 onData → 回传前自检存活（child 即刻死亡 = wrapper 启动即崩，显式
    * PTY_START_FAILED，绝不回传死 ref）。失败路径不登记会话表。
    */
-  function spawnSession(cfg: BridgeConfig, id: string, prev: PtySession | undefined): PtySession {
+  function spawnSession(cfg: BridgeConfig, id: string, prev: PtySession | undefined, model?: string): PtySession {
     // 修复环裁定①（2026-10-31）：PTY 宿主一律经官方 wrapper <installDir>/codearts
     // 启动（见 start 处原注释）；wrapper 缺失显式报错，禁静默回退 bin 直启。
     const wrapper = path.join(cfg.installDir, "codearts");
@@ -321,10 +321,12 @@ export function createScriptTransport(
           "installers 目录不完整（应含 codearts 启动脚本）。检查安装目录完整性，或重新执行官方安装/升级恢复（codearts_upgrade）。",
       });
     }
-    const cmd = shQuote(wrapper);
+    // 模型轮换（2026-11-02）：ref.model 经官方 CLI `-m provider/model` 下发
+    // （wrapper `exec bin "$@"` 透传实测；CLI help 明列 -m 支持 TUI 形态）。
+    const cmd = model !== undefined ? `${shQuote(wrapper)} -m ${shQuote(model)}` : shQuote(wrapper);
     // R-p5：argv 数组传递，无 shell 字符串拼接；-c 命令串经 shQuote 转义
     const child = exec.spawnPty(["script", "-qefc", cmd, "/dev/null"], process.env);
-    const created: SessionRef = { kind, id };
+    const created: SessionRef = { kind, id, ...(model !== undefined ? { model } : {}) };
     const s: PtySession = {
       ref: created,
       child,
@@ -364,9 +366,11 @@ export function createScriptTransport(
           });
         }
         const prev = sessions.get(ref.id);
-        if (prev !== undefined && !prev.closed && prev.child.alive()) {
+        if (prev !== undefined && !prev.closed && prev.child.alive() && prev.ref.model === ref.model) {
           return { ...prev.ref }; // 存活会话幂等返回（真实 PTY 复用无恢复概念）
         }
+        // 存活但 ref.model 变更（模型轮换）：不复用——落到下方重建路径，
+        // spawnSession 以新模型 -m 重启进程（换模型必须重启才生效）。
         // 修复环裁定③：已亡（存在但死）或未知（跨守护重启对账）ref = 同名重建。
         // 旧会话残留销毁：置 closed（旧观察循环见 closed 即按 stop 语义终止，
         // I1 同款）→ 残余进程组杀（R-p4 两级终止）→ 唤醒释放等待者；新会话体
@@ -376,7 +380,7 @@ export function createScriptTransport(
           if (prev.child.alive()) prev.child.kill();
           wakeAll(prev);
         }
-        const s = spawnSession(cfg, ref.id, prev); // 失败抛错：不登记、不改旧账
+        const s = spawnSession(cfg, ref.id, prev, ref.model); // 失败抛错：不登记、不改旧账（ref.model 模型轮换透传）
         sessions.set(ref.id, s);
         return { ...s.ref };
       }

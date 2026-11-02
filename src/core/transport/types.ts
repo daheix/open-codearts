@@ -26,6 +26,12 @@ export interface Signal {
 export interface SessionRef {
   kind: TransportKind;
   id: string;
+  /**
+   * 2026-11-02 模型轮换（用户裁决：429 等模型类错误持续时切换模型而非盲重试）：
+   * 重建会话时指定的启动模型（provider/model 形态）。对调用方不透明；
+   * pty 传输消费（官方 CLI -m 旗标，wrapper "$@" 透传实测）。undefined = 默认模型。
+   */
+  model?: string;
 }
 
 /**

@@ -119,6 +119,9 @@ export class FakeTransport implements CodeartsTransport {
       }
       // 复用/恢复语义：复活会话并归零时间线；信号队列、raw 缓冲、注入留痕
       // 一律保留（留痕是审计事实，重启不抹除）。
+      // 2026-11-02 模型轮换：传入 ref 携带的 model 原样回传（消费方据此核对
+      // 轮换是否生效；fake 会话无进程，模型仅作引用元数据）。
+      s.ref = { ...ref };
       s.alive = true;
       s.closed = false;
       s.atNext = 0;

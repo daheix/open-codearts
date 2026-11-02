@@ -187,6 +187,9 @@ export function normalizeReceived(raw: string): string {
 
 /** 写死参数（FR-9，C++ RetryEngine 常量移植）：连续失败 ≥10 次告警。 */
 const RETRY_WARN_THRESHOLD = 10;
+/** 模型轮换适用的错误类（2026-11-02）。refusal 走 blocked 不轮换；unknown 亦轮换
+ *  （429 未匹配模式表也要换——用户实测场景）。 */
+const FAILOVER_KINDS = new Set(["rate_limit", "server", "timeout", "network", "empty", "unknown"]);
 
 /**
  * 模型错误永久重试引擎（C++ RetryEngine 同构）：第 1 次失败立即重试，连续失败
@@ -271,6 +274,14 @@ export class GoalRunner {
   /* 引擎与未决动作（feed 只置位，tick 统一执行——纯 tick 驱动） */
   private readonly retry = new RetryEngine();
   private pendingRetry: { kind: string } | null = null;
+  /** 2026-11-02 错误风暴合流：上次 goal.retry 审计时刻（时间节流 5s/条）。 */
+  private lastRetryAuditAt = -1;
+  /** 自上次 goal.retry 审计以来的错误信号数（随审计清零，coalesced 字段透出）。 */
+  private coalescedSinceAudit = 0;
+  /** 模型轮换游标（-1 = 未轮换；进度不清零游标——同一目标继续向后轮换）。 */
+  private failoverIdx = -1;
+  /** 自最近真实进度以来的轮换次数（达清单长度 = 全部模型试过仍失败 → blocked）。 */
+  private switchesSinceProgress = 0;
   private pendingVerify = false;
 
   /* 信号泵（transport.observe 事件驱动；无定时器，R-rn1） */
@@ -381,6 +392,30 @@ export class GoalRunner {
     // 1) 验收双过（done 申报的处理优先于重试/看门狗——C++ handleMarkers 语义）
     if (this.pendingVerify) {
       await this.runVerifyLocked();
+      return this.snap();
+    }
+    // 1b) 模型轮换（2026-11-02 用户裁决：429 等模型类错误持续 → 切换模型而非盲重试）。
+    // 连续模型类错误达 failoverAfterConsecutive → 轮换下一模型（官方 -m 旗标重启会话）；
+    // 清单内全部试过仍无进度 → blocked 显式止损（等人工换 key/查配额后 resume）。
+    // cfg 可缺席（测试替身 RunnerDeps 不带 cfg）——缺席即轮换关闭，生产恒传
+    const failoverCfg = this.deps.cfg as BridgeConfig | undefined;
+    if (
+      this.st.phase === "active" &&
+      failoverCfg !== undefined &&
+      failoverCfg.failoverModels.length > 0 &&
+      this.retry.consecutive >= failoverCfg.failoverAfterConsecutive &&
+      FAILOVER_KINDS.has(this.retry.lastKind)
+    ) {
+      if (this.switchesSinceProgress >= failoverCfg.failoverModels.length) {
+        this.enterBlocked("model-failover-exhausted", now);
+        this.deps.log({ type: "goal.log", goalId: this.st.goalId, at: now, msg: "failover-exhausted", tried: failoverCfg.failoverModels.length });
+        return this.snap();
+      }
+      this.switchesSinceProgress += 1;
+      this.failoverIdx = (this.failoverIdx + 1) % failoverCfg.failoverModels.length;
+      const nextModel = failoverCfg.failoverModels[this.failoverIdx] as string;
+      this.pendingRetry = null;
+      await this.switchModelLocked(nextModel, now);
       return this.snap();
     }
     // 2) 错误重试到期（C++ tick 第 1 步：到期重试优先，看门狗让路）
@@ -690,6 +725,7 @@ export class GoalRunner {
     if (prog.steps.length > 0 || prog.done) {
       if (this.retry.consecutive > 0) this.retry.notifySuccess();
       this.pendingRetry = null;
+      this.switchesSinceProgress = 0;   // 进度 → 轮换耗尽计数复位
       this.applyProgress(prog, now);
       return;
     }
@@ -702,12 +738,12 @@ export class GoalRunner {
       const k: ModelErrorKind | "unknown" = kind ?? "unknown";
       if (this.st.phase === "active") {
         if (k === "refusal") this.enterBlocked(k, now);
-        else this.scheduleRetry(k, now);
+        else this.handleModelError(k, now);
       }
       return; // error 信号不落入普通输出分支（不复位重试计数）
     }
     if (kind !== null && this.st.phase === "active") {
-      this.scheduleRetry(kind, now);
+      this.handleModelError(kind, now);
       return;
     }
     // 普通输出：会话存活，复位连续失败计数、清错误重试未决（C++ feed 尾段）。
@@ -773,10 +809,50 @@ export class GoalRunner {
     });
   }
 
-  /** 错误排程（C++ scheduleRetry 移植；注入动作延后到 tick 统一执行）。 */
-  private scheduleRetry(kind: string, now: number): void {
+  /**
+   * 错误信号合流入口（2026-11-02 热修回仓）：错误风暴下 kernel-log 尾随会为同一
+   * 底层故障产出海量信号（实测 4 分钟 17k 条 goal.retry + 11k 条告警——逐信号
+   * 审计即审计风暴，注入退避虽在、观测面已崩）。口径：
+   * - retry.consecutive 计数照加（模型轮换判据看真实错误量）；
+   * - 审计与 pendingRetry 只在批次首信号落一次，其后每 50 条一条节流留痕；
+   * - 告警只在阈值跨越与此后每逢 ×10 发一次；
+   * - 注入动作延后到 tick 统一执行（C++ scheduleRetry 语义保留）。
+   */
+  private handleModelError(kind: string, now: number): void {
     const intervalMs = this.deps.thresholds.retryCapSeconds * 1000;
     this.retry.notifyError(now, kind, intervalMs);
+    this.coalescedSinceAudit += 1;
+    // 时间节流：5s 窗口内只落一条 goal.retry（coalesced=窗口内真实信号数）——
+    // 批次边界（错误/输出交错）不打碎节流，审计量与风暴时长成比例而非信号量。
+    const throttled = this.lastRetryAuditAt >= 0 && now - this.lastRetryAuditAt < 5000;
+    if (!throttled) {
+      this.auditRetry(kind, now, this.coalescedSinceAudit);
+      this.lastRetryAuditAt = now;
+      this.coalescedSinceAudit = 0;
+      this.deps.log({
+        type: "goal.log",
+        goalId: this.st.goalId,
+        at: now,
+        msg: "error-scheduled",
+        kind,
+        consecutive: this.retry.consecutive,
+        nextRetryAtMs: this.retry.nextRetryAtMs,
+      });
+    }
+    const c = this.retry.consecutive;
+    if (c === RETRY_WARN_THRESHOLD || (c > RETRY_WARN_THRESHOLD && c % (RETRY_WARN_THRESHOLD * 10) === 0)) {
+      this.deps.audit({
+        type: "goal.warning",
+        goalId: this.st.goalId,
+        at: now,
+        reason: "consecutive-errors",
+        consecutive: c,
+      });
+    }
+    this.pendingRetry = { kind }; // 最新 kind 最具代表性；tick 到期统一注入
+  }
+
+  private auditRetry(kind: string, now: number, coalesced: number): void {
     this.deps.audit({
       type: "goal.retry",
       goalId: this.st.goalId,
@@ -784,27 +860,44 @@ export class GoalRunner {
       kind,
       consecutive: this.retry.consecutive,
       total: this.retry.total,
+      ...(coalesced > 0 ? { coalesced } : {}),
     });
-    if (this.retry.consecutive >= RETRY_WARN_THRESHOLD) {
-      // 连续 ≥10 告警事件（继续重试不打断——C++ warningActive 黄条语义）。
-      this.deps.audit({
-        type: "goal.warning",
-        goalId: this.st.goalId,
-        at: now,
-        reason: "consecutive-errors",
-        consecutive: this.retry.consecutive,
-      });
-    }
-    this.deps.log({
-      type: "goal.log",
+  }
+
+  /**
+   * 模型轮换会话重建（2026-11-02）：官方 `-m provider/model` 旗标重启会话
+   * （wrapper "$@" 透传实测）+ 断点契约重注 + 错误计数复位。
+   * 轮换游标推进由 tickLocked 编排（含耗尽→blocked 止损）。
+   */
+  private async switchModelLocked(model: string, now: number): Promise<void> {
+    this.deps.audit({
+      type: "goal.model_switch",
       goalId: this.st.goalId,
       at: now,
-      msg: "error-scheduled",
-      kind,
+      model,
       consecutive: this.retry.consecutive,
-      nextRetryAtMs: this.retry.nextRetryAtMs,
     });
-    this.pendingRetry = { kind };
+    this.deps.log({ type: "goal.log", goalId: this.st.goalId, at: now, msg: "model-switch", model });
+    this.pendingRetry = null;
+    this.pumpAbort.abort(); // 旧观察流随会话死亡终止（abort → 正常结束，R-tr2）
+    await this.awaitPumpDead();
+    const ref = this.st.session as SessionRef;
+    await this.deps.transport.stop(ref); // 幂等清理（stop+start 重建）
+    if (this.st.phase !== "active") return; // await 间被 pause/stop
+    const ref2 = await this.deps.transport.start(this.deps.cfg as BridgeConfig, { ...ref, model });
+    this.st.session = ref2;
+    this.startPump(ref2);
+    this.retry.notifySuccess(); // 新模型新局面：旧错误连击不再累计
+    const hasProgress = this.hasProgress();
+    await this.injectPrompt(
+      hasProgress
+        ? buildResumeContract({
+            objective: this.st.objective,
+            doneSteps: [...new Set(this.st.steps)].sort((a, b) => a - b),
+          })
+        : buildContract(this.st.objective, this.st.verify),
+      hasProgress ? "resume" : "contract",
+    );
   }
 
   /* ───── 注入与文案 ───── */

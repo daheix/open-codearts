@@ -2,6 +2,31 @@
 
 本文件记录面向使用者的重要变更。格式参考[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.2] - 2026-11-02
+
+错误感知监督：模型轮换 + 错误风暴合流（用户实测缺陷：429 风暴盲重试、
+永不切模型、审计风暴 4 分钟 17k 条）。`bun test` 573 项全绿（三轮复跑一致）。
+
+### 新增
+
+- **模型轮换**：连续模型类错误（429 限流/5xx/超时/网络）达
+  `failoverAfterConsecutive`（默认 6，env `CODEARTS_BRIDGE_FAILOVER_AFTER`）→
+  按清单（env `CODEARTS_BRIDGE_FAILOVER_MODELS`，逗号分隔 provider/model）
+  以官方 `-m` 旗标重启会话并重注断点契约；审计 `goal.model_switch`。
+  清单内全部模型试过仍无进度 → `blocked` 显式止损（等人工换 key/查配额后 resume），
+  不再无限盲转。
+- **错误风暴合流**：kernel-log 尾随的同源错误风暴不再逐信号审计
+  （5s 时间节流，`goal.retry.coalesced` 透出窗口内真实信号数；告警只在
+  连续错误阈值跨越与每逢 ×10 发出）——实测把 4 分钟 17k 条审计风暴压到与
+  风暴时长成比例。
+
+### 变更
+
+- `SessionRef` 增加可选 `model` 字段（pty 传输消费 `-m`；存活复用遇 model
+  变更自动走重建路径）。
+- 真机实证：429 风暴中轮换 3 次后，内核日志 `provider_name=NVIDIA` ——
+  会话确已切换到轮换目标模型。
+
 ## [0.4.1] - 2026-11-02
 
 生产运维热修回仓 + 守护会话只读画面（dsh-codearts 侧栏集成）。

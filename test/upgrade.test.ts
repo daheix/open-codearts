@@ -73,6 +73,8 @@ function cfgOf(installDir: string, stateDir: string): BridgeConfig {
     ptyHost: "auto",
     daemonUrl: "http://127.0.0.1:4577",
     akskFile: path.join(stateDir, "config.env"),
+    failoverModels: [],
+    failoverAfterConsecutive: 6,
     thresholds: { stallSeconds: 60, retryCapSeconds: 60, strikes: 3, echoGuardMs: 3000 },
     autoNudge: true,
   };

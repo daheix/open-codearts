@@ -58,6 +58,8 @@ function makeHarness(opts?: {
   failOut?: string;
   session?: SessionRef;
   injected?: string[];
+  /** 2026-11-02 模型轮换：注入 BridgeConfig（缺省不传 → 轮换关闭）。 */
+  cfg?: { failoverModels: string[]; failoverAfterConsecutive: number };
 }): Harness {
   const transport = new FakeTransport();
   const audits: AuditEvent[] = [];
@@ -71,6 +73,22 @@ function makeHarness(opts?: {
     audit: (e) => audits.push(e as AuditEvent),
     log: (e) => logs.push(e as AuditEvent),
     thresholds: { stallSeconds: 60, retryCapSeconds: 60, strikes: 3, echoGuardMs: 3000 },
+    ...(opts?.cfg !== undefined
+      ? {
+          cfg: {
+            installDir: "/tmp/fake-installers",
+            stateDir: "/tmp/fake-state",
+            transport: "auto" as const,
+            ptyHost: "auto" as const,
+            daemonUrl: "http://127.0.0.1:4577",
+            akskFile: "/tmp/fake-config.env",
+            thresholds: { stallSeconds: 60, retryCapSeconds: 60, strikes: 3, echoGuardMs: 3000 },
+            autoNudge: true,
+            failoverModels: opts.cfg.failoverModels,
+            failoverAfterConsecutive: opts.cfg.failoverAfterConsecutive,
+          },
+        }
+      : {}),
     verifyRun:
       opts?.verify === undefined
         ? undefined
@@ -818,5 +836,80 @@ describe("修复环第 1 轮（真机 T4-02 五缺陷）", () => {
     expect(r.state().rounds).toBe(1); // 回滚：rounds 不变（真机缺陷②"注入被拒仍 rounds+1"回归断言）
     expect(rt.injections.length).toBe(1); // 无注入留痕
     expect(h.audits.filter((e) => e.type === "goal.inject").length).toBe(1); // 仅 bootstrap 一条
+  });
+});
+
+/* ───── 2026-11-02 错误风暴合流 + 模型轮换（用户实测缺陷：429 风暴盲重试永不切模型） ───── */
+
+describe("错误风暴合流（2026-11-02）", () => {
+  it("30 个连续错误信号 → consecutive 计满、审计只落 1+N/50 条、重试注入恰一次", async () => {
+    const h = makeHarness();
+    const r = await boot(h);
+    const ref = r.state().session!;
+    h.advance(5_000); // 越过回显守卫
+    for (let i = 0; i < 30; i++) {
+      h.transport.emit(ref, "error", "HTTP 429 rate limited");
+    }
+    await r.tick();
+    // 真实错误量照加：告警在阈值跨越（consecutive=10）发出且带准确计数
+    const warns = ofType(h, "goal.warning");
+    expect(warns.length).toBe(1);
+    expect(warns[0]!.consecutive).toBe(10);
+    // 审计节流：首信号 1 条（30 条未到 50 的倍数 → 不再追加）
+    const retries = ofType(h, "goal.retry");
+    expect(retries.length).toBe(1);
+    // 重试注入：到期后恰一次（风暴期 nextRetryAtMs 被持续推后，风暴停止才注入）
+    // 注入总数 = 引导契约 + 本次重试
+    h.advance(61_000);
+    await r.tick();
+    const injects = ofType(h, "goal.inject");
+    expect(injects.length).toBe(2);
+  });
+});
+
+describe("模型轮换（2026-11-02：429 等持续 → 切模型而非盲重试）", () => {
+  const CFG = { failoverModels: ["nvidia/deepseek-ai/deepseek-v4.1-flash", "nvidia/z-ai/glm-5.3-flash"], failoverAfterConsecutive: 2 };
+
+  it("连续 2 次 rate_limit → 轮换第 1 个模型（会话带 model 重建 + goal.model_switch 审计）", async () => {
+    const h = makeHarness({ cfg: CFG });
+    const r = await boot(h);
+    const ref = r.state().session!;
+    h.advance(5_000);
+    h.transport.emit(ref, "error", "HTTP 429 too many requests");
+    h.transport.emit(ref, "error", "HTTP 429 too many requests");
+    await r.tick();
+    expect(r.state().phase).toBe("active");
+    expect(r.state().session?.model).toBe("nvidia/deepseek-ai/deepseek-v4.1-flash");
+    const switches = ofType(h, "goal.model_switch");
+    expect(switches.length).toBe(1);
+    expect(switches[0]!.model).toBe("nvidia/deepseek-ai/deepseek-v4.1-flash");
+    // 轮换后注入契约（新会话自包含）：引导契约 + 轮换契约
+    expect(ofType(h, "goal.inject").length).toBe(2);
+  });
+
+  it("两个模型都试过仍失败 → blocked 显式止损（failover-exhausted）", async () => {
+    const h = makeHarness({ cfg: CFG });
+    const r = await boot(h);
+    const ref = r.state().session!;
+    // 第 1 轮：连续 2 错 → 轮换模型 A
+    h.advance(5_000);
+    h.transport.emit(ref, "error", "429");
+    h.transport.emit(ref, "error", "429");
+    await r.tick();
+    expect(r.state().session?.model).toBe("nvidia/deepseek-ai/deepseek-v4.1-flash");
+    // 第 2 轮：新会话再 2 错 → 轮换模型 B
+    h.advance(5_000);
+    h.transport.emit(r.state().session!, "error", "429");
+    h.transport.emit(r.state().session!, "error", "429");
+    await r.tick();
+    expect(r.state().session?.model).toBe("nvidia/z-ai/glm-5.3-flash");
+    // 第 3 轮：全部模型试过仍失败 → blocked（等人工，不无限盲转）
+    h.advance(5_000);
+    h.transport.emit(r.state().session!, "error", "429");
+    h.transport.emit(r.state().session!, "error", "429");
+    await r.tick();
+    expect(r.state().phase).toBe("blocked");
+    const errs = ofType(h, "goal.error");
+    expect(errs.some((e) => e.kind === "model-failover-exhausted")).toBe(true);
   });
 });

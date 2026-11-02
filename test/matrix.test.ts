@@ -473,11 +473,18 @@ describe("矩阵1：模型错误连续重试", () => {
     expect(st["steps"]).toEqual([1]);
     expect(await healthOf(h.port)).toMatchObject({ actives: 0 }); // 终态出册无残留
 
-    // 审计关键项（R-mx2）：retry ×4（kind=server、consecutive 1..4）、无 fatal、complete 收尾
+    // 审计关键项（R-mx2）：retry 全为 server、无 fatal、complete 收尾。
+    // 2026-11-02 风暴合流：goal.retry 按 5s 时间节流（coalesced 记窗口内信号数），
+    // 逐信号 kind 序列不再保证 1:1——改断言类纯度与至少两条。
     const events = await readLogsUntil(h, goalId, (es) => es[es.length - 1]!["type"] === "goal.complete", "goal.complete 收尾");
     const retries = events.filter((e) => e["type"] === "goal.retry");
-    expect(retries.map((e) => e["kind"])).toEqual(["server", "server", "server", "server"]);
-    expect(retries.map((e) => e["consecutive"])).toEqual([1, 2, 3, 4]);
+    expect(retries.length).toBeGreaterThanOrEqual(2);
+    expect(retries.every((e) => e["kind"] === "server")).toBe(true);
+    // consecutive 严格递增且覆盖首（1）尾（4）——节流合并中间点，首尾计数保真
+    const cons = retries.map((e) => e["consecutive"] as number);
+    expect(cons[0]).toBe(1);
+    expect(cons[cons.length - 1]).toBe(4);
+    for (let i = 1; i < cons.length; i++) expect(cons[i]!).toBeGreaterThan(cons[i - 1]!);
     expect(events.some((e) => e["fatal"] === true)).toBe(false);
     expect(events[events.length - 1]!["type"]).toBe("goal.complete");
   });
@@ -520,13 +527,11 @@ describe("矩阵2：网络类错误注入", () => {
     expect(st["phase"]).toBe("complete");
     expect(st["rounds"]).toBe(4);
 
-    // 审计：错误分类逐一对齐模式表（network/timeout/network）、无 fatal
+    // 审计：错误类全落 network/timeout 模式表（2026-11-02 节流后不保证逐信号 1:1）
     const events = await readLogsUntil(h, goalId, (es) => es[es.length - 1]!["type"] === "goal.complete", "goal.complete 收尾");
-    expect(events.filter((e) => e["type"] === "goal.retry").map((e) => e["kind"])).toEqual([
-      "network",
-      "timeout",
-      "network",
-    ]);
+    const kinds = events.filter((e) => e["type"] === "goal.retry").map((e) => e["kind"]);
+    expect(kinds.length).toBeGreaterThanOrEqual(2);
+    expect(kinds.every((k) => k === "network" || k === "timeout")).toBe(true);
     expect(events.some((e) => e["fatal"] === true)).toBe(false);
     expect(events[events.length - 1]!["type"]).toBe("goal.complete");
   });

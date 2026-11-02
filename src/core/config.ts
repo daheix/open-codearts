@@ -70,6 +70,14 @@ export interface BridgeConfig {
   akskFile: string; // 默认 <stateDir>/config.env
   thresholds: Thresholds;
   autoNudge: boolean; // 默认 true（主控裁决 2026-10-31：目标会话默认自动续跑；false 为显式退出的高级选项）
+  /**
+   * 2026-11-02 模型轮换（用户裁决：429 等模型类错误持续时切换模型而非盲重试）：
+   * 轮换清单（provider/model 形态，经官方 CLI -m 旗标重启会话）。空数组 = 禁用
+   * 轮换（维持无限重试原语义）。env: CODEARTS_BRIDGE_FAILOVER_MODELS（逗号分隔）。
+   */
+  failoverModels: string[];
+  /** 连续模型类错误达此数 → 轮换下一模型。默认 6。env: CODEARTS_BRIDGE_FAILOVER_AFTER。 */
+  failoverAfterConsecutive: number;
 }
 
 /** 环境变量注入源：键值对，undefined 视为未设置。 */
@@ -264,7 +272,32 @@ export function loadConfig(
   const thresholds =
     overrides.thresholds !== undefined ? requireThresholds(overrides.thresholds) : { ...DEFAULT_THRESHOLDS };
 
-  return { installDir, stateDir, transport, ptyHost, daemonUrl, akskFile, thresholds, autoNudge };
+  // 模型轮换（2026-11-02）：清单逐项校验 provider/model 形态；空数组 = 禁用
+  const failoverModelsEnv = envValue(env, "FAILOVER_MODELS");
+  const failoverRaw =
+    overrides.failoverModels !== undefined
+      ? overrides.failoverModels
+      : failoverModelsEnv !== undefined && failoverModelsEnv.trim() !== ""
+        ? failoverModelsEnv.split(",")
+        : [];
+  const failoverModels = failoverRaw.map((m) => m.trim()).filter((m) => m.length > 0);
+  for (const m of failoverModels) {
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+$/.test(m)) {
+      fail(`failoverModels 项非法（须为 provider/model 形态）：${JSON.stringify(m)}`);
+    }
+  }
+  const failoverAfterEnv = envValue(env, "FAILOVER_AFTER");
+  const failoverAfterConsecutive =
+    overrides.failoverAfterConsecutive !== undefined
+      ? overrides.failoverAfterConsecutive
+      : failoverAfterEnv !== undefined
+        ? Number(failoverAfterEnv)
+        : 6;
+  if (!Number.isInteger(failoverAfterConsecutive) || failoverAfterConsecutive < 1) {
+    fail(`failoverAfterConsecutive 须为正整数，实际 ${JSON.stringify(failoverAfterConsecutive)}`);
+  }
+
+  return { installDir, stateDir, transport, ptyHost, daemonUrl, akskFile, thresholds, autoNudge, failoverModels, failoverAfterConsecutive };
 }
 
 /** 从 env 读取路径类字段并校验绝对路径；未设置返回 undefined。 */
